@@ -3,9 +3,9 @@ LDFLAGS :=
 
 -include site.mk
 
-all: main
+all: pip
 
-main: main.cpp pip.hpp
+pip: main.cpp pip.hpp
 	@echo -n ' LD  ';
 	$(strip $(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $< $(LDFLAGS))
 

@@ -18,9 +18,9 @@
 #include <vector>
 
 #ifndef PIP_DEBUG
-# define PIP_ASSERT assert
+# define PIP_ASSERT(x) (assert((x)))
 #else
-# define PIP_ASSERT(x)
+# define PIP_ASSERT(x) ((void)0)
 #endif
 
 #define PIP_GC_MSG(x) std::cout << x << std::endl
@@ -39,7 +39,6 @@ struct State;
 struct Value;
 
 std::ostream& operator<<(std::ostream& os, pip::Value* x);
-
 
 ///// UTILITIES
 
@@ -63,7 +62,8 @@ inline std::ostream& operator<<(std::ostream& os, FriendlySize f) {
 
 ///// OBJECT REPRESENTATION
 
-#define PIP_CAST(type, value) PIP_ASSERT((value)->get_type() == (type)), ((type*) value)
+#define PIP_CAST(klass, x) ((klass *) x)
+//# define PIP_CAST(klass, x) (PIP_ASSERT((x)->get_type() == pip::##klass ::CLASS_TYPE), (klass *) (x))
 
 #define PIP_FALSE ((pip::Value*) 0)
 #define PIP_TRUE ((pip::Value*) 2)
@@ -146,6 +146,8 @@ struct Value {
 struct Pair : Value {
   Value *car, *cdr;
   SourceInfo src;
+  
+  static const Type CLASS_TYPE = PAIR;
 };
 
 Value* Value::car() const { PIP_ASSERT(get_type() == PAIR); return static_cast<const Pair*>(this)->car; }
@@ -163,6 +165,8 @@ size_t Value::array_length() const { PIP_ASSERT(get_type() == ARRAY); return sta
 struct Blob : Value {
   unsigned length;
   char data[1];
+
+  static const Type CLASS_TYPE = BLOB;
 };
 
 struct Symbol : Value {
@@ -201,9 +205,11 @@ struct Frame {
   Frame* previous;
 };
 
-#define PIP_S_FRAME(...) \
+#define PIP_FRAME(state, ...) \
   pip::FrameHack __pip_frame_hacks[] = { __VA_ARGS__ }; \
-  pip::Frame __pip_frame((*this), (FrameHack*) __pip_frame_hacks, sizeof(__pip_frame_hacks) / sizeof(pip::FrameHack))
+  pip::Frame __pip_frame((state), (FrameHack*) __pip_frame_hacks, sizeof(__pip_frame_hacks) / sizeof(pip::FrameHack))
+
+#define PIP_S_FRAME(...) PIP_FRAME((*this), __VA_ARGS__)
 
 struct State {
 
@@ -228,7 +234,7 @@ struct State {
     frame_list(0), 
     collect_before_every_allocation(false), heap_size(PIP_HEAP_ALIGNMENT),
     mark_bit(1), block_cursor(0), sweep_cursor(0), live_at_last_collection(0),
-    collections(0), gc_temps_i(0) {
+    collections(0) {
 
     Block* first = new Block(PIP_HEAP_ALIGNMENT, false, mark_bit);
     blocks.push_back(first);
@@ -251,8 +257,6 @@ struct State {
   bool collect_before_every_allocation;
   size_t heap_size, mark_bit, block_cursor, live_at_last_collection, collections;
   char* sweep_cursor;
-  Value* gc_temps[10];
-  size_t gc_temps_i;
 
   bool markedp(Value* x) {
     return x->get_mark_unsafe() == mark_bit;
@@ -260,6 +264,9 @@ struct State {
 
   void recursive_mark(Value* x) {
     while(x->pointerp() && !markedp(x)) {
+      live_at_last_collection += x->get_size_unsafe();
+      x->flip_mark_unsafe();
+
       switch(x->get_type_unsafe()) {
         case PAIR:
           recursive_mark(x->car());
@@ -386,6 +393,21 @@ struct State {
     return address;
   }
 
+  void compact() {
+    // Mark all live memory
+
+    // Create a new block to copy the heap to
+    Block* heap = new Block(align(PIP_HEAP_ALIGNMENT, heap_size), false, mark_bit);
+
+    // Loop over live memory, allocating from the new block. The new
+    // allocation is called the "forwarding pointer" and the object's
+    // 'size' field is used to store the forwarding pointer (the newly
+    // allocated space stores the object's size)
+
+    // Loop over the heap and copy all objects, updating pointers as
+    // you go.
+  }
+
   void collect(size_t request = 0, bool force_request = false) {
       collections++;
 
@@ -454,9 +476,6 @@ struct State {
     mark_bit = !mark_bit;
 
     // Mark all live memory
-    for(size_t i = 0; i != GC_TEMPS_SIZE; i++)
-      recursive_mark(gc_temps[i]);
-
     for(Frame* f = frame_list; f != NULL; f = f->previous)
       for(size_t i = 0; i != f->root_count; i++)
         recursive_mark(*f->roots[i]);
@@ -517,23 +536,18 @@ struct State {
     PIP_ASSERT(x->get_type_unsafe() == type);
     PIP_ASSERT(x->pointerp());
 
-    if(gc_temps_i == GC_TEMPS_SIZE)
-      gc_temps_i = 0;
-
-    gc_temps[gc_temps_i++] = x;
-
     return x;
   }
-
-  template <class T, int i> T* allocate(ptrdiff_t additional = 0) {
-    return static_cast<T*>(allocate(static_cast<Type>(i), sizeof(T) + additional));
+  
+  template <class T> T* allocate(ptrdiff_t additional = 0) {
+    return static_cast<T*>(allocate(static_cast<Type>(T::CLASS_TYPE), sizeof(T) + additional));
   }
 
   ///// CONSTRUCTORS
   Pair* cons(Value* car, Value* cdr, bool has_source_info = false, unsigned file = 0, unsigned line = 0) {
     Pair* p = NULL;
     PIP_S_FRAME(p, car, cdr);
-    p = allocate<Pair, PAIR>(has_source_info ? 0 : -(sizeof(((Pair*)0)->src)));
+    p = allocate<Pair>(has_source_info ? 0 : -(sizeof(((Pair*)0)->src)));
     p->car = car;
     p->cdr = cdr;
     if(has_source_info) {
@@ -544,8 +558,19 @@ struct State {
     return p;
   }
 
+  Blob* make_blob(ptrdiff_t length) {
+    Blob* b = allocate<Blob>(length - 1);
+    b->length = length;
+    return b;
+  }
+
   ///// FUNCTIONS
 
+  ///// READER
+  void prime_reader() {
+
+  }
+  
   ///// VIRTUAL MACHINE
 }; // State
 
