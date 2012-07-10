@@ -1,4 +1,4 @@
-CXXFLAGS := -O2 -g3 -fno-rtti -fno-exceptions -DPIP_DEBUG
+CXXFLAGS := -std=c++11 -O2 -g3 -fno-rtti -fno-exceptions -DPIP_DEBUG
 LDFLAGS := 
 
 -include site.mk
@@ -12,4 +12,4 @@ pip: main.cpp pip.hpp
 .PHONY: clean cloc update-s7 microgue.c
 
 clean:
-	rm -f $(wildcard main *.o)
+	rm -f $(wildcard pip *.o)
