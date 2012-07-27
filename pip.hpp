@@ -1,9 +1,24 @@
-// pip.hpp - r7rs scheme in one header
+// pip.hpp - r7rs scheme in (almost) one header
 
 // Copyright (c) 2011-2012 ioddly
 // Website: <http://ioddly.com/projects/pip/>
 // Released under the Boost Software License:
 // <http://www.boost.org/LICENSE_1_0.txt>
+
+// Welcome to Pip Scheme!
+// Pip is an implementation of the Scheme programming language. In addition to
+// that, it's also something of a guided tour through language implementation.
+// You can use the following "table of contents" to navigate the source code.
+
+// 1. (PRELUDE) Preprocessor definitions and miscellaneous utilities
+// 2. (OBJ) Object representation - How Scheme types are represented in C++
+// 3. (GC) Garbage collector
+// 4. (READ) Expression reader and source code tracking
+// 5. (CC) Compiler
+// 6. (VM) Virtual Machine
+// 7. (UTIL) Utilities
+
+// (PRELUDE)
 
 #ifndef PIP_HPP
 #define PIP_HPP
@@ -20,31 +35,61 @@
 #include <iostream>
 #include <list>
 #include <vector>
-#include <unordered_map> // TODO: Alternatives to c++0x hash tables
+#ifdef __APPLE__
+# include <boost/unordered_map.hpp>
+#else
+# include <unordered_map> // TODO: Alternatives to c++0x hash tables
+#endif
 
-#ifndef PIP_DEBUG
-# define PIP_ASSERT(x) (assert((x)))
+// Assertions. Since these can be quite expensive, they're only enabled when
+// PIP_DEBUG is explicitly defined.
+#ifdef PIP_DEBUG
+# define PIP_ASSERT(x) (assert(x))
 #else
 # define PIP_ASSERT(x) ((void)0)
 #endif
 
+// Checking for exceptions
 #define PIP_CHECK(x) if((x)->active_exception()) return (x);
-#define PIP_GC_MSG(x) std::cout << x << std::endl
 
+// Debug mesages
+#define PIP_GC_MSG(x) std::cout << x << std::endl
+#define PIP_CC_MSG(x) \
+    for(size_t _x = (depth); _x; _x--) \
+      std::cout << '>'; std::cout << "CC: " << x << std::endl;
+#define PIP_CC_VMSG(x) PIP_CC_MSG(x)
+#define PIP_VM_MSG(x) \
+  for(size_t _x = (vm_depth); _x != 1; _x--) \
+    std::cout << '>'; \
+  std::cout << "VM: " << x << std::endl
+#define PIP_VM_VMSG(y) PIP_VM_MSG("(stack: " << f.si << ") " << y)
+
+// Heap alignment is both the default size of the heap and the threshold for
+// allocating large objects separate from the normal heap
 #ifndef PIP_HEAP_ALIGNMENT
 # define PIP_HEAP_ALIGNMENT 4096
 #endif
 
-#ifndef PIP_GROW_RATIO
-# define PIP_GROW_RATIO 77
+// The "load factor" is a percentage used to determine when to grow the heap.
+// When the live objects in memory after a collection exceed this percentage,
+// the heap is grown.
+#ifndef PIP_LOAD_FACTOR
+# define PIP_LOAD_FACTOR 77
 #endif
 
 namespace pip {
+
+#ifdef __APPLE__
+using boost::unordered_map;
+#else
+using std::unordered_map;
+#endif
 
 struct State;
 struct Value;
 struct String;
 struct Symbol;
+struct VectorStorage;
 
 std::ostream& operator<<(std::ostream& os, pip::Value* x);
 
@@ -68,60 +113,135 @@ inline std::ostream& operator<<(std::ostream& os, FriendlySize f) {
   return os << f.s << ending;
 }
 
-///// OBJECT REPRESENTATION
+struct SourceInfo {
+  SourceInfo(): file(0), line(0) {}
+  unsigned file, line;
+};
 
+///// (OBJ) Object representation 
+
+// <--
+// The first thing a language implementation needs to do is determine how to
+// represent the language's values in memory. It's hard to interact with
+// objects when you don't even know what they look like! 
+
+// So how do we represent a Scheme object (dynamically typed) with a C++
+// structure? The easiest way would be to take advantage of C++'s polymorphism.
+// But I've decided to go in a different direction, for performance reasons.
+// Pip values can be either immediate (they are contained directly within an
+// integer) or heap-allocated (they are referenced by a pointer). In any case,
+// these values are generally represented and passed around as "Value*".
+
+// Why would we want to have "immediate" values? To save on allocating and
+// dereferencing pointers when dealing with basic constants (such as boolean
+// values, or most numbers). The downside of this approach is that pointers
+// cannot be safely dereferenced without checking types first, but since we're
+// dealing with dynamic objects, we generally have to check types before doing
+// anything anyway.
+
+// How do we determine an object's type? First, we have to check its bits. Each
+// Value* has the following bit layout
+
+// 0000 0000 - False, or #f
+// .... ..10 - For constants
+// .... ...1 - For fixed-point numbers
+// .... ..00 - For real pointers
+
+// In addition, heap-allocated objects have a type field. This is all handled
+// by methods within the Value class. (Oddly enough, though we can't
+// dereference a Value* safely, we can execute methods on it)
+
+// Beyond that, objects are largely represented just like you'd think they
+// would be. For instance, a Pair contains two pointers.
+// -->
+
+// Cast with assertions (will cause double evaluation; do not give an argument with side effects)
 #define PIP_CAST(klass, x) (PIP_ASSERT((x)->get_type() == pip::klass ::CLASS_TYPE), (klass *) (x))
 
+// Constant values 
 #define PIP_FALSE ((pip::Value*) 0)
 #define PIP_TRUE ((pip::Value*) 2)
 #define PIP_NULL ((pip::Value*) 6)
 #define PIP_EOF ((pip::Value*) 10)
+#define PIP_UNSPECIFIED ((pip::Value*) 18)
 
-struct SourceInfo { unsigned file, line; };
-
+// C++ object types (which may not match up exactly with Scheme predicates)
 enum Type {
   TRANSIENT,
-  FIXNUM,
-  CONSTANT,
   PAIR,
   VECTOR,
+  VECTOR_STORAGE,
   BLOB,
   STRING,
   SYMBOL,
   EXCEPTION,
-  BOX
+  BOX,
+  // Functions
+  PROTOTYPE,
+  CLOSURE,
+  UPVALUE,
+  // Immediate values
+  FIXNUM,
+  CONSTANT,
 };
 
 struct Value {
+  // The space that's been allocated for this object, for the garbage
+  // collector.
   size_t size;
+  // The 'header' field contains an object's type, the garbage collector mark,
+  // and other information that can be represented with a bit or two (such as
+  // whether a Pair has source code information attached)
   unsigned header;
 
+  // Headers have the following format
+  // SSSS SSSM TTTT TTTT
+  // Where S is 0 or an object-specific flag
+  // M is the garbage collector mark
+  // T is the object's type
+  
+  // The following methods deal with size and type and are mostly for internal
+  // use
+
+  // Get the bits of a Value*
   ptrdiff_t bits() const { return (ptrdiff_t) this; }
+  
+  // Type predicates
+  
+  // Check for ...1
   bool fixnump() const { return bits() & 1; }
+  // Check for 0 or ..10 
   bool constantp() const { return !this || (bits() & 3) == 2; }
+  // Check for ..00 (and not null)
   bool pointerp() const { return this && (bits() & 3) == 0; }
+  // Anything that isn't a pointer is immediate
   bool immediatep() const { return !pointerp(); }
 
+  // Methods for interacting with the header safely
   int get_header_bit(Type type, int bit) const { PIP_ASSERT(pointerp()); PIP_ASSERT(get_type() == type); return header & bit; }
   void set_header_bit(Type type, int bit) { PIP_ASSERT(get_type() == type); header += bit; }
 
+  // Set the header's type and mark (for the garbage collector)
   void set_header_unsafe(unsigned char type, bool mark, size_t mark_bit) {
     header = (mark ? (mark_bit << 8) : (!mark_bit << 8)) + type;
   }
 
-  void set_size(size_t size_) { size = size_; }
-
-  unsigned char get_type_unsafe() const { return header & 255; };
-
-  Type get_type() const {
-    return fixnump() ? FIXNUM : (constantp() ? CONSTANT : static_cast<Type>(get_type_unsafe()));
-  }
-
+  // Interacting with marks and types
   int get_mark_unsafe() const { return (header & (1 << 8)) != 0; }
   size_t get_size_unsafe() const { return size; }
   void set_size_unsafe(size_t size_) { size = size_; }
   void flip_mark_unsafe() { header += get_mark_unsafe() ? -256 : 256; }
   void set_type_unsafe(int type) { header = (get_mark_unsafe() << 8) + type; }
+
+  // Get the type of a heap-allocated object
+  unsigned char get_type_unsafe() const { return header & 255; };
+
+  // Safely determine the type of an object
+  Type get_type() const {
+    return fixnump() ? FIXNUM : (constantp() ? CONSTANT : static_cast<Type>(get_type_unsafe()));
+  }
+
+  // Type specific methods: simple getters and setters, object flags
 
   // Fixnums
 
@@ -129,14 +249,16 @@ struct Value {
   ptrdiff_t fixnum_value() const { return bits() >> 1; }
 
   // Pairs
+
+  // True when the Pair has source code information attached
   static const int PAIR_HAS_SOURCE_BIT = 1 << 15;
-  static const int PAIR_TRUE_PAIR_BIT = 1 << 14;
 
   bool pair_has_source() const { return get_header_bit(PAIR, PAIR_HAS_SOURCE_BIT); }
-  bool pair_true_pair() const { return get_header_bit(PAIR, PAIR_TRUE_PAIR_BIT); }
 
   Value* car() const;
   Value* cdr() const;
+  Value* cadr() const;
+  Value* cddr() const;
 
   void set_car(Value*);
   void set_cdr(Value*);
@@ -144,7 +266,12 @@ struct Value {
   // Vectors
   Value** vector_data();
   Value* vector_ref(size_t i);
+  void vector_set(size_t, Value*);
   size_t vector_length() const;
+  VectorStorage* vector_storage() const;
+
+  // Vector storage
+  Value** vector_storage_data() const;
 
   // Blobs
   const char* blob_data() const;
@@ -159,24 +286,41 @@ struct Value {
   Value* symbol_value() const;
 
   // Exceptions
+
+  // True when an exception is active and should be passed on
   static const int EXCEPTION_ACTIVE_BIT = 1 << 15;
-  
-  Symbol* exception_tag() const;
-  String* exception_message() const;
-  Value* exception_irritants() const;
   
   bool active_exception() const { return get_type() == EXCEPTION && (header & EXCEPTION_ACTIVE_BIT); }
 
+  Symbol* exception_tag() const;
+  String* exception_message() const;
+  Value* exception_irritants() const;
+
   // Boxes
+
+  // True when a box contains source code information
   static const int BOX_HAS_SOURCE_BIT = 1 << 15;
 
   bool box_has_source() const { return get_header_bit(BOX, BOX_HAS_SOURCE_BIT); }
 
   Value* box_value() const;
+
+  // Prototypes
+  static const int PROTOTYPE_VARIABLE_ARITY_BIT = 1 << 15;
+
+  bool prototype_variable_arity() const { return get_header_bit(PROTOTYPE, PROTOTYPE_VARIABLE_ARITY_BIT); }
+
+  // Upvalues
+  static const int UPVALUE_CLOSED_BIT = 1 << 15;
+
+  bool upvalue_closed() const { return get_header_bit(UPVALUE, UPVALUE_CLOSED_BIT); }
+
+  Value* upvalue() const;
 };
 
 struct Pair : Value {
   Value *car, *cdr;
+  // Source code information; only available when pair_has_source() is true
   SourceInfo src;
   
   static const Type CLASS_TYPE = PAIR;
@@ -184,18 +328,33 @@ struct Pair : Value {
 
 Value* Value::car() const { PIP_ASSERT(get_type() == PAIR); return static_cast<const Pair*>(this)->car; }
 Value* Value::cdr() const { PIP_ASSERT(get_type() == PAIR); return static_cast<const Pair*>(this)->cdr; }
+Value* Value::cadr() const { PIP_ASSERT(get_type() == PAIR); return static_cast<const Pair*>(this)->cdr->car(); }
+Value* Value::cddr() const { PIP_ASSERT(get_type() == PAIR); return static_cast<const Pair*>(this)->cdr->cdr(); }
 
 void Value::set_car(Value* car_)  { PIP_ASSERT(get_type() == PAIR); static_cast<Pair*>(this)->car = car_; }
 void Value::set_cdr(Value* cdr_)  { PIP_ASSERT(get_type() == PAIR); static_cast<Pair*>(this)->cdr = cdr_; }
 
-struct Vector : Value {
+struct VectorStorage : Value {
   unsigned length;
   Value* data[1];
+
+  static const Type CLASS_TYPE = VECTOR_STORAGE;
 };
 
-Value** Value::vector_data() { PIP_ASSERT(get_type() == VECTOR); return static_cast<Vector*>(this)->data; }
-Value* Value::vector_ref(size_t i) { PIP_ASSERT(get_type() == VECTOR); return vector_data()[i]; }
-size_t Value::vector_length() const { PIP_ASSERT(get_type() == VECTOR); return static_cast<const Vector*>(this)->length; }
+Value** Value::vector_storage_data() const { PIP_ASSERT(get_type() == VECTOR_STORAGE); return (Value**)static_cast<const VectorStorage*>(this)->data; }
+
+struct Vector : Value {
+  VectorStorage* storage;
+  unsigned capacity;
+
+  static const Type CLASS_TYPE = VECTOR;
+};
+
+VectorStorage* Value::vector_storage() const { PIP_ASSERT(get_type() == VECTOR); return static_cast<const Vector*>(this)->storage; }
+Value** Value::vector_data() { return vector_storage()->data; }
+Value* Value::vector_ref(size_t i) { return vector_storage()->data[i]; }
+void Value::vector_set(size_t i, Value* v) { vector_storage()->data[i] = v; }
+size_t Value::vector_length() const { return vector_storage()->length; }
 
 struct Blob : Value {
   unsigned length;
@@ -203,7 +362,6 @@ struct Blob : Value {
 
   static const Type CLASS_TYPE = BLOB;
 };
-
 
 const char* Value::blob_data() const { PIP_ASSERT(get_type() == BLOB); return static_cast<const Blob*>(this)->data; }
 unsigned Value::blob_length() const { PIP_ASSERT(get_type() == BLOB); return static_cast<const Blob*>(this)->length; }
@@ -244,6 +402,79 @@ struct Box : Value {
 };
 
 Value* Value::box_value() const { PIP_ASSERT(get_type() == BOX); return static_cast<const Box*>(this)->value; };
+
+// Prototype for a procedure containing constants, code, and debugging
+// information. May be executed directly if the function does not reference
+// free variables.
+struct Prototype : Value {
+  Vector* constants;
+  Blob* code;
+  Blob* debuginfo;
+  unsigned stack_max;
+  unsigned locals;
+  unsigned arguments;
+
+  static const Type CLASS_TYPE = PROTOTYPE;
+};
+
+// A closure, aka a procedure which references free variables
+struct Closure : Value {
+  Prototype* prototype;
+  // Vector containing Upvalues
+  VectorStorage* upvalues;
+
+  static const Type CLASS_TYPE = CLOSURE;
+};
+
+// A reference to a free variable; used to support closures
+struct Upvalue : Value {
+  union { 
+    Value** local;
+    Value* converted;
+  };
+
+  static const Type CLASS_TYPE = UPVALUE;
+};
+
+Value* Value::upvalue() const {
+  Upvalue* u = PIP_CAST(Upvalue, this);
+  return upvalue_closed() ? u->converted : *(u->local);
+}
+
+///// (GC) Garbage collector
+
+// <--
+// Pip's garbage collector is a mark-and-don't-sweep collector. The allocator
+// is a first-fit allocator: it allocates memory from the first appropriately
+// sized free chunk of memory it can find. It marks every chunk of memory it
+// sweeps over (or, if the chunk is already marked, it skips it). When the
+// allocator reaches the end of the heap, the meaning of the mark bit is
+// flipped, and the entire heap is considered garbage. Then the collector
+// immediately marks all live memory, and we know which objects are marked. The
+// benefit of a mark-and-don't-sweep collector is that the work is spread out
+// amongst allocations and should (in most cases) result in no large pauses to
+// the program. It requires no external data structures; the only overhead
+// being that each object needs a "size" and "mark" field (and in Pip's case,
+// the mark field is stored alongside type and other flags in a space efficient
+// manner). The main downside is fragmentation.
+
+// How does Pip mark live memory? It starts with the program's "roots" and
+// marks all their children and so on. But how do we find the roots? They are
+// explicitly registered with the garbage collector using two methods: Frames
+// and Handles. A Frame is a stack-allocated structure that keeps track of as
+// many variables as needed. You create a frame in each function you want to
+// track variables in like so: PIP_FRAME(state, var1, var2). A Handle is a
+// heap-allocated structure that keeps track of one variable, and is useful
+// when your variables have lifetimes beyond the execution of a single
+// function.
+
+// How does Pip get memory from the operating system? It starts by using a
+// small amount of memory (4 kilobytes). If, after a collection, more than a
+// certain amount of memory is in use (the "load factor", by default 77%), it
+// allocates twice as much memory. It can also allocate more memory if a very
+// large object (over 4kb) is allocated.
+// -->
+
 ///// GARBAGE COLLECTOR TRACKING
 
 // This structure is used in the GC tracking macros to take a normal
@@ -255,9 +486,13 @@ struct FrameHack {
   PIP_(Blob)
   PIP_(Symbol)
   PIP_(Vector)
+  PIP_(VectorStorage)
   PIP_(String)
   PIP_(Exception)
   PIP_(Box)
+  PIP_(Prototype)
+  PIP_(Closure)
+  PIP_(Upvalue)
 #undef PIP_
   
   ~FrameHack() {}
@@ -291,6 +526,7 @@ struct Handle {
 
   State& state;
   T* ref;
+  Handle<Value> *previous, *next;
   std::list<Handle<Value>*>::iterator location;
   
   void initialize();
@@ -298,8 +534,6 @@ struct Handle {
   T* operator->() const { return ref; }
   void operator=(T* ref_) { ref = ref_; }  
 };
-
-typedef std::list<Handle<Value> *> handle_list_t;
 
 struct Block {
   size_t size;
@@ -309,7 +543,7 @@ struct Block {
     begin = (char*) malloc(size);
     end = begin + size;
     ((Value*) begin)->set_header_unsafe(TRANSIENT, mark, mark_bit);
-    ((Value*) begin)->set_size(size);
+    ((Value*) begin)->set_size_unsafe(size);
   }
 
   ~Block() {
@@ -318,14 +552,25 @@ struct Block {
 };
 
 struct State {
+  struct VMFrame;
+
   State(): 
 
+    // Garbage collector
+    handle_list(0),
     frame_list(0), 
     collect_before_every_allocation(false), heap_size(PIP_HEAP_ALIGNMENT),
     mark_bit(1), block_cursor(0), sweep_cursor(0), live_at_last_collection(0),
     collections(0),
 
-    source_counter(1) {
+    // Reader
+    source_counter(1),
+   
+    // Compiler
+    global_env(*this),
+    
+    // Virtual machine
+    vm_depth(0) {
 
     // Initialize garbage collector
     Block* first = new Block(PIP_HEAP_ALIGNMENT, false, mark_bit);
@@ -334,11 +579,20 @@ struct State {
 
     // Initialize globals
     static const char* global_symbols[] = {
+      // Compiler symbols
+      "special",
+      "variable",
+      "upvalue",
       // Exception tags
       "#pip#read",
+      "#pip#compile",
+      "#pip#eval",
       // Special forms
       "define",
+      "set!",
       "lambda",
+      "named-lambda",
+      "if",
       "quote",
       "quasiquote",
       "unquote",
@@ -351,9 +605,18 @@ struct State {
       globals.push_back(v);
     }
 
+    global_env = make_vector();
+
+    vector_append(*global_env, PIP_FALSE);
+
+    for(size_t i = S_DEFINE; i != S_QUOTE+1; i++) {
+      vector_append(*global_env, global_symbol(static_cast<Global>(i)));
+      vector_append(*global_env, global_symbol(S_SPECIAL));
+    }
+
     // Initialize reader
     source_names.push_back("unknown");
-    source_contents.push_back("");
+    source_contents.push_back(NULL);
   }
 
   ~State() {
@@ -362,6 +625,9 @@ struct State {
 
     for(size_t i = 0; i != blocks.size(); i++)
       delete blocks[i];
+
+    for(size_t i = 0; i != source_contents.size(); i++)
+      delete source_contents[i];
   }
 
   ///// GARBAGE COLLECTOR
@@ -369,7 +635,8 @@ struct State {
   static const size_t GC_TEMPS_SIZE = 10;
 
   std::vector<Block*> blocks;
-  handle_list_t handle_list;
+  Handle<Value>* handle_list;
+  std::vector<VMFrame*> vm_frames;
   Frame* frame_list;
   bool collect_before_every_allocation;
   size_t heap_size, mark_bit, block_cursor, live_at_last_collection, collections;
@@ -386,31 +653,46 @@ struct State {
       x->flip_mark_unsafe();
 
       switch(x->get_type_unsafe()) {
+        // Note that in order to save a little redunancy, objects are marked
+        // based on their structure (eg all objects with two pointers are
+        // marked as though they were pairs)
         // Atomic
         case STRING: case BLOB:
           return;
         // One pointer
+        case VECTOR:
         case BOX:
           x = static_cast<Box*>(x)->value;
           continue;
         // Two pointers 
+        case CLOSURE:
         case PAIR:
         case SYMBOL:
           recursive_mark(static_cast<Pair*>(x)->car);
           x = static_cast<Pair*>(x)->cdr;
           continue;
         // Three pointers
+        case PROTOTYPE:
         case EXCEPTION:
           recursive_mark(static_cast<Exception*>(x)->tag);
           recursive_mark(static_cast<Exception*>(x)->message);
           x = static_cast<Exception*>(x)->irritants;
           continue;
-        case VECTOR:
-          for(size_t i = 0; i != x->vector_length(); i++) {
-            recursive_mark(x->vector_ref(i));
+        // Special types
+        case VECTOR_STORAGE: {
+          VectorStorage* s = static_cast<VectorStorage*>(x);
+          if(s->length) {
+            for(size_t i = 0; i != s->length - 1; i++) {
+              recursive_mark(s->data[i]);
+            }
+            x = s->data[s->length - 1];
           }
-          x = x->vector_ref(x->vector_length() - 1);
           continue;
+        }
+        case UPVALUE: { 
+          x = x->upvalue();
+          continue;
+        }
         default: PIP_ASSERT(!"recursive_mark bad;"); return;
       }
     }
@@ -522,27 +804,24 @@ struct State {
     return address;
   }
 
-  void compact() {
-    // Mark all live memory
+  struct HeapSweep {
+    HeapSweep(State& state_): state(state_), block_cursor(0), cursor(0), block(state_.blocks[0]) {
+    }
+    
+    State& state;
+    size_t block_cursor;
+    char* cursor;
+    Block* block;
 
-    // Create a new block to copy the heap to
-    Block* heap = new Block(align(PIP_HEAP_ALIGNMENT, heap_size), false, mark_bit);
+    bool done() { return block_cursor == state.blocks.size(); }
 
-    // Loop over live memory, allocating from the new block. The new
-    // allocation is called the "forwarding pointer" and the object's
-    // 'size' field is used to store the forwarding pointer (the newly
-    // allocated space stores the object's size)
+    void next(size_t& oblock, Value*& ocursor) {
 
-    // Loop over the heap and copy all objects, updating pointers as
-    // you go.
-  }
+    }
+  };
 
-  void collect(size_t request = 0, bool force_request = false) {
-    collections++;
-
-    // If collection is called early, we have to sweep over everything
-    // and make sure it's marked as used
-
+  // If collection is called early, finish iterating over and marking the heap
+  void finish_mark() {
     while(block_cursor != blocks.size()) {
       Block* b = blocks[block_cursor];
       PIP_ASSERT(sweep_cursor >= b->begin && sweep_cursor <= b->end);
@@ -559,10 +838,65 @@ struct State {
       if(block_cursor != blocks.size())
         sweep_cursor = blocks[block_cursor]->begin;
     }
+  }
 
-    // Reset sweep cursor
+  // Mark all live memory
+  void mark_heap() {
+    // Symbols are roots (for now)
+    for(symbol_table_t::iterator i = symbol_table.begin(); i != symbol_table.end(); i++)
+      recursive_mark(i->second);
+
+    for(Frame* f = frame_list; f != NULL; f = f->previous)
+      for(size_t i = 0; i != f->root_count; i++)
+        recursive_mark(*f->roots[i]);
+
+    for(Handle<Value>* i = handle_list; i != NULL; i = i->previous)
+      recursive_mark(i->ref);
+    
+    for(size_t i = 0; i != vm_frames.size(); i++) {
+      VMFrame* f = vm_frames[i];
+      recursive_mark(f->p);
+      recursive_mark(f->c);
+      for(size_t j = 0; j != f->si; j++) {
+        recursive_mark(f->stack[j]);
+      }
+    }
+
+  }
+
+  void compact() {
+    // Quick collection
+    finish_mark();
+    mark_bit = !mark_bit;
+    mark_heap();
+
+    // Create a new block to copy the heap to
+    Block* heap = new Block(align(PIP_HEAP_ALIGNMENT, heap_size), false, mark_bit);
+
+    // Loop over live memory, allocating from the new block. The new
+    // allocation is called the "forwarding pointer" and the object's
+    // 'size' field is used to store the forwarding pointer (the newly
+    // allocated space stores the object's size)
+
+
+    // Loop over the heap and copy all objects, updating pointers as
+    // you go.
+  }
+
+  void reset_sweep() {
     sweep_cursor = blocks[0]->begin;
     block_cursor = 0;
+  }
+
+  void collect(size_t request = 0, bool force_request = false) {
+    collections++;
+
+    // If collection is called early, we have to sweep over everything
+    // and make sure it's marked as used
+    finish_mark();
+
+    // Reset sweep cursor
+    reset_sweep();
 
     // If growth is necessary
 
@@ -572,7 +906,7 @@ struct State {
     // b) A collection has failed to free up enough space for an allocation
 
     size_t pressure = (live_at_last_collection * 100) / heap_size;
-    if(pressure >= PIP_GROW_RATIO || force_request) {
+    if(pressure >= PIP_LOAD_FACTOR || force_request) {
       // We're gonna grow
       size_t new_block_size = (heap_size);
     
@@ -590,7 +924,7 @@ struct State {
       heap_size += new_block_size;
 
       PIP_GC_MSG("growing heap from " << FriendlySize(heap_size - new_block_size) << " to " << FriendlySize(heap_size)
-                 << " because of " << (pressure >= PIP_GROW_RATIO ? "pressure" : "allocation failure"));
+                 << " because of " << (pressure >= PIP_LOAD_FACTOR ? "pressure" : "allocation failure"));
     }
 
     live_at_last_collection = 0;
@@ -605,17 +939,7 @@ struct State {
     mark_bit = !mark_bit;
 
     // Mark all live memory
-
-    // Symbols are roots (for now)
-    for(symbol_table_t::iterator i = symbol_table.begin(); i != symbol_table.end(); i++)
-      recursive_mark(i->second);
-
-    for(Frame* f = frame_list; f != NULL; f = f->previous)
-      for(size_t i = 0; i != f->root_count; i++)
-        recursive_mark(*f->roots[i]);
-
-    for(handle_list_t::iterator i = handle_list.begin(); i != handle_list.end(); i++)
-      recursive_mark((*i)->ref);
+    mark_heap();
   }
 
   Value* allocate(Type type, size_t size) {
@@ -658,7 +982,7 @@ struct State {
         address = findfree(size);
         if(!address) {
           std::cerr << "could not allocate " << size << " bytes " << std::endl;
-
+          // TODO: A graceful out
           PIP_ASSERT(!"out of memory");
         }
       }
@@ -681,15 +1005,23 @@ struct State {
   }
 
   ///// RUNTIME
-  typedef std::unordered_map<std::string, Symbol*> symbol_table_t;
+  typedef unordered_map<std::string, Symbol*> symbol_table_t;
 
-  std::unordered_map<std::string, Symbol*> symbol_table;
+  symbol_table_t symbol_table;
   std::vector<Handle<Value> *> globals;
 
   enum Global {
+    S_SPECIAL,
+    S_VARIABLE,
+    S_UPVALUE,
     S_PIP_READ,
+    S_PIP_COMPILE,
+    S_PIP_EVAL,
     S_DEFINE,
+    S_SET,
     S_LAMBDA,
+    S_NAMED_LAMBDA,
+    S_IF,
     S_QUOTE,
     S_QUASIQUOTE,
     S_UNQUOTE,
@@ -765,6 +1097,18 @@ struct State {
     return box;
   }
 
+  Vector* make_vector(unsigned capacity = 2) {
+    capacity = capacity > 2 ? capacity : 2;
+    Vector* v = 0;
+    VectorStorage* s = 0;
+    PIP_S_FRAME(v, s);
+    v = allocate<Vector>();
+    v->capacity = capacity;
+    s = allocate<VectorStorage>((capacity * sizeof(Value*)) - sizeof(Value*));
+    v->storage = s;
+    return v;
+  }
+
   Exception* make_exception(Symbol* tag, String* message, Value* irritants) {
     Exception* e = 0;
     PIP_S_FRAME(e,tag,message,irritants);
@@ -783,6 +1127,60 @@ struct State {
 
   ///// BASIC FUNCTIONS
 
+  unsigned vector_append(Vector* vec, Value* value) {
+    vec->storage->data[vec->storage->length++] = value;
+    if(vec->storage->length == vec->capacity) {
+      VectorStorage* s = 0;
+      PIP_S_FRAME(vec, s);
+      size_t capacity = vec->capacity * 2;
+      s = allocate<VectorStorage>((capacity * sizeof(Value*)) - sizeof(Value*));
+      memcpy(s->data, vec->storage->data, (vec->storage->length * sizeof(Value*)));
+      s->length = vec->storage->length;
+      vec->capacity = capacity;
+      vec->storage = s;
+    }
+    return vec->storage->length - 1;
+  }
+
+  static void unwrap_source_info(Value* exp, SourceInfo& info) {
+    if(exp->get_type() == PAIR && exp->pair_has_source()) {
+      info = PIP_CAST(Pair, exp)->src;
+    } else if(exp->get_type() == BOX && exp->box_has_source()) {
+      info = PIP_CAST(Box, exp)->src;
+    }
+  }
+
+  void format_source_error(Value* exp, const std::string& msg, std::string& out) {
+    SourceInfo info;
+    unwrap_source_info(exp, info);
+    if(info.file) {
+      std::ostringstream ss;
+      ss << source_names[info.file] << ':' << info.line << ": " << msg << std::endl << "  " << source_contents[info.file]->at(info.line-1);
+      out = ss.str();
+    } else {
+      out = msg;
+    }
+  }
+
+  static bool listp(Value* lst) {
+    if(lst == PIP_NULL) return true;
+    if(lst->get_type() != PAIR) return false;
+    while(lst->get_type() == PAIR) {
+      lst = lst->cdr();
+      if(lst == PIP_NULL) return true;
+    }
+    return false;
+  }
+
+  static size_t length(Value* lst) {
+    size_t i = 0;
+    while(lst->get_type() == PAIR) {
+      i++;
+      lst = lst->cdr();
+    }
+    return i;
+  } 
+
   void append_m(Value** head, Value** tail, Value* value) {
     Value* h = *head, *t = *tail, *swap = NULL;
     PIP_S_FRAME(h, t, swap, value);
@@ -796,44 +1194,100 @@ struct State {
     }
   }
 
-  ///// READER
+  ///// (READ) Expression reader and source code tracking 
+
+  // <--
+  // Before reading expressions from a source (which may be a file or a string
+  // provided by e.g. a program that embeds Pip, or a user entering expressions
+  // at the command line), the source is first "registered" with the Pip
+  // runtime. It receives a unique numeric identifier and the entire text is
+  // read and saved. This is done in order to provide helpful error messages at
+  // every stage of program execution.
+
+  // The reader itself is fairly simple. It's split into a tokenizer and a
+  // parser; the tokenizer does most of the heavy lifting. The only parsing
+  // required is reading lists. The tokenizer is capable of previewing a single
+  // token.
+
+  // The reader attaches source code information to lists and symbols. In Pip,
+  // lists can be allocated with extra fields for their file and line. Symbols
+  // on the other hand are placed in a special "Box" structure, which is
+  // unwrapped by the compiler and then becomes garbage. Literal constants,
+  // such as #f and 12345, don't cause compilation or runtime errors and therefore
+  // don't need to be wrapped.
+  // --> 
+
+  // Source code tracking
+
+  // A descriptive name for a source; usually a file path
   std::vector<std::string> source_names;
-  std::vector<std::string> source_contents;
+  // The actual source code, line by line
+  std::vector<std::vector<std::string>* > source_contents;
+  // File id counter
   unsigned source_counter;
 
-  // Load the source code for a file (for debugging purposes)
+  // Read every line from an input stream
+  void read_lines(std::istream& is) {
+    std::string line;
+    std::vector<std::string>* contents = new std::vector<std::string>();
+    while(true) {
+      if(!std::getline(is, line)) break;
+      contents->push_back(line);
+    }
+    source_contents.push_back(contents);
+  }
+
+  // Load the source code of a file
+  // Return 0 on failure
   unsigned register_file(const char* path) {
     size_t length;
     std::fstream fs(path, std::fstream::in);
-    // TODO: Check validity
-    fs.seekg(0, std::ios::end);
-    length = fs.tellg();
-    fs.seekg(0, std::ios::beg);
-    char* buffer = new char[length+1];
-    fs.read(buffer, length);
-    buffer[length] = 0;
+    std::string line;
+    if(!fs.is_open()) return 0;
     source_names.push_back(path);
-    source_contents.push_back(buffer);
-    fs.close();
-    delete[] buffer;
+    read_lines(fs);
+
     return source_counter++;
   }
 
+  // Load the source code of a string
+  // "name" is ideally something describing where the string came from
+  unsigned register_string(const std::string& name, const std::string& string) {
+    source_names.push_back(name);
+
+    std::stringstream ss;
+    ss << std::noskipws;
+    ss << string;
+    read_lines(ss);
+
+    return source_counter++;
+  }
+
+  // The actual reader
   struct Reader {
+    // Character types
+
     // TODO: Replace with a table of properties to avoid branching
+    // True if a character is a type of quote
     static bool quotep(char c) {
       return c == '\'' || c == '`' || c == ',';
     }
     
+    // True if a character is a delimiter; used to determine what is NOT a
+    // valid symbol character
     static bool delimiterp(char c) {
       return c == '(' || c == ')' || c == ';' || c == '@' ||
         c == EOF || isspace(c) || c == '.' || c == '#' || c == '"' || quotep(c);
     }
 
+    // True if a character is a symbol starting character (all non-delimiters
+    // and non-numbers)
     static bool symbol_startp(char c) {
       return (isalpha(c) || ispunct(c)) && !delimiterp(c);
     }
 
+    // True if a character is a symbol character (all symbol characters and
+    // numbers)
     static bool symbolp(char c) { 
       return symbol_startp(c) || (!delimiterp(c) && isdigit(c));
     }
@@ -859,17 +1313,34 @@ struct State {
     };
 
     Reader(State& state_, std::istream& input_, unsigned file_): state(state_), input(input_),
-    file(file_), line(0), token_value(state), token_lookahead(TK_LOOKAHEAD) {
+    file(file_), line(1), token_value(state), token_lookahead(TK_LOOKAHEAD) {
       
     }
     ~Reader() { }
 
     State& state;
     std::istream& input;
+    // File and current line
     unsigned file, line;
+    // Values read in by the tokenizer, or exceptions encountered while tokenizing
     Handle<Value> token_value;
     Token token_lookahead;
     std::string token_buffer;
+
+    // Error handling
+
+    Token lex_error(const std::string& msg) {
+      std::stringstream ss;
+      ss << state.source_names[file] << ':' << line << ": " << msg;
+      token_value = state.make_exception(State::S_PIP_READ, ss.str());
+      return TK_EXCEPTION;
+    }
+
+    Value* parse_error(const std::string& msg) {
+      std::stringstream ss;
+      ss << state.source_names[file] << ':' << line << ": " << msg;
+      return state.make_exception(State::S_PIP_READ, ss.str());
+    }
 
     // Tokenizer
     char getc() {
@@ -881,19 +1352,6 @@ struct State {
     void ungetc(char c) {
       if(c == '\n') line--;
       input.putback(c);
-    }
-
-    Token lex_error(const std::string& msg) {
-      std::stringstream ss;
-      ss << state.source_names[file] << ' ' << line << ": " << msg;
-      token_value = state.make_exception(State::S_PIP_READ, ss.str());
-      return TK_EXCEPTION;
-    }
-
-    Value* parse_error(const std::string& msg) {
-      std::stringstream ss;
-      ss << state.source_names[file] << ' ' << line<< ": " << msg;
-      return state.make_exception(State::S_PIP_READ, ss.str());
     }
 
     Token next_token(bool eat_whitespace = true, bool eat_newlines = false) {
@@ -944,7 +1402,9 @@ struct State {
           }
         }
 
+        // If it's not a number or a symbol, it will begin with a single character
         switch(c) {
+          // Whitespace handling
           // Eat newlines
           case '\n':
             if(eat_newlines) continue;
@@ -955,6 +1415,7 @@ struct State {
           case '.': return TK_DOT;
           case '(': return TK_LPAREN;
           case ')': return TK_RPAREN;
+          // Quotes
           case '\'': return TK_QUOTE;
           case '`': return TK_QUASIQUOTE;
           case ',': {
@@ -963,6 +1424,7 @@ struct State {
             ungetc(c);
             return TK_UNQUOTE;
           }
+          // Strings
           case '"': {
             token_buffer.clear();
             while((c = getc())) {
@@ -976,6 +1438,7 @@ struct State {
               }
             }
           }
+          // Read syntax (true and false)
           case '#': {
             c = getc();
             switch(c) {
@@ -1012,6 +1475,7 @@ struct State {
       return t;
     }
     
+    // The list reader
 #define PIP_READ_CHECK_TK(x) if((x) == TK_EXCEPTION) return pop_token_value(); 
 
     Value* read_list(Value* initial = 0) {
@@ -1019,6 +1483,7 @@ struct State {
       // Save the line this list begins on
       size_t l = line; 
       PIP_FRAME(state, initial, head, tail, elt, swap);
+      // If we've been given an initial element (say quote in a quoted expression), attach it
       if(initial != NULL) {
         swap = state.cons(initial, PIP_NULL);
         head = tail = swap;
@@ -1058,7 +1523,8 @@ struct State {
         state.append_m(&head, &tail, elt);
       }
 
-      // Read last element of dotted list
+      // Read last element of dotted list -- we also need to make sure it's the
+      // last element in the list
       if(token == TK_DOT) {
         token = peek_token();
         PIP_READ_CHECK_TK(token);
@@ -1077,7 +1543,7 @@ struct State {
         discard_lookahead();
       }
 
-      // Attach source info
+      // Attach source info by re-creating the head of the list with source information attached
       if(head->get_type() == PAIR) {
         swap = head->car();
         elt = head->cdr();
@@ -1087,6 +1553,8 @@ struct State {
       return head == PIP_FALSE ? PIP_NULL : head;
     }
 
+    // The actual entry point for the reader. Basically a fancy dispatcher for
+    // list reading, including shortcuts such as quotes
     Value* read() {
       Token token;
 
@@ -1100,7 +1568,10 @@ struct State {
           case TK_SYMBOL:
             return pop_token_value();
           case TK_LPAREN: {
-            if(peek_token(false, false) == TK_RPAREN) return PIP_NULL;
+            if(peek_token(false, false) == TK_RPAREN) {
+              discard_lookahead(); 
+              return PIP_NULL;
+            }
             return read_list();
           }
           case TK_RPAREN: return parse_error("unexpected ')'");
@@ -1136,7 +1607,575 @@ struct State {
     }
   };
 
-  ///// VIRTUAL MACHINE
+  ///// (CC) Compiler
+
+  // <--
+  // The Pip compiler is a simple, one-pass compiler. An instance of the
+  // compiler is created for each procedure (for the purposes of the compiler,
+  // something like a library source file is considered a procedure). There is
+  // no separate parsing step; the compiler operates directly on s-expressions.
+  // It is a little hairy in places because of this, but doing everything in
+  // one pass makes it much shorter.
+
+  // The compiler compiles a very small subset of Scheme. Most special forms,
+  // such as let, are implemented with macros. 
+
+  // It doesn't really do any optimization, although its implementation of
+  // closures, based on Lua's upvalues, reduces the access time of free
+  // variables and ensures that variables are not kept around longer than
+  // necessary.
+  // -->
+  
+  // Virtual machine instructions
+  enum {
+    OP_BAD = 0,
+    OP_PUSH_IMMEDIATE = 1,
+    OP_PUSH_CONSTANT = 2,
+    OP_GLOBAL_SET = 3,
+    OP_GLOBAL_GET = 4,
+    OP_LOCAL_SET = 5,
+    OP_LOCAL_GET = 6,
+    OP_UPVALUE_SET = 7,
+    OP_UPVALUE_GET = 8,
+    OP_RETURN = 10,
+    OP_APPLY = 11,
+    OP_TAIL_APPLY = 12
+  };
+
+
+  // Environments
+
+  // Environment format
+  // #(<parent environment> <key> <value> ...)
+
+  Vector* make_env(Value* parent = PIP_FALSE) {
+    Vector* env = 0;
+    PIP_S_FRAME(env, parent);
+    env = make_vector();
+    vector_append(env, parent);
+  }
+
+  // Set an environment variable
+  unsigned env_set(Vector* env, Value* key, Value* value) {
+    for(size_t i = 1; i != env->vector_length(); i += 2) {
+      if(env->vector_ref(i) == key) {
+        env->vector_set(i+1, value);
+        return ((i - 1) / 2) - 1;
+      }
+    }
+    PIP_S_FRAME(env, key, value);
+    unsigned slot = vector_append(env, key);
+    vector_append(env, value);
+    return ((slot - 1) / 1) - 1;
+  }
+
+
+  // Set an environment variable
+  enum RefScope { REF_GLOBAL, REF_UP, REF_LOCAL };
+  Value* env_ref(Vector* env, Value* key, RefScope& scope, unsigned& index) {
+    Value *start_env = env;
+    while(env->get_type() == VECTOR) {
+      for(size_t i = 1; i != env->vector_length(); i += 2) {
+        if(env->vector_ref(i) == key) {
+          if(env->vector_ref(0) == PIP_FALSE) {
+            scope = REF_GLOBAL;
+          } else {
+            scope = env == start_env ? REF_LOCAL : REF_UP;
+          }
+          index = (i - 1) / 2;
+          return env->vector_ref(i+1);
+        }
+      }
+      env = static_cast<Vector*>(env->vector_ref(0));
+    }
+    return PIP_FALSE;
+  }
+
+  Handle<Vector> global_env;
+
+  // An instance of the compiler, created for each procedure
+  struct Compiler {
+    Compiler(State& state_, Vector* env_ = NULL, size_t depth_ = 0): 
+      state(state_), stack_max(0), stack_size(0), locals(0), constants(state), closure(false),
+      env(0), depth(depth_) {
+      if(!env_) env = &state.global_env;
+      else env = new Handle<Vector>(state, env_);
+    }
+    ~Compiler() {
+      if(env != &state.global_env) delete env;    
+    }
+
+    State& state;
+    // The bytecode
+    std::vector<unsigned char> code;
+    // A vector containing combinations of instruction offsets and source location info for debugging and tracebacks
+    std::vector<std::pair<unsigned, SourceInfo> > debuginfo;
+    unsigned stack_max, stack_size, locals;
+    Handle<Vector> constants;
+    bool closure;
+    // The environment of the function
+    Handle<Vector>* env;
+    // The depth of the function (for debug message purposes)
+    size_t depth;
+
+    // Code generation
+    void emit(unsigned char byte) {
+      code.push_back(byte);
+    }
+
+    // In order to push a constant onto the stack, we have to save it and store
+    // it along with the function. This function lazily creates the vector of
+    // constants and makes sure no constants are repeated.
+    void push_constant(Value* constant) {
+      push();
+      Vector* cs = *constants;
+      PIP_FRAME(state, cs, constant);
+      // Lazily create constant vector
+      if(cs == PIP_FALSE) {
+        cs = state.make_vector();
+        constants = cs;
+      }
+      // Check for existing constant
+      for(unsigned i = 0; i != cs->vector_length(); i++) {
+        if(cs->vector_ref(i) == constant) {
+          // Constant already exists, don't append it to vector
+          emit(OP_PUSH_CONSTANT);
+          emit(i);
+          PIP_CC_VMSG("push-constant " << constant << " " << i << " (existing constant)");
+          return;
+        }
+      }
+      // Constant does not exist, add to vector and then push
+      unsigned i = state.vector_append(cs, constant);
+      emit(OP_PUSH_CONSTANT);
+      emit(i);
+      PIP_CC_VMSG("emit push-constant " << constant << " " << i);
+    }
+
+    // Stack size management; determines how much memory will be allocated for
+    // the stack
+    void push(ptrdiff_t i = 1) {
+      stack_size += i;
+      if(stack_size > stack_max) stack_max = stack_size;
+      PIP_CC_VMSG("PUSH: stack_size = " << stack_size);
+    }
+
+    void pop(ptrdiff_t i = 1) {
+      stack_size -= i;
+      PIP_ASSERT(stack_size >= 0);
+      PIP_CC_VMSG("POP: stack_size = " << stack_size);
+    }
+
+    // Dealing with symbols which are boxed and contain source code location
+    // info    
+    Value* unbox(Value* x) {
+      if(x->get_type() == BOX) return x->box_value();
+      return x;
+    }
+
+    // Annotating virtual machine instructions with their source location for
+    // debug purposes
+    void annotate(Value* exp) {
+      SourceInfo src;
+      unwrap_source_info(exp, src);
+      if(src.file) {
+        unsigned insn = code.size() - 1;
+        std::pair<unsigned, SourceInfo> dbg(insn, src);
+        debuginfo.push_back(dbg);
+      }
+    }
+
+    // Error handling
+    Value* error(Value* form, const std::string& msg) {
+      std::string out;
+      state.format_source_error(form, msg, out);
+      return state.make_exception(State::S_PIP_COMPILE, out);
+    }
+
+    Value* syntax_error(Value* form, const std::string& str) {
+      std::string out;
+      state.format_source_error(form, str, out);
+      return state.make_exception(State::S_PIP_COMPILE, out);
+    }
+
+    Value* arity_error(Global name, Value* form, size_t expected, unsigned got) {
+      std::ostringstream ss;
+      ss << "malformed " << state.global_symbol(name) << ": expected " << expected << " arguments, but got " << got;
+      syntax_error(form, ss.str());
+    }
+
+    Value* syntax_error(Global name, Value* form, const std::string& str) {
+      std::ostringstream ss;
+      ss << "malformed " << state.global_symbol(name) << ": " << str;
+      syntax_error(form, ss.str());
+    }
+
+    Value* undefined_variable(Value* form) {
+      std::ostringstream ss;
+      ss << "reference to undefined variable '" << form << '\'';;
+      std::string out;
+      state.format_source_error(form, ss.str(), out);
+      return state.make_exception(State::S_PIP_COMPILE, out);
+    }
+
+    // Compile a single expression, returns #f or an error if one occurred
+    Value* compile(Value* exp) {
+      Value* chk = 0;
+      switch(exp->get_type()) {
+        // Constants
+        case CONSTANT:
+          emit(OP_PUSH_IMMEDIATE);
+          emit((unsigned char)(((size_t) exp) & 255));
+          PIP_CC_VMSG("emit push-immediate " << exp);
+          push();
+          break;
+        // Variable references
+        case SYMBOL:
+        case BOX: {
+          annotate(exp);
+          Value* name = unbox(exp);
+          RefScope scope;
+          unsigned index;
+          Value* type = state.env_ref(**env, name, scope, index);
+          if(type == state.global_symbol(S_SPECIAL))
+            return syntax_error(exp, "special forms cannot be used as values");
+          if(type == state.global_symbol(S_VARIABLE)) {
+            switch(scope) {
+              case REF_GLOBAL:
+                push_constant(name);
+                emit(OP_GLOBAL_GET);
+                PIP_CC_VMSG("emit global-get " << name);
+                push();
+                break;
+              case REF_LOCAL:
+                emit(OP_LOCAL_GET);
+                emit((unsigned char)index);
+                PIP_CC_VMSG("emit local-get " << name << ' ' << index);
+                break;
+              case REF_UP:
+                assert(false);
+            } 
+          } else assert(0);
+          break;
+        }
+        case PAIR: {
+          // Compile applications, including special forms, macros, and normal function applications
+          if(!listp(exp)) return error(exp, "dotted lists not allowed in source");
+          annotate(exp);
+          // Check for special forms
+          RefScope scope;
+          unsigned index;
+          Value* type = state.env_ref(**env, unbox(exp->car()), scope, index);
+          // This is a special form
+          if(type == state.global_symbol(S_SPECIAL)) {
+            Symbol* op = PIP_CAST(Symbol, unbox(exp->car()));
+            size_t argc = length(exp->cdr());
+            // define
+            if(op == state.global_symbol(S_DEFINE)) {
+              if(argc != 2) return arity_error(S_DEFINE, exp, 2, argc);
+              Value* name = unbox(exp->cadr());
+              // TODO: lambda shortcut 
+              if(name->get_type() != SYMBOL)
+                return syntax_error(S_DEFINE, exp, "first argument to define must be a symbol");
+              unsigned slot = state.env_set(**env, name, state.global_symbol(S_VARIABLE));
+              // Compile body
+              compile(exp->cddr()->car());
+              // Global variable
+              if(**env == *state.global_env) {
+                // NOTE: Causes allocation
+                push_constant(name);
+                emit(OP_GLOBAL_SET);
+                PIP_CC_VMSG("emit global-set " << name);
+                pop(2);
+              } else {
+                locals++;
+                emit(OP_LOCAL_SET);
+                emit(slot);
+                pop();
+              }
+            // set!
+            } else if(op == state.global_symbol(S_SET)) {
+              // set always has two arguments
+              if(argc != 2) return arity_error(S_SET, exp, 2, argc);
+              Value* name = unbox(exp->cadr());
+              if(name->get_type() != SYMBOL)
+                return syntax_error(S_SET, exp, "first argument to set! must be a symbol");
+              // look up variable
+              unsigned index;
+              RefScope scope;
+              Value* type = state.env_ref(**env, name, scope, index);
+              if(type == state.global_symbol(S_SPECIAL))
+                return syntax_error(exp, "special forms cannot be used as variables");
+              else if(type == state.global_symbol(S_VARIABLE)) {
+                switch(scope) {
+                  case REF_GLOBAL:
+                  case REF_LOCAL: assert(0);
+                  case REF_UP: assert(0);
+                }
+              } else assert(0);
+            // lambda
+            } else if(op == state.global_symbol(S_LAMBDA)) {
+              if(argc < 2) return arity_error(S_LAMBDA, exp, 2, argc);
+              // Create new compiler, environment
+              unsigned argc = 0;
+              bool variable_arity = false;
+              Value *new_env = 0, *args = 0, *body = 0;
+              Prototype* proto = 0;
+              PIP_FRAME(state, exp, new_env, args, body, proto);
+              new_env = state.make_vector();
+              state.vector_append(PIP_CAST(Vector, new_env), **env);
+              // Add arguments to environment
+              args = exp->cadr();
+              if(args != PIP_NULL) {
+                if(args->get_type() != PAIR) 
+                  return syntax_error(S_LAMBDA, exp, "first argument to lambda must be either () or a list of arguments");
+                while(args->get_type() == PAIR) {
+                  Value* arg = unbox(args->car());
+                  if(arg->get_type() != SYMBOL) {
+                    return syntax_error(S_LAMBDA, exp, "lambda argument list must be symbols");
+                  }
+                  state.vector_append(PIP_CAST(Vector, new_env), arg);
+                  state.vector_append(PIP_CAST(Vector, new_env), state.global_symbol(S_VARIABLE));
+                  argc++;
+                  args = args->cdr();
+                  if(args->get_type() != PAIR) {
+                    variable_arity = true;
+                    break;
+                  }
+                }
+              }
+              PIP_CC_MSG("compiling subprocedure");
+              Compiler cc(state, PIP_CAST(Vector, new_env), depth+1);
+              // Compile body
+              body = exp->cddr();
+              while(body != PIP_NULL) {
+                chk = cc.compile(body->car());
+                PIP_CHECK(chk);
+                body = body->cdr();
+              }
+              proto = cc.end(argc, variable_arity);
+              push_constant(proto);
+            }
+          } else {
+            // function application
+
+            // First, compile the arguments. We'll determine how many arguments
+            // were passed by comparing the stack size before and after
+            // compiling them.
+            size_t old_stack_size = stack_size;
+
+            Value* args = exp->cdr();
+            while(args != PIP_NULL) {
+              chk = compile(args->car());
+              PIP_CHECK(chk);
+              args = args->cdr();
+            }
+
+            size_t argc = stack_size - old_stack_size;
+            // Compile the actual function, which might be a symbol or perhaps
+            // an inline anonymous function (e.g. ((lambda () #t)))
+            chk = compile(exp->car());
+            PIP_CHECK(chk);
+
+            emit(OP_APPLY);
+            PIP_ASSERT(argc < 255);
+            emit((unsigned char) argc); 
+            PIP_CC_VMSG("emit apply " << argc);
+            // The application will pop the arguments and the function once finished
+            pop(stack_size - old_stack_size);
+            return PIP_FALSE;
+          }
+          break;
+        }
+        default:
+          PIP_ASSERT(!"unknown expression given to compiler");
+          break;
+      }
+      return PIP_FALSE;
+    }
+
+    // Creates the actual Prototype at the end of compilation
+    Prototype* end(unsigned arguments = 0, bool variable_arity = false) {
+      emit(OP_RETURN);
+      PIP_CC_VMSG("emit return");
+      Prototype* p = 0;
+      Blob* codeblob = 0;
+      PIP_FRAME(state, p, codeblob);
+      p = state.allocate<Prototype>();
+      codeblob = state.make_blob(code.size());
+      std::copy(code.begin(), code.end(), codeblob->data);
+      p->code = codeblob;
+      p->stack_max = stack_max;
+      p->locals = locals;
+      // TODO: Compress vector
+      p->constants = *constants;
+      p->arguments = arguments;
+      if(variable_arity)
+        p->set_header_bit(PROTOTYPE, Value::PROTOTYPE_VARIABLE_ARITY_BIT);
+      return p;
+    }
+  };
+
+  ///// (VM) VIRTUAL MACHINE
+
+  // Return that properly unwinds the stack
+#define VM_RETURN(x) { \
+  vm_frames.pop_back(); \
+  vm_depth--; \
+  return x; }
+
+  // Check for exceptions and unwind the stack if necessary
+#define VM_CHECK(x) \
+  if(x->active_exception()) { \
+    VM_RETURN(x); \
+  }
+
+  size_t vm_depth;
+
+  // A frame containing information that needs to be tracked by the garbage collector
+  struct VMFrame {
+    VMFrame(Prototype* p_, Closure* c_, Value** stack_, Value** locals_): p(p_), c(c_), stack(stack_), locals(locals_), si(0) {}
+    // Need to save pointers to the prototype and closure so they're considered roots
+    Prototype* p;
+    Closure* c;
+    // Storage for stack and locals
+    Value** stack;
+    Value** locals;
+    // Stack index
+    unsigned si;
+  };
+
+  // Evaluation errors
+  Value* arity_error() {
+    return make_exception(State::S_PIP_EVAL, "function got bad amount of arguments");
+  }
+
+  Value* bad_application() {
+    return make_exception(State::S_PIP_EVAL, "attempt to apply non-function");
+  }
+
+  // Attempt to apply non-function eg (#t)
+  // Apply bytecode function
+  Value* apply(Prototype* prototype, Closure* closure, size_t argc, Value* args[]) {
+    vm_depth++;
+    PIP_VM_MSG("entering function ");
+    // Get pointer to code
+    // NOTE: could be moved if moving garbage collector is ever used
+    unsigned char* bc = (unsigned char*)(prototype->code->data);
+
+    // Set up call frame
+    VMFrame f(prototype, closure, 
+        static_cast<Value**>(alloca(prototype->stack_max * sizeof(Value*))),
+        static_cast<Value**>(alloca(prototype->locals * sizeof(Value*))));
+    // Clear local storage (necessary because garbage collector might look at them even before they are set)
+    memset(f.locals, 0, prototype->locals * sizeof(Value*));
+    // Push call frame
+    vm_frames.push_back(&f);
+
+    // Load arguments
+
+    // Check argument count
+    if(argc < prototype->arguments) {
+      return arity_error();
+    }
+
+    // Load normal arguments
+    size_t i;
+    for(i = 0; i != prototype->arguments; i++) {
+      f.locals[i] = args[i];
+    }
+
+    // If we're not done yet, either we've received too many arguments or this is a variable arity function
+    if(i != argc) {
+      if(prototype->prototype_variable_arity()) {
+        return make_exception(State::S_PIP_EVAL, "variable arity not supported yet");
+      } else {
+        return arity_error();
+      }
+    }
+
+    // Evaluate procedure
+    unsigned ip = 0;
+    while(1) {
+      switch(bc[ip++]) {
+        case OP_PUSH_IMMEDIATE:
+          f.stack[f.si++] = (Value*)(ptrdiff_t) bc[ip++]; 
+          continue;
+        case OP_PUSH_CONSTANT:
+          f.stack[f.si++] = f.p->constants->vector_ref(bc[ip++]);
+          continue;
+        case OP_GLOBAL_SET: {
+          std::cout << "YEAH " << f.stack[f.si-1] << ' ' << f.stack[f.si-2] << ' ' << f.si << std::endl;
+          Symbol* k = PIP_CAST(Symbol, f.stack[f.si-1]);
+          f.si--;
+          std::cout << "READING FROM :  " << f.si << std::endl;
+          Value* v = f.stack[--f.si];
+          std::cout << f.si << std::endl;
+          k->value = v;
+          continue;
+        }
+        case OP_GLOBAL_GET: {
+          // Pop the global name (this is guaranteed to be a symbol)
+          Symbol* k = PIP_CAST(Symbol, f.stack[f.si-1]);
+          f.si--;
+          // TODO: error messages
+          f.stack[f.si++] = k->value;
+          continue;
+        }
+        case OP_LOCAL_GET: {
+          // Get the local index
+          unsigned char index = bc[ip++];
+          PIP_VM_VMSG("get-local-index " << (unsigned)index);
+          f.stack[f.si++] = f.locals[index];
+          continue;
+        }
+        case OP_RETURN: {
+          PIP_VM_VMSG("return");
+          // Get return value
+          Value* ret = f.si ? f.stack[--f.si] : PIP_UNSPECIFIED;
+          VM_RETURN(ret);
+        }
+        case OP_APPLY: {
+          // Retrieve argument count
+          unsigned char argc = bc[ip++];
+          PIP_VM_VMSG("apply " << (unsigned)argc);
+          // Pop the function, which should be at the top of the stack
+          Value* fn = f.stack[f.si-1];
+          f.si--;
+          // Apply the function to the arguments by slicing the stack
+          Value* tmp = apply(fn, argc, &f.stack[f.si-argc]);
+          VM_CHECK(tmp);
+          // Pop the rest of the arguments off the stack
+          f.si -= argc;
+          // Add the result of application to the stack
+          f.stack[f.si++] = tmp;
+          PIP_VM_VMSG("apply result: " << tmp);
+          continue;
+        }
+        default: {
+          std::cout << (int)bc[ip-1] << std::endl;
+          assert(!"bad instruction");
+        }
+      }
+    }
+  }
+
+  // Safe apply which also unwraps closures
+  Value* apply(Value* function, size_t argc, Value* args[]) {
+    switch(function->get_type()) {
+      case PROTOTYPE:
+        return apply(PIP_CAST(Prototype, function), 0, argc, args);
+      case CLOSURE:
+        return apply(PIP_CAST(Prototype, PIP_CAST(Closure, function)->prototype), PIP_CAST(Closure, function), argc, args);
+      default:
+        PIP_ASSERT(!"bad application");
+        break;
+    }
+    return PIP_UNSPECIFIED;
+  } 
+
+#undef VM_RETURN
+#undef VM_CHECK
 }; // State
 
 ///// GARBAGE COLLECTOR TRACKING IMPLEMENTATION
@@ -1168,13 +2207,21 @@ inline Handle<T>::Handle(State& state_, T* ref_): state(state_), ref(ref_) {
 
 template <class T>
 inline void Handle<T>::initialize() {
-  location = state.handle_list.insert(state.handle_list.begin(),
-      (Handle<Value> *) this);
+  previous = state.handle_list;
+  if(previous)
+    previous->next = (Handle<Value> *) this;
+  state.handle_list = (Handle<Value> *) this;
+  next = 0;
 }
 
 template <class T>
 inline Handle<T>::~Handle() {
-  state.handle_list.erase(location);
+  if(previous) previous->next = next;
+  if(next) next->previous = previous;
+  if(state.handle_list == (Handle<Value> *) this) {
+    PIP_ASSERT(!next);
+    state.handle_list = previous;
+  }
 }
 
 inline std::ostream& operator<<(std::ostream& os, Value* x) {
@@ -1193,6 +2240,13 @@ inline std::ostream& operator<<(std::ostream& os, Value* x) {
         return os << "#<blob " << x->blob_length() << '>';
     case STRING:
         return os << x->string_data();
+    case VECTOR:
+        os << "#(";
+        for(size_t i = 0; i != x->vector_length(); i++) {
+          os << x->vector_ref(i);
+          if(i != x->vector_length() - 1) os << ' ';
+        }
+        return os << ')';
     case PAIR: {
       os << '(' << x->car();
       for(x = x->cdr(); x->get_type() == PAIR; x = x->cdr()) {
@@ -1214,6 +2268,7 @@ inline std::ostream& operator<<(std::ostream& os, Value* x) {
     case EXCEPTION: {
       return os << "#<exception " << x->exception_tag() << ' ' << x->exception_message() << '>';
     }
+    case PROTOTYPE: return os << "#<prototype>";
     default:
       return os << "#<unknown value " << (size_t) x << " type: " << x->get_type() << ">";
   }

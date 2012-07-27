@@ -19,3 +19,5 @@ symbol
 ,jerk
 `jerk
 ,@jerk
+
+(lambda () #t)

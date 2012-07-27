@@ -106,16 +106,16 @@ static void bench_boehm() {
   GCPair *root, *long_lived_tree, *temp_tree;
   temp_tree = make_tree(kStretchTreeDepth);
   temp_tree = 0;
-  // Create long-lived tree
-  cout << "! Creating a long-lived binary tree of depth " << kLongLivedTreeDepth << endl;
-  long_lived_tree = new GCPair();
-  populate(kLongLivedTreeDepth, long_lived_tree);
   // Create long-lived array
   cout << "! Creating a long-lived array of " << kArraySize << " doubles " << endl;
   double* array = (double*) GC_MALLOC_ATOMIC(sizeof(double) * kArraySize);
   for(int i = 0; i < kArraySize / 2; ++i) {
     array[i] = 1.0/i;
   }
+  // Create long-lived tree
+  cout << "! Creating a long-lived binary tree of depth " << kLongLivedTreeDepth << endl;
+  long_lived_tree = new GCPair();
+  populate(kLongLivedTreeDepth, long_lived_tree);
 
   int i=2;
   while(i--) {
@@ -222,7 +222,7 @@ int main(int argc, char** argv) {
   long start = CURRENT_TIME();
   cout << "! BEGIN " << (BOEHM_GC ? "BOEHM" : "PIP") << endl;
   cout << "! Live storage will peak at " << 
-    FriendlySize(2 * sizeof(Pair) * tree_size(kLongLivedTreeDepth) + sizeof(double) * kArraySize) << endl <<
+    FriendlySize((2 * sizeof(Pair) * tree_size(kLongLivedTreeDepth)) + (sizeof(double) * kArraySize)) << endl <<
     "! Stretching memory with a binary tree of depth " << kStretchTreeDepth << endl <<
     "! Long-lived binary tree of depth " << kLongLivedTreeDepth << " and long-lived array of " << kArraySize << " doubles " << endl;
   cout.flush();

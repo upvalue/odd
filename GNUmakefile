@@ -1,4 +1,4 @@
-CXXFLAGS := -std=c++11 -O2 -g3 -fno-rtti -fno-exceptions -DPIP_DEBUG
+CXXFLAGS :=  -O2 -g3 -fno-rtti -fno-exceptions -DPIP_DEBUG
 LDFLAGS := 
 
 -include site.mk

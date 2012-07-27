@@ -96,6 +96,27 @@ static void test_symbols(State& state) {
   assert(state.markedp(*sym4));
 }
 
+static void test_vectors(State& state) {
+  std::cout << "!! test_vectors" << std::endl;
+  Vector* v = 0;
+  PIP_FRAME(state, v);
+  v = state.make_vector();
+
+  //state.collect();
+
+  for(int i = 0; i != 10; i++) {
+    state.vector_append(v, Value::make_fixnum(i));
+  }
+
+  state.collect();
+
+  for(int i = 0; i != 10; i++) {
+    assert(v->vector_ref(i) == Value::make_fixnum(i));
+  }
+
+  std::cout << v << std::endl;
+}
+
 static void test_reader(State& state) {
   std::cout << "!! test_reader" << std::endl;
   unsigned file = state.register_file("test/read.ss");
@@ -110,13 +131,81 @@ static void test_reader(State& state) {
   }
 }
 
+Value* eval_string(State& state, const std::string& string) {
+  unsigned file = state.register_string("string", string);
+  State::Compiler cc(state);
+  std::stringstream ss;
+  ss << std::noskipws;
+  ss << string;
+  State::Reader reader(state, ss, file);
+  Value* x = 0;
+  Value* check = 0;
+  Prototype* p = 0;
+  PIP_FRAME(state, x, p, check);
+  std::cout << "!! compile_string: " << string << std::endl;
+  while(true) {
+    x = reader.read();
+    if(x == PIP_EOF) break;
+    check = cc.compile(x);
+    if(check != PIP_FALSE) {
+      //std::cout << check << std::endl;
+      assert(0);
+    }
+  }
+  p = cc.end();
+  x = state.apply(p, 0, 0, 0);
+  return x;
+}
+
+void test_compile_string(State& state, const std::string& string, Value* result) {
+  Value* x = eval_string(state, string);
+  std::cout << "!! test_compiler: " << string <<  " => " << x << std::endl;
+  assert(x == result);
+}
+
+void test_compile_string(State& state, const std::string& string, Type type) {
+  Value* x = eval_string(state, string);
+  std::cout << "!! test_compiler (result type): " << string << " => " << type << std::endl;
+  assert(x->get_type() == type);
+}
+
+void test_compiler(State& state) {
+  std::cout << "!! test_compiler" << std::endl;
+  test_compile_string(state, "#t", PIP_TRUE);
+  test_compile_string(state, "#f", PIP_FALSE);
+  // Global variable access
+  test_compile_string(state, "(define x #t) x", PIP_TRUE);
+  // Function compilation
+  test_compile_string(state, "(lambda () #t) ", PROTOTYPE);
+  // Simple application
+  test_compile_string(state, "((lambda () #t))", PIP_TRUE);
+  // Argument function and application
+  test_compile_string(state, "((lambda (x) x) #t)", PIP_TRUE);
+  // Closures
+  //test_compile_string(state, "((lambda (x) ((lambda () x))) #t)", PIP_TRUE);
+}
+
 void test() {
   State* state = new State;
 
+  std::cout << "!! sizeof(State) " << sizeof(State) << " [" << FriendlySize(sizeof(State)) << "]" << std::endl;
   state->collect_before_every_allocation = true;
   test_gc_1(*state);
   test_symbols(*state);
+  test_vectors(*state);
   test_reader(*state);
+  test_compiler(*state);
+
+  { 
+    State::Compiler cc(*state);
+    cc.compile(PIP_TRUE);
+    Prototype* p = 0;
+    {
+      PIP_FRAME(*state, p);
+      p = cc.end();
+      std::cout << state->apply(p, 0, 0, 0) << std::endl;
+    }
+  }
 
   std::cout << "Collections "<< state->collections << std::endl;
 
