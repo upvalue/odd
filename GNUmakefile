@@ -1,11 +1,11 @@
-CXXFLAGS :=  -O2 -g3 -fno-rtti -fno-exceptions -DPIP_DEBUG
+CXXFLAGS := -g3 -fno-rtti -fno-exceptions -DPIP_DEBUG
 LDFLAGS := 
 
 -include site.mk
 
 all: pip
 
-pip: cli.cpp pip.hpp
+pip: cli.cpp pip.hpp test/tests.cpp
 	@echo -n ' LD  ';
 	$(strip $(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $< $(LDFLAGS))
 

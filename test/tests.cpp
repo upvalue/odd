@@ -145,7 +145,7 @@ Value* eval_string(State& state, const std::string& string) {
     if(x == PIP_EOF) break;
     check = cc.compile(x);
     if(check != PIP_FALSE) {
-      //std::cout << check << std::endl;
+      std::cerr << check << std::endl;
       assert(0);
     }
   }
@@ -154,13 +154,13 @@ Value* eval_string(State& state, const std::string& string) {
   return x;
 }
 
-void test_compile_string(State& state, const std::string& string, Value* result) {
+void test_eval(State& state, const std::string& string, Value* result) {
   Value* x = eval_string(state, string);
   std::cout << "!! test_compiler: " << string <<  " => " << x << std::endl;
   assert(x == result);
 }
 
-void test_compile_string(State& state, const std::string& string, Type type) {
+void test_eval(State& state, const std::string& string, Type type) {
   Value* x = eval_string(state, string);
   std::cout << "!! test_compiler (result type): " << string << " => " << type << std::endl;
   assert(x->get_type() == type);
@@ -168,20 +168,24 @@ void test_compile_string(State& state, const std::string& string, Type type) {
 
 void test_compiler(State& state) {
   std::cout << "!! test_compiler" << std::endl;
-  test_compile_string(state, "#t", PIP_TRUE);
-  test_compile_string(state, "#f", PIP_FALSE);
+  test_eval(state, "#t", PIP_TRUE);
+  test_eval(state, "#f", PIP_FALSE);
   // Global variable access
-  test_compile_string(state, "(define x #t) x", PIP_TRUE);
+  test_eval(state, "(define x #t) x", PIP_TRUE);
   // Function compilation
-  test_compile_string(state, "(lambda () #t) ", PROTOTYPE);
+  test_eval(state, "(lambda () #t) ", PROTOTYPE);
   // Simple application
-  test_compile_string(state, "((lambda () #t))", PIP_TRUE);
+  test_eval(state, "((lambda () #t))", PIP_TRUE);
   // Argument function and application
-  test_compile_string(state, "((lambda (x) x) #t)", PIP_TRUE);
+  test_eval(state, "((lambda (x) x) #t)", PIP_TRUE);
   // Set!
-  test_compile_string(state, "(define z #f) (set! z #t) z", PIP_TRUE);
-  test_compile_string(state, "((lambda (x) (set! x #t) x) #f)", PIP_TRUE);
-  test_compile_string(state, "((lambda (x) ((lambda () x))) #t)", PIP_TRUE);
+  test_eval(state, "(define z #f) (set! z #t) z", PIP_TRUE);
+  test_eval(state, "((lambda (x) (set! x #t) x) #f)", PIP_TRUE);
+  // Closures
+  test_eval(state, "((lambda (x) ((lambda () x))) #t)", PIP_TRUE);
+  // 2-level Closure
+  test_eval(state, "((lambda (x) ((lambda () ((lambda () x))))) #t)", PIP_TRUE);
+  //test_eval(state, "((lambda (x) ((lambda () ((lambda () x)))) #t))", PIP_TRUE);
 }
 
 void test() {

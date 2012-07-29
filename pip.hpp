@@ -428,7 +428,7 @@ struct Prototype : Value {
   String* name;
   unsigned stack_max;
   unsigned locals;
-  unsigned free_variable_count;
+  unsigned local_free_variable_count;
   unsigned arguments;
 
   static const Type CLASS_TYPE = PROTOTYPE;
@@ -907,7 +907,7 @@ struct State {
         recursive_mark(f->locals[j]);
       }
       // Mark upvalues (if necessary)
-      for(size_t j = 0; j != f->p->free_variable_count; j++) {
+      for(size_t j = 0; j != f->p->local_free_variable_count; j++) {
         recursive_mark(f->upvalues[j]);
       }
     }
@@ -1718,7 +1718,7 @@ struct State {
   }
 
   // Set an environment variable
-  unsigned env_set(Vector* env, Value* key, Value* value) {
+  unsigned env_def(Vector* env, Value* key, Value* value) {
     for(size_t i = 1; i != env->vector_length(); i += 2) {
       if(env->vector_ref(i) == key) {
         env->vector_set(i+1, value);
@@ -1789,7 +1789,9 @@ struct State {
   // An instance of the compiler, created for each procedure
   struct Compiler {
     Compiler(State& state_, Compiler* parent_, Vector* env_ = NULL, size_t depth_ = 0): 
-      state(state_), parent(parent_), stack_max(0), stack_size(0), locals(0), constants(state), closure(false),
+      state(state_), parent(parent_),
+      local_free_variable_count(0), upvalue_count(0),
+      stack_max(0), stack_size(0), locals(0), constants(state), closure(false),
       env(0), depth(depth_) {
       if(!env_) env = &state.global_env;
       else env = new Handle<Vector>(state, env_);
@@ -1799,14 +1801,16 @@ struct State {
     }
 
     State& state;
-    // The parent procedure -- necessary for free_variables
+    // The parent procedure -- necessary for free variables
     Compiler* parent;
     // The bytecode
     std::vector<unsigned char> code;
     // A vector containing combinations of instruction offsets and source location info for debugging and tracebacks
     std::vector<std::pair<unsigned, SourceInfo> > debuginfo;
-    // A vector containing free_variable locations
+    // A vector containing free variable locations
     std::vector<FreeVariableInfo> free_variables;
+    unsigned local_free_variable_count, upvalue_count;
+
     unsigned stack_max, stack_size, locals;
     Handle<Vector> constants;
     bool closure;
@@ -1882,7 +1886,7 @@ struct State {
       }
     }
 
-    // Error handling
+    // error handling
     Value* error(Value* form, const std::string& msg) {
       std::string out;
       state.format_source_error(form, msg, out);
@@ -1935,18 +1939,204 @@ struct State {
         // Register with preceding function, and make this a closure if it isn't already
         closure = true;
         l.index = parent->register_free_variable(lookup_copy);
+        upvalue_count++;
       } else {
         // If the "level" is 0, it's actually a local variable, so we
         // don't need necessarily need to make this function a closure
         l.index = l.lexical_index;
+        local_free_variable_count++;
       }
       free_variables.push_back(l);
       return free_variables.size() - 1;
     }
 
+    // Generate a set! (used by both define and set!)
+    // Assumes value is already on the stack
+    void generate_set(Lookup& lookup, Value* name) {
+      switch(lookup.scope) {
+        case REF_GLOBAL:
+          push_constant(name);
+          emit(OP_GLOBAL_SET);
+          PIP_CC_VMSG("emit global-set " << name);
+          pop(2);
+          break;
+        case REF_LOCAL:
+          emit(OP_LOCAL_SET);
+          emit(lookup.index);
+          PIP_CC_VMSG("emit local-set " << (unsigned) lookup.index);
+          pop();
+          break;
+        case REF_UP: assert(0);
+      }
+    }
+
+    // Special forms
+    Value* compile_set(size_t argc, Value* exp) {
+      Value* chk = 0;
+      // set always has two arguments
+      if(argc != 2) return arity_error(S_SET, exp, 2, argc);
+      Value* name = unbox(exp->cadr());
+      // Check that name is a symbol
+      if(name->get_type() != SYMBOL)
+        return syntax_error(S_SET, exp, "first argument to set! must be a symbol");
+
+      // Compile body 
+      chk = compile(exp->cddr()->car());
+      PIP_CHECK(chk);
+
+      // Look up variable
+      Lookup lookup;
+      Value* type = state.env_ref(**env, name, lookup);
+      // Don't allow special forms
+      if(type == state.global_symbol(S_SPECIAL))
+        return syntax_error(exp, "special forms cannot be used as variables");
+      // Lookup was successful
+      else if(type == state.global_symbol(S_VARIABLE)) {
+        generate_set(lookup, name);
+      } else assert(0);
+      return PIP_FALSE;
+    }
+
+    Value* compile_define(size_t argc, Value* exp) {
+      Value* chk = 0;
+      if(argc != 2) return arity_error(S_DEFINE, exp, 2, argc);
+      Value* name = unbox(exp->cadr());
+      // TODO: lambda shortcut 
+      if(name->get_type() != SYMBOL)
+        return syntax_error(S_DEFINE, exp, "first argument to define must be a symbol");
+      unsigned slot = state.env_def(**env, name, state.global_symbol(S_VARIABLE));
+      // Compile body for set!
+      chk = compile(exp->cddr()->car());
+      PIP_CHECK(chk);
+      // Global variable
+      Lookup lookup;
+      lookup.scope = (*env)->vector_ref(0) == PIP_FALSE ? REF_GLOBAL : REF_LOCAL;
+      lookup.index = slot;
+      generate_set(lookup, name);
+      return PIP_FALSE;
+    }
+
+    Value* compile_lambda(size_t form_argc, Value* exp) {
+      // For checking subcompilation results
+      Value* chk = 0;
+      if(form_argc < 2) return arity_error(S_LAMBDA, exp, 2, form_argc);
+      // Create new compiler, environment
+      unsigned argc = 0;
+      // Will be set to true if the function is variable arity
+      // (i.e. takes unlimited arguments)
+      bool variable_arity = false;
+      Value *new_env = 0, *args = 0, *body = 0;
+      Prototype* proto = 0;
+      PIP_FRAME(state, exp, new_env, args, body, proto);
+      // Create a new environment for the function
+      new_env = state.make_vector();
+      // Make the current environment its parent environment
+      state.vector_append(PIP_CAST(Vector, new_env), **env);
+      // Now parse the function's arguments and define them within the
+      // new environment
+      args = exp->cadr();
+      if(args != PIP_NULL) {
+        if(args->get_type() != PAIR) 
+          return syntax_error(S_LAMBDA, exp, "first argument to lambda must be either () or a list of arguments");
+        while(args->get_type() == PAIR) {
+          Value* arg = unbox(args->car());
+          if(arg->get_type() != SYMBOL) {
+            return syntax_error(S_LAMBDA, exp, "lambda argument list must be symbols");
+          }
+          // Finally, we can add them to the environment!
+          state.vector_append(PIP_CAST(Vector, new_env), arg);
+          state.vector_append(PIP_CAST(Vector, new_env), state.global_symbol(S_VARIABLE));
+          argc++;
+          args = args->cdr();
+          if(args->get_type() != PAIR) {
+            variable_arity = true;
+            break;
+          }
+        }
+      }
+      // Compile the procedure's body
+      PIP_CC_MSG("compiling subprocedure");
+      Compiler cc(state, this, PIP_CAST(Vector, new_env), depth+1);
+      body = exp->cddr();
+      while(body != PIP_NULL) {
+        chk = cc.compile(body->car());
+        PIP_CHECK(chk);
+        body = body->cdr();
+      }
+      proto = cc.end(argc, variable_arity);
+      push_constant(proto);
+      // If the function's a closure, we'll have to close over it
+      if(cc.closure) {
+        PIP_CC_VMSG("emit close-over");
+        emit(OP_CLOSE_OVER);
+      }
+      return PIP_FALSE;
+    }
+
+    // Compile a normal function application
+    Value* compile_apply(Value* exp) {
+      Value* chk = 0;
+      // First, compile the arguments. We'll determine how many arguments
+      // were passed by comparing the stack size before and after
+      // compiling them.
+      size_t old_stack_size = stack_size;
+
+      Value* args = exp->cdr();
+      while(args != PIP_NULL) {
+        chk = compile(args->car());
+        PIP_CHECK(chk);
+        args = args->cdr();
+      }
+
+      size_t argc = stack_size - old_stack_size;
+      // Compile the actual function, which might be a symbol or perhaps
+      // an inline anonymous function (e.g. ((lambda () #t)))
+      chk = compile(exp->car());
+      PIP_CHECK(chk);
+
+      emit(OP_APPLY);
+      PIP_ASSERT(argc < 255);
+      emit((unsigned char) argc); 
+      PIP_CC_VMSG("emit apply " << argc);
+      // The application will pop the arguments and the function once finished
+      pop(stack_size - old_stack_size);
+      return PIP_FALSE;
+    }
+
+    // Compile a variable reference
+    Value* compile_ref(Value* exp) {
+      annotate(exp);
+      Value* name = unbox(exp);
+      Lookup lookup;
+      Value* type = state.env_ref(**env, name, lookup);
+      if(type == state.global_symbol(S_SPECIAL))
+        return syntax_error(exp, "special forms cannot be used as values");
+      if(type == state.global_symbol(S_VARIABLE)) {
+        switch(lookup.scope) {
+          case REF_GLOBAL:
+            push_constant(name);
+            emit(OP_GLOBAL_GET);
+            PIP_CC_VMSG("emit global-get " << name);
+            push();
+            break;
+          case REF_LOCAL:
+            emit(OP_LOCAL_GET);
+            emit((unsigned char)lookup.index);
+            PIP_CC_VMSG("emit local-get " << name << ' ' << lookup.index);
+            break;
+          case REF_UP:
+            unsigned index = register_free_variable(lookup);
+            emit(OP_UPVALUE_GET);
+            emit((unsigned char) index);
+            PIP_CC_VMSG("emit upvalue-get " << name << ' ' << index);
+            break;
+        } 
+      } else PIP_ASSERT(0);
+      return PIP_FALSE;
+    }
+
     // Compile a single expression, returns #f or an error if one occurred
     Value* compile(Value* exp) {
-      Value* chk = 0;
       // Dispatch based on an object's type
       switch(exp->get_type()) {
         // Constants: note that these are only immediate constants, such as #t
@@ -1961,183 +2151,37 @@ struct State {
         // Variable references
         case SYMBOL:
         case BOX: {
-          annotate(exp);
-          Value* name = unbox(exp);
-          Lookup lookup;
-          Value* type = state.env_ref(**env, name, lookup);
-          if(type == state.global_symbol(S_SPECIAL))
-            return syntax_error(exp, "special forms cannot be used as values");
-          if(type == state.global_symbol(S_VARIABLE)) {
-            switch(lookup.scope) {
-              case REF_GLOBAL:
-                push_constant(name);
-                emit(OP_GLOBAL_GET);
-                PIP_CC_VMSG("emit global-get " << name);
-                push();
-                break;
-              case REF_LOCAL:
-                emit(OP_LOCAL_GET);
-                emit((unsigned char)lookup.index);
-                PIP_CC_VMSG("emit local-get " << name << ' ' << lookup.index);
-                break;
-              case REF_UP:
-                unsigned index = register_free_variable(lookup);
-                emit(OP_UPVALUE_GET);
-                emit((unsigned char) index);
-                PIP_CC_VMSG("emit upvalue-get " << name << ' ' << index);
-                break;
-            } 
-          } else assert(0);
+          return compile_ref(exp);
           break;
         }
         case PAIR: {
           // Compile applications, including special forms, macros, and normal function applications
           if(!listp(exp)) return error(exp, "dotted lists not allowed in source");
+          // Note the source location of this application
           annotate(exp);
           // Check for special forms
           Lookup lookup;
           Value* type = state.env_ref(**env, unbox(exp->car()), lookup);
-          // This is a special form
+          // If this is a special form
           if(type == state.global_symbol(S_SPECIAL)) {
+            // Dispatch on the special form
             Symbol* op = PIP_CAST(Symbol, unbox(exp->car()));
             size_t argc = length(exp->cdr());
             // define
             if(op == state.global_symbol(S_DEFINE)) {
-              if(argc != 2) return arity_error(S_DEFINE, exp, 2, argc);
-              Value* name = unbox(exp->cadr());
-              // TODO: lambda shortcut 
-              if(name->get_type() != SYMBOL)
-                return syntax_error(S_DEFINE, exp, "first argument to define must be a symbol");
-              unsigned slot = state.env_set(**env, name, state.global_symbol(S_VARIABLE));
-              // Compile body
-              compile(exp->cddr()->car());
-              // Global variable
-              switch(lookup.scope) {
-                case REF_GLOBAL: {
-                  // NOTE: Causes allocation
-                  push_constant(name);
-                  emit(OP_GLOBAL_SET);
-                  PIP_CC_VMSG("emit global-set " << name);
-                  pop(2);
-                  break;
-                }
-                case REF_LOCAL: {
-                  locals++;
-                  emit(OP_LOCAL_SET);
-                  emit(slot);
-                  pop();
-                  break;
-                }
-              }
+              return compile_define(argc, exp);
             // set!
             } else if(op == state.global_symbol(S_SET)) {
-              // set always has two arguments
-              if(argc != 2) return arity_error(S_SET, exp, 2, argc);
-              Value* name = unbox(exp->cadr());
-              if(name->get_type() != SYMBOL)
-                return syntax_error(S_SET, exp, "first argument to set! must be a symbol");
-              // look up variable
-              Lookup lookup;
-              Value* type = state.env_ref(**env, name, lookup);
-              if(type == state.global_symbol(S_SPECIAL))
-                return syntax_error(exp, "special forms cannot be used as variables");
-              else if(type == state.global_symbol(S_VARIABLE)) {
-                // compile body
-                compile(exp->cddr()->car());
-                
-                switch(lookup.scope) {
-                  case REF_GLOBAL:
-                    push_constant(name);
-                    emit(OP_GLOBAL_SET);
-                    PIP_CC_VMSG("emit global-set " << name);
-                    pop(2);
-                    break;
-                  case REF_LOCAL:
-                    emit(OP_LOCAL_SET);
-                    emit(lookup.index);
-                    PIP_CC_VMSG("emit local-set " << (unsigned) lookup.index);
-                    pop();
-                    break;
-                  case REF_UP: assert(0);
-                }
-              } else assert(0);
+              return compile_set(argc, exp);
             // lambda
             } else if(op == state.global_symbol(S_LAMBDA)) {
-              if(argc < 2) return arity_error(S_LAMBDA, exp, 2, argc);
-              // Create new compiler, environment
-              unsigned argc = 0;
-              bool variable_arity = false;
-              Value *new_env = 0, *args = 0, *body = 0;
-              Prototype* proto = 0;
-              PIP_FRAME(state, exp, new_env, args, body, proto);
-              new_env = state.make_vector();
-              state.vector_append(PIP_CAST(Vector, new_env), **env);
-              // Add arguments to environment
-              args = exp->cadr();
-              if(args != PIP_NULL) {
-                if(args->get_type() != PAIR) 
-                  return syntax_error(S_LAMBDA, exp, "first argument to lambda must be either () or a list of arguments");
-                while(args->get_type() == PAIR) {
-                  Value* arg = unbox(args->car());
-                  if(arg->get_type() != SYMBOL) {
-                    return syntax_error(S_LAMBDA, exp, "lambda argument list must be symbols");
-                  }
-                  state.vector_append(PIP_CAST(Vector, new_env), arg);
-                  state.vector_append(PIP_CAST(Vector, new_env), state.global_symbol(S_VARIABLE));
-                  argc++;
-                  args = args->cdr();
-                  if(args->get_type() != PAIR) {
-                    variable_arity = true;
-                    break;
-                  }
-                }
-              }
-              PIP_CC_MSG("compiling subprocedure");
-              Compiler cc(state, this, PIP_CAST(Vector, new_env), depth+1);
-              // Compile body
-              body = exp->cddr();
-              while(body != PIP_NULL) {
-                chk = cc.compile(body->car());
-                PIP_CHECK(chk);
-                body = body->cdr();
-              }
-              proto = cc.end(argc, variable_arity);
-              push_constant(proto);
-              if(cc.closure) {
-                PIP_CC_VMSG("emit close-over");
-                emit(OP_CLOSE_OVER);
-              }
+              return compile_lambda(argc, exp);
             }
           } else {
             // function application
-
-            // First, compile the arguments. We'll determine how many arguments
-            // were passed by comparing the stack size before and after
-            // compiling them.
-            size_t old_stack_size = stack_size;
-
-            Value* args = exp->cdr();
-            while(args != PIP_NULL) {
-              chk = compile(args->car());
-              PIP_CHECK(chk);
-              args = args->cdr();
-            }
-
-            size_t argc = stack_size - old_stack_size;
-            // Compile the actual function, which might be a symbol or perhaps
-            // an inline anonymous function (e.g. ((lambda () #t)))
-            chk = compile(exp->car());
-            PIP_CHECK(chk);
-
-            emit(OP_APPLY);
-            PIP_ASSERT(argc < 255);
-            emit((unsigned char) argc); 
-            PIP_CC_VMSG("emit apply " << argc);
-            // The application will pop the arguments and the function once finished
-            pop(stack_size - old_stack_size);
-            return PIP_FALSE;
+            return compile_apply(exp);
           }
-          break;
+          PIP_ASSERT(0);
         }
         default:
           PIP_ASSERT(!"unknown expression given to compiler");
@@ -2161,35 +2205,21 @@ struct State {
       p->code = codeblob;
 
       // Free variable handling
-
-      // Determine how large these blobs need to be 
-      size_t localfreevar_count = 0, upvalue_count = 0, localfreevar_i = 0,
-             upvalue_i = 0;
+      localfreevars = state.make_blob<unsigned>(local_free_variable_count);
+      upvals = state.make_blob<UpvalLoc>(upvalue_count);
+      size_t freevar_i = 0, upvalue_i = 0;
       for(size_t i = 0; i != free_variables.size(); i++) {
         if(free_variables[i].lexical_level == 0)
-          localfreevar_count++;
-        else
-          upvalue_count++;
-      }
-
-      // Populate them
-      if(localfreevar_count)
-        localfreevars = state.make_blob(localfreevar_count * sizeof(unsigned));
-      if(upvalue_count)
-        upvals = state.make_blob<UpvalLoc>(upvalue_count);
-
-      for(size_t i = 0; i != free_variables.size(); i++) {
-        if(free_variables[i].lexical_level == 0) {
-          ((unsigned*)localfreevars->data)[localfreevar_i++] = free_variables[i].index;
-        } else {
+          localfreevars->blob_set<unsigned>(freevar_i++, free_variables[i].index);
+        else {
           // Note whether the variable is local to the function that will be creating the closure
           UpvalLoc l(free_variables[i].lexical_level == 1, free_variables[i].index);
-          upvals->blob_set(upvalue_i, l);
+          upvals->blob_set(upvalue_i++, l);
         }
       }
 
       p->local_free_variables = localfreevars;
-      p->free_variable_count = localfreevar_count;
+      p->local_free_variable_count = local_free_variable_count;
     
       p->upvalues = upvals;
 
@@ -2213,12 +2243,13 @@ struct State {
 
   // - Pops the function's frame
 #define VM_RETURN(x) { \
-  for(size_t i = 0; i != prototype->free_variable_count; i++) { \
+  for(size_t i = 0; i != prototype->local_free_variable_count; i++) { \
     f.upvalues[i]->upvalue_close(); \
   } \
   vm_frames.pop_back(); \
   vm_depth--; \
-  return x; }
+  Value* res = (x); \
+  return res; }
 
   // Check for exceptions and unwind the stack if necessary
 #define VM_CHECK(x) \
@@ -2272,13 +2303,13 @@ struct State {
     vm_frames.push_back(&f);
 
     // Create upvalues, if necessary
-    if(prototype->free_variable_count) {
+    if(prototype->local_free_variable_count) {
       unsigned* data = (unsigned*) prototype->local_free_variables->data;
       
-      f.upvalues = (Upvalue**) alloca(prototype->free_variable_count * sizeof(Upvalue*));
-      memset(f.upvalues, 0, prototype->free_variable_count * sizeof(Upvalue*));
+      f.upvalues = (Upvalue**) alloca(prototype->local_free_variable_count * sizeof(Upvalue*));
+      memset(f.upvalues, 0, prototype->local_free_variable_count * sizeof(Upvalue*));
 
-      for(size_t i = 0; i != prototype->free_variable_count; i++) {
+      for(size_t i = 0; i != prototype->local_free_variable_count; i++) {
         unsigned index = data[i];
         f.upvalues[i] = allocate<Upvalue>();
         f.upvalues[i]->local = &f.locals[index];
@@ -2289,7 +2320,7 @@ struct State {
 
     // Check argument count
     if(argc < prototype->arguments) {
-      return arity_error();
+      VM_RETURN(arity_error());
     }
 
     // Load normal arguments
@@ -2303,7 +2334,7 @@ struct State {
       if(prototype->prototype_variable_arity()) {
         return make_exception(State::S_PIP_EVAL, "variable arity not supported yet");
       } else {
-        return arity_error();
+        VM_RETURN(arity_error());
       }
     }
 
