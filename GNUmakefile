@@ -1,6 +1,10 @@
 CXXFLAGS := -g3 -fno-rtti -fno-exceptions -DPIP_DEBUG
 LDFLAGS := 
 
+ifneq ($(shell uname -s),Darwin)
+	CXXFLAGS := $(CXXFLAGS) -std=c++11
+endif
+
 -include site.mk
 
 all: pip
