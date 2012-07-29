@@ -67,7 +67,7 @@ static void test_gc_1(State& state) {
 static void test_symbols(State& state) {
   std::cout << "!! test_symbols" << std::endl;
   Symbol *sym1 = 0, *sym2 = 0, *sym3 = 0;
-  Handle<Symbol> sym4(state);
+  State::Handle<Symbol> sym4(state);
   PIP_FRAME(state, sym1, sym2, sym3);
 
   sym1 = state.make_symbol("symble");

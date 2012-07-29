@@ -548,42 +548,9 @@ struct Frame {
 
 #define PIP_S_FRAME(...) PIP_FRAME((*this), __VA_ARGS__)
 
-// Handles are heap-allocated pointers
-template <class T>
-struct Handle {
-  Handle(State& state_);
-  Handle(State& state_, T* ref_);
-  ~Handle();
-
-  State& state;
-  T* ref;
-  Handle<Value> *previous, *next;
-  std::list<Handle<Value>*>::iterator location;
-  
-  void initialize();
-  T* operator*() const { return ref; }
-  T* operator->() const { return ref; }
-  void operator=(T* ref_) { ref = ref_; }  
-};
-
-struct Block {
-  size_t size;
-  char *begin, *end;
-  
-  Block(size_t size, bool mark, int mark_bit) {
-    begin = (char*) malloc(size);
-    end = begin + size;
-    ((Value*) begin)->set_header_unsafe(TRANSIENT, mark, mark_bit);
-    ((Value*) begin)->set_size_unsafe(size);
-  }
-
-  ~Block() {
-    free(begin);
-  }
-};
-
 struct State {
   struct VMFrame;
+  template <class T> struct Handle;
 
   State(): 
 
@@ -661,9 +628,187 @@ struct State {
       delete source_contents[i];
   }
 
+  ///// RUNTIME
+  typedef unordered_map<std::string, Symbol*> symbol_table_t;
+
+  symbol_table_t symbol_table;
+  std::vector<Handle<Value> *> globals;
+
+  enum Global {
+    S_SPECIAL,
+    S_VARIABLE,
+    S_UPVALUE,
+    S_PIP_READ,
+    S_PIP_COMPILE,
+    S_PIP_EVAL,
+    S_DEFINE,
+    S_SET,
+    S_LAMBDA,
+    S_NAMED_LAMBDA,
+    S_IF,
+    S_QUOTE,
+    S_QUASIQUOTE,
+    S_UNQUOTE,
+    S_UNQUOTE_SPLICING,
+    GLOBAL_SYMBOL_COUNT
+  };
+
+  Symbol* global_symbol(Global g) {
+    return static_cast<Symbol*>(**(globals[(size_t) g]));
+  }
+
+  ///// CONSTRUCTORS
+  Pair* cons(Value* car, Value* cdr, bool has_source_info = false, unsigned file = 0, unsigned line = 0) {
+    Pair* p = NULL;
+    PIP_S_FRAME(p, car, cdr);
+    p = allocate<Pair>(has_source_info ? 0 : -(sizeof(((Pair*)0)->src)));
+    p->car = car;
+    p->cdr = cdr;
+    if(has_source_info) {
+      p->set_header_bit(PAIR, Value::PAIR_HAS_SOURCE_BIT);
+      p->src.file = file;
+      p->src.line = line;
+    }
+    return p;
+  }
+
+  Blob* make_blob(ptrdiff_t length) {
+    Blob* b = allocate<Blob>(length - 1);
+    b->length = length;
+    return b;
+  }
+
+  template <class T>
+  Blob* make_blob(ptrdiff_t length) {
+    return make_blob(sizeof(T) * length);
+  }
+
+  String* make_string(const std::string& cstr) {
+    String* str = allocate<String>(cstr.length());
+    cstr.copy(str->data, cstr.length());
+    str->data[cstr.length()] = 0;
+    return str;
+  }
+
+  Symbol* make_symbol(const std::string& str) {
+    Symbol* sym = 0;
+    symbol_table_t::const_iterator g = symbol_table.find(str);
+    // Intern symbol if it hasn't already been
+    if(g == symbol_table.end()) {
+      String* ostr = 0;
+      PIP_S_FRAME(sym, ostr);
+      sym = allocate<Symbol>();
+      ostr = make_string(str.c_str());
+      sym->name = ostr;
+      std::pair<std::string, Symbol*> pair(str,sym);
+      symbol_table.insert(pair);
+    } else {
+      sym = g->second;
+    }
+    return sym;
+  }
+
+  Symbol* make_symbol(String* string) {
+    std::string str(string->string_data());
+    return make_symbol(str);
+  }
+
+  Box* make_box(Value* value, bool has_source_info, unsigned file = 0, unsigned line = 0) {
+    Box* box = 0;
+    PIP_S_FRAME(value, box);
+    box = allocate<Box>(has_source_info ? 0 : -(sizeof(((Box*)0)->src)));
+    box->value = value;
+    if(has_source_info) {
+      box->set_header_bit(BOX, Value::BOX_HAS_SOURCE_BIT);
+      box->src.file = file;
+      box->src.line = line;
+    }
+    return box;
+  }
+
+  Vector* make_vector(unsigned capacity = 2) {
+    capacity = capacity > 2 ? capacity : 2;
+    Vector* v = 0;
+    VectorStorage* s = 0;
+    PIP_S_FRAME(v, s);
+    v = allocate<Vector>();
+    v->capacity = capacity;
+    s = allocate<VectorStorage>((capacity * sizeof(Value*)) - sizeof(Value*));
+    v->storage = s;
+    return v;
+  }
+
+  Exception* make_exception(Symbol* tag, String* message, Value* irritants) {
+    Exception* e = 0;
+    PIP_S_FRAME(e,tag,message,irritants);
+    e = allocate<Exception>();
+    e->tag = tag;
+    e->message = message;
+    e->irritants = irritants;
+    e->set_header_bit(EXCEPTION, Value::EXCEPTION_ACTIVE_BIT);
+    return e;
+  }
+
+  Exception* make_exception(Global g, const std::string& msg) {
+    String* smsg = make_string(msg);
+    return make_exception(global_symbol(g), smsg, PIP_FALSE);
+  }
+
   ///// GARBAGE COLLECTOR
 
-  static const size_t GC_TEMPS_SIZE = 10;
+  // Handles are auto-tracked heap-allocated pointers
+  template <class T>
+  struct Handle {
+    Handle(State& state_): state(state_), ref(0) {
+      initialize();
+    }
+
+    Handle(State& state_, T* ref_): state(state_), ref(ref_) {
+      initialize();
+    }
+
+    void initialize() {
+      previous = state.handle_list;
+      if(previous)
+        previous->next = (Handle<Value> *) this;
+      state.handle_list = (Handle<Value> *) this;
+      next = 0;
+    }
+
+    ~Handle() {
+      if(previous) previous->next = next;
+      if(next) next->previous = previous;
+      if(state.handle_list == (Handle<Value> *) this) {
+        PIP_ASSERT(!next);
+        state.handle_list = previous;
+      }
+    }
+
+    State& state;
+    T* ref;
+    Handle<Value> *previous, *next;
+    std::list<Handle<Value>*>::iterator location;
+  
+    T* operator*() const { return ref; }
+    T* operator->() const { return ref; }
+    void operator=(T* ref_) { ref = ref_; }  
+  };
+
+  struct Block {
+    size_t size;
+    char *begin, *end;
+  
+    Block(size_t size, bool mark, int mark_bit) {
+      begin = (char*) malloc(size);
+      end = begin + size;
+      ((Value*) begin)->set_header_unsafe(TRANSIENT, mark, mark_bit);
+      ((Value*) begin)->set_size_unsafe(size);
+    }
+
+    ~Block() {
+      free(begin);
+    }
+  };
 
   std::vector<Block*> blocks;
   Handle<Value>* handle_list;
@@ -1054,131 +1199,6 @@ struct State {
     return static_cast<T*>(allocate(static_cast<Type>(T::CLASS_TYPE), sizeof(T) + additional));
   }
 
-  ///// RUNTIME
-  typedef unordered_map<std::string, Symbol*> symbol_table_t;
-
-  symbol_table_t symbol_table;
-  std::vector<Handle<Value> *> globals;
-
-  enum Global {
-    S_SPECIAL,
-    S_VARIABLE,
-    S_UPVALUE,
-    S_PIP_READ,
-    S_PIP_COMPILE,
-    S_PIP_EVAL,
-    S_DEFINE,
-    S_SET,
-    S_LAMBDA,
-    S_NAMED_LAMBDA,
-    S_IF,
-    S_QUOTE,
-    S_QUASIQUOTE,
-    S_UNQUOTE,
-    S_UNQUOTE_SPLICING,
-    GLOBAL_SYMBOL_COUNT
-  };
-
-  Symbol* global_symbol(Global g) {
-    return static_cast<Symbol*>(**(globals[(size_t) g]));
-  }
-
-  ///// CONSTRUCTORS
-  Pair* cons(Value* car, Value* cdr, bool has_source_info = false, unsigned file = 0, unsigned line = 0) {
-    Pair* p = NULL;
-    PIP_S_FRAME(p, car, cdr);
-    p = allocate<Pair>(has_source_info ? 0 : -(sizeof(((Pair*)0)->src)));
-    p->car = car;
-    p->cdr = cdr;
-    if(has_source_info) {
-      p->set_header_bit(PAIR, Value::PAIR_HAS_SOURCE_BIT);
-      p->src.file = file;
-      p->src.line = line;
-    }
-    return p;
-  }
-
-  Blob* make_blob(ptrdiff_t length) {
-    Blob* b = allocate<Blob>(length - 1);
-    b->length = length;
-    return b;
-  }
-
-  template <class T>
-  Blob* make_blob(ptrdiff_t length) {
-    return make_blob(sizeof(T) * length);
-  }
-
-  String* make_string(const std::string& cstr) {
-    String* str = allocate<String>(cstr.length());
-    cstr.copy(str->data, cstr.length());
-    str->data[cstr.length()] = 0;
-    return str;
-  }
-
-  Symbol* make_symbol(const std::string& str) {
-    Symbol* sym = 0;
-    symbol_table_t::const_iterator g = symbol_table.find(str);
-    // Intern symbol if it hasn't already been
-    if(g == symbol_table.end()) {
-      String* ostr = 0;
-      PIP_S_FRAME(sym, ostr);
-      sym = allocate<Symbol>();
-      ostr = make_string(str.c_str());
-      sym->name = ostr;
-      std::pair<std::string, Symbol*> pair(str,sym);
-      symbol_table.insert(pair);
-    } else {
-      sym = g->second;
-    }
-    return sym;
-  }
-
-  Symbol* make_symbol(String* string) {
-    std::string str(string->string_data());
-    return make_symbol(str);
-  }
-
-  Box* make_box(Value* value, bool has_source_info, unsigned file = 0, unsigned line = 0) {
-    Box* box = 0;
-    PIP_S_FRAME(value, box);
-    box = allocate<Box>(has_source_info ? 0 : -(sizeof(((Box*)0)->src)));
-    box->value = value;
-    if(has_source_info) {
-      box->set_header_bit(BOX, Value::BOX_HAS_SOURCE_BIT);
-      box->src.file = file;
-      box->src.line = line;
-    }
-    return box;
-  }
-
-  Vector* make_vector(unsigned capacity = 2) {
-    capacity = capacity > 2 ? capacity : 2;
-    Vector* v = 0;
-    VectorStorage* s = 0;
-    PIP_S_FRAME(v, s);
-    v = allocate<Vector>();
-    v->capacity = capacity;
-    s = allocate<VectorStorage>((capacity * sizeof(Value*)) - sizeof(Value*));
-    v->storage = s;
-    return v;
-  }
-
-  Exception* make_exception(Symbol* tag, String* message, Value* irritants) {
-    Exception* e = 0;
-    PIP_S_FRAME(e,tag,message,irritants);
-    e = allocate<Exception>();
-    e->tag = tag;
-    e->message = message;
-    e->irritants = irritants;
-    e->set_header_bit(EXCEPTION, Value::EXCEPTION_ACTIVE_BIT);
-    return e;
-  }
-
-  Exception* make_exception(Global g, const std::string& msg) {
-    String* smsg = make_string(msg);
-    return make_exception(global_symbol(g), smsg, PIP_FALSE);
-  }
 
   ///// BASIC FUNCTIONS
 
@@ -1673,12 +1693,20 @@ struct State {
   // one pass makes it much shorter.
 
   // The compiler compiles a very small subset of Scheme. Most special forms,
-  // such as let, are implemented with macros. 
+  // such as let, are implemented with macros.
 
-  // It doesn't really do any optimization, although its implementation of
-  // closures, based on Lua's upvalues, reduces the access time of free
-  // variables and ensures that variables are not kept around longer than
-  // necessary.
+  // Perhaps the most complex machinery in the compiler is the handling of free
+  // variables (for Pip's purposes, a "free variable" is defined as any
+  // variable that might exist after its function returns; I'm not sure that's
+  // the right definition but I'm not changing it now). When a procedure
+  // references, either by setting or getting, any variable from a higher
+  // procedure, the compiler causes that variable to be pulled into every
+  // procedure from that procedure on down as an "upvalue", which is basically
+  // a heap-allocated pointer. All of those procedures become Closures, a
+  // combination of a function and a set of upvalues. These variables are then
+  // set and retreived through the Upvalue structure. This ensures that access
+  // to all variables is O(1) and that large structures do not need to be
+  // allocated (and left) on the heap to support function calls.
   // -->
   
   // Some structures that are shared by the virtual machine and compiler
@@ -2212,7 +2240,8 @@ struct State {
         if(free_variables[i].lexical_level == 0)
           localfreevars->blob_set<unsigned>(freevar_i++, free_variables[i].index);
         else {
-          // Note whether the variable is local to the function that will be creating the closure
+          // Note whether the variable is local to the function that
+          // will be creating the closure
           UpvalLoc l(free_variables[i].lexical_level == 1, free_variables[i].index);
           upvals->blob_set(upvalue_i++, l);
         }
@@ -2488,35 +2517,6 @@ inline Frame::Frame(State& state_, FrameHack* roots_, size_t root_count_):
 inline Frame::~Frame() {
   PIP_ASSERT("odd::Frame FIFO order violated" && state.frame_list == this);
   state.frame_list = previous;
-}
-
-template <class T>
-inline Handle<T>::Handle(State& state_): state(state_), ref(0) {
-  initialize();
-}
-
-template <class T>
-inline Handle<T>::Handle(State& state_, T* ref_): state(state_), ref(ref_) {
-  initialize();
-}
-
-template <class T>
-inline void Handle<T>::initialize() {
-  previous = state.handle_list;
-  if(previous)
-    previous->next = (Handle<Value> *) this;
-  state.handle_list = (Handle<Value> *) this;
-  next = 0;
-}
-
-template <class T>
-inline Handle<T>::~Handle() {
-  if(previous) previous->next = next;
-  if(next) next->previous = previous;
-  if(state.handle_list == (Handle<Value> *) this) {
-    PIP_ASSERT(!next);
-    state.handle_list = previous;
-  }
 }
 
 inline std::ostream& operator<<(std::ostream& os, Value* x) {
