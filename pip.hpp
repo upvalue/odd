@@ -589,7 +589,7 @@ struct State {
       "define",
       "set!",
       "lambda",
-      "named-lambda",
+      "#named-lambda",
       "if",
       "quote",
       "quasiquote",
@@ -670,6 +670,17 @@ struct State {
       p->src.line = line;
     }
     return p;
+  }
+
+  // Cons and copy source information from a third expression
+  Pair* cons_source(Value* car, Value* cdr, Value* src_exp) {
+    SourceInfo src;
+    unwrap_source_info(src_exp, src);
+    if(src.file) {
+      return cons(car, cdr, true, src.file, src.line);
+    } else {
+      return cons(car, cdr);
+    }
   }
 
   Blob* make_blob(ptrdiff_t length) {
@@ -1820,7 +1831,7 @@ struct State {
       state(state_), parent(parent_),
       local_free_variable_count(0), upvalue_count(0),
       stack_max(0), stack_size(0), locals(0), constants(state), closure(false),
-      env(0), depth(depth_) {
+      name(state_), env(0), depth(depth_) {
       if(!env_) env = &state.global_env;
       else env = new Handle<Vector>(state, env_);
     }
@@ -1831,8 +1842,8 @@ struct State {
     State& state;
     // The parent procedure -- necessary for free variables
     Compiler* parent;
-    // The bytecode
-    std::vector<unsigned char> code;
+    // The wordcode
+    std::vector<ptrdiff_t> code;
     // A vector containing combinations of instruction offsets and source location info for debugging and tracebacks
     std::vector<std::pair<unsigned, SourceInfo> > debuginfo;
     // A vector containing free variable locations
@@ -1842,13 +1853,15 @@ struct State {
     unsigned stack_max, stack_size, locals;
     Handle<Vector> constants;
     bool closure;
+    // The name of the function (if any)
+    Handle<String> name;
     // The environment of the function
     Handle<Vector>* env;
     // The depth of the function (for debug message purposes)
     size_t depth;
 
     // Code generation
-    void emit(unsigned char byte) {
+    void emit(ptrdiff_t byte) {
       code.push_back(byte);
     }
 
@@ -2026,14 +2039,41 @@ struct State {
     }
 
     Value* compile_define(size_t argc, Value* exp) {
+      // There's a goto here (yuck) because we'll restart the compilation
+      // process if this define is a function definition
+restart:
       Value* chk = 0;
       if(argc != 2) return arity_error(S_DEFINE, exp, 2, argc);
       Value* name = unbox(exp->cadr());
-      // TODO: lambda shortcut 
-      if(name->get_type() != SYMBOL)
-        return syntax_error(S_DEFINE, exp, "first argument to define must be a symbol");
+      Value* args = 0;
+      if(name->get_type() != SYMBOL) {
+        // Parse a lambda shortcut, e.g. (define (x) #t) becomes 
+        // (define x (named-lambda x () #t))
+        if(name->get_type() == PAIR) {
+          args = name->cdr();
+          name = name->car();
+          if(unbox(name)->get_type() != SYMBOL)
+            return syntax_error(S_DEFINE, exp, "first argument to define a function must be a symbol");
+          Value* named_lambda = 0, *tmp = 0;
+          PIP_FRAME(state, exp, name, args, named_lambda, tmp);
+          // Get the argument list and body
+          tmp = state.cons(args, exp->cddr());
+          // Put the function's name in front of them
+          tmp = state.cons(name, tmp);
+          // Finally put all that in a (named-lambda ...) expression
+          named_lambda = state.cons(state.global_symbol(S_NAMED_LAMBDA), tmp);
+          named_lambda = state.cons_source(named_lambda, PIP_NULL, exp);
+          // This is kind of hacky, but we're just going to twiddle the
+          // expression a little bit and start parsing again
+          exp->cdr()->set_car(name);
+          exp->cdr()->set_cdr(named_lambda);
+          goto restart;
+        } else return syntax_error(S_DEFINE, exp, "first argument to define must be a symbol");
+      }
+      // TODO: Handle (define name (lambda () #t))
       unsigned slot = state.env_def(**env, name, state.global_symbol(S_VARIABLE));
       // Compile body for set!
+      PIP_FRAME(state, name);
       chk = compile(exp->cddr()->car());
       PIP_CHECK(chk);
       // Global variable
@@ -2044,7 +2084,12 @@ struct State {
       return PIP_FALSE;
     }
 
-    Value* compile_lambda(size_t form_argc, Value* exp) {
+    Value* compile_if(size_t argc, Value* exp) {
+
+      return PIP_FALSE;
+    }
+
+    Value* compile_lambda(size_t form_argc, Value* exp, Value* name) {
       // For checking subcompilation results
       Value* chk = 0;
       if(form_argc < 2) return arity_error(S_LAMBDA, exp, 2, form_argc);
@@ -2085,6 +2130,7 @@ struct State {
       // Compile the procedure's body
       PIP_CC_MSG("compiling subprocedure");
       Compiler cc(state, this, PIP_CAST(Vector, new_env), depth+1);
+      cc.name = static_cast<String*>(name);
       body = exp->cddr();
       while(body != PIP_NULL) {
         chk = cc.compile(body->car());
@@ -2170,9 +2216,10 @@ struct State {
         // Constants: note that these are only immediate constants, such as #t
         // and #f, and not complex values that the compiler considers
         // constants, such as '(list)
+        case FIXNUM:
         case CONSTANT:
           emit(OP_PUSH_IMMEDIATE);
-          emit((unsigned char)(((size_t) exp) & 255));
+          emit((ptrdiff_t) exp);
           PIP_CC_VMSG("emit push-immediate " << exp);
           push();
           break;
@@ -2203,8 +2250,21 @@ struct State {
               return compile_set(argc, exp);
             // lambda
             } else if(op == state.global_symbol(S_LAMBDA)) {
-              return compile_lambda(argc, exp);
-            }
+              return compile_lambda(argc, exp, PIP_FALSE);
+            // named-lambda
+            } else if(op == state.global_symbol(S_NAMED_LAMBDA)) {  
+              // This is a little hacky, but we're going to extract the name
+              // here and then make it look like a normal lambda for compile_lambda
+              
+              // No need for parsing because named lambdas are generated by the parser
+              Value* name = exp->cadr();
+              Value* rest = exp->cddr();
+              exp->set_cdr(rest);
+
+              return compile_lambda(argc-1, exp, name);
+            } else if(op == state.global_symbol(S_IF)) {
+              return compile_if(argc, exp);
+            } else assert(0);
           } else {
             // function application
             return compile_apply(exp);
@@ -2228,8 +2288,9 @@ struct State {
       PIP_FRAME(state, p, codeblob, localfreevars, upvals);
       p = state.allocate<Prototype>();
       // Copy some data from the compiler to Scheme blobs
-      codeblob = state.make_blob(code.size());
-      std::copy(code.begin(), code.end(), codeblob->data);
+      codeblob = state.make_blob<ptrdiff_t>(code.size());
+      memcpy(codeblob->data, &code[0], code.size() * sizeof(ptrdiff_t));
+//      std::copy(code.begin(), code.end(), codeblob->data);
       p->code = codeblob;
 
       // Free variable handling
@@ -2320,7 +2381,7 @@ struct State {
     PIP_VM_MSG("entering function ");
     // Get pointer to code
     // NOTE: could be moved if moving garbage collector is ever used
-    unsigned char* bc = (unsigned char*)(prototype->code->data);
+    ptrdiff_t* bc = (ptrdiff_t*)(prototype->code->data);
 
     // Set up call frame
     VMFrame f(prototype, closure, 
@@ -2378,12 +2439,13 @@ struct State {
           f.stack[f.si++] = f.p->constants->vector_ref(bc[ip++]);
           continue;
         case OP_GLOBAL_SET: {
-          std::cout << "YEAH " << f.stack[f.si-1] << ' ' << f.stack[f.si-2] << ' ' << f.si << std::endl;
+          // Get the global name
           Symbol* k = PIP_CAST(Symbol, f.stack[f.si-1]);
           f.si--;
-          std::cout << "READING FROM :  " << f.si << std::endl;
+          // Pop the value off the stack
           Value* v = f.stack[--f.si];
-          std::cout << f.si << std::endl;
+          PIP_VM_VMSG("global-set " << k << ' ' << v);
+          // Set the value
           k->value = v;
           continue;
         }

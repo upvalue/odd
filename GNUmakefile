@@ -1,4 +1,4 @@
-CXXFLAGS := -g3 -fno-rtti -fno-exceptions -DPIP_DEBUG
+CXXFLAGS := -O3 -g3 -fno-rtti -fno-exceptions #-DPIP_DEBUG
 LDFLAGS := 
 
 ifneq ($(shell uname -s),Darwin)

@@ -186,13 +186,15 @@ void test_compiler(State& state) {
   // 2-level Closure
   test_eval(state, "((lambda (x) ((lambda () ((lambda () x))))) #t)", PIP_TRUE);
   //test_eval(state, "((lambda (x) ((lambda () ((lambda () x)))) #t))", PIP_TRUE);
+  // Define lambda shortcut
+  test_eval(state, "(define (name) #t) (name)", PIP_TRUE);
 }
 
 void test() {
   State* state = new State;
 
   std::cout << "!! sizeof(State) " << sizeof(State) << " [" << FriendlySize(sizeof(State)) << "]" << std::endl;
-  state->collect_before_every_allocation = true;
+  state->collect_before_every_allocation = false;
   test_gc_1(*state);
   test_symbols(*state);
   test_vectors(*state);
