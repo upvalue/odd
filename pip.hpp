@@ -276,6 +276,10 @@ struct Value {
   // Blobs
   const char* blob_data() const;
   unsigned blob_length() const;
+  // Templated functions for dealing with structured data within blobs
+  template <class T> unsigned blob_length() const;
+  template <class T> T blob_ref(unsigned) const;
+  template <class T> T blob_set(unsigned, T& value) const;
 
   // Strings
   const char* string_data() const;
@@ -316,6 +320,8 @@ struct Value {
   bool upvalue_closed() const { return get_header_bit(UPVALUE, UPVALUE_CLOSED_BIT); }
 
   Value* upvalue() const;
+  void upvalue_set(Value*);
+  void upvalue_close();
 };
 
 struct Pair : Value {
@@ -365,6 +371,9 @@ struct Blob : Value {
 
 const char* Value::blob_data() const { PIP_ASSERT(get_type() == BLOB); return static_cast<const Blob*>(this)->data; }
 unsigned Value::blob_length() const { PIP_ASSERT(get_type() == BLOB); return static_cast<const Blob*>(this)->length; }
+template <class T> unsigned Value::blob_length() const { PIP_ASSERT(get_type() == BLOB); return static_cast<const Blob*>(this)->length / sizeof(T); }
+template <class T> T Value::blob_ref(unsigned i) const { PIP_ASSERT(get_type() == BLOB); return ((T*) static_cast<const Blob*>(this)->data)[i]; }
+template <class T> T Value::blob_set(unsigned i, T& val) const { PIP_ASSERT(get_type() == BLOB); ((T*) static_cast<const Blob*>(this)->data)[i] = val; }
 
 struct String : Blob {
   static const Type CLASS_TYPE = STRING;
@@ -415,6 +424,8 @@ struct Prototype : Value {
   Blob* local_free_variables;
   // A list of upvalues, which will be used to turn this into a closure if necessary
   Blob* upvalues;
+  // The function's name, if available, or #f if not
+  String* name;
   unsigned stack_max;
   unsigned locals;
   unsigned free_variable_count;
@@ -445,6 +456,20 @@ struct Upvalue : Value {
 Value* Value::upvalue() const {
   Upvalue* u = PIP_CAST(Upvalue, this);
   return upvalue_closed() ? u->converted : *(u->local);
+}
+
+void Value::upvalue_set(Value* v) {
+  Upvalue* u = PIP_CAST(Upvalue, this);
+  if(upvalue_closed())
+    u->converted = v;
+  else
+    (*u->local) = v;
+}
+
+void Value::upvalue_close() {
+  Upvalue* u = PIP_CAST(Upvalue, this);
+  set_header_bit(UPVALUE, UPVALUE_CLOSED_BIT);
+  u->converted = *u->local;
 }
 
 ///// (GC) Garbage collector
@@ -689,6 +714,7 @@ struct State {
           recursive_mark(static_cast<Prototype*>(x)->debuginfo);
           recursive_mark(static_cast<Prototype*>(x)->local_free_variables);
           recursive_mark(static_cast<Prototype*>(x)->upvalues);
+          recursive_mark(static_cast<Prototype*>(x)->name);
           x = static_cast<Prototype*>(x)->constants;
           continue;
         // Special types
@@ -1076,6 +1102,11 @@ struct State {
     Blob* b = allocate<Blob>(length - 1);
     b->length = length;
     return b;
+  }
+
+  template <class T>
+  Blob* make_blob(ptrdiff_t length) {
+    return make_blob(sizeof(T) * length);
   }
 
   String* make_string(const std::string& cstr) {
@@ -1668,6 +1699,12 @@ struct State {
     OP_TAIL_APPLY = 12
   };
 
+  struct UpvalLoc {
+    UpvalLoc(bool l, unsigned i): local(l), index(i) {}
+    bool local;
+    unsigned index;
+  };
+
   // Environments
 
   // Environment format
@@ -1878,16 +1915,16 @@ struct State {
       return state.make_exception(State::S_PIP_COMPILE, out);
     }
 
-    // free_variable handling
+    // free variable handling
     unsigned register_free_variable(Lookup lookup) {
       FreeVariableInfo l;
-      // Check for existing free_variable
+      // Check for existing free variable
       for(unsigned i = 0; i != free_variables.size(); i++) {
         l = free_variables[i];
         if(l.lexical_level == lookup.level && l.lexical_index == lookup.index)
           return i;
       }
-      // New free_variable - register it with this and all preceding functions as
+      // New free variable - register it with this and all preceding functions as
       // necessary. 
       l.lexical_level = lookup.level;
       l.lexical_index = lookup.index;
@@ -2122,7 +2159,8 @@ struct State {
       codeblob = state.make_blob(code.size());
       std::copy(code.begin(), code.end(), codeblob->data);
       p->code = codeblob;
-      // Upvalues
+
+      // Free variable handling
 
       // Determine how large these blobs need to be 
       size_t localfreevar_count = 0, upvalue_count = 0, localfreevar_i = 0,
@@ -2135,14 +2173,18 @@ struct State {
       }
 
       // Populate them
-      localfreevars = state.make_blob(localfreevar_count * sizeof(unsigned));
-      upvals = state.make_blob(upvalue_count * sizeof(unsigned));
+      if(localfreevar_count)
+        localfreevars = state.make_blob(localfreevar_count * sizeof(unsigned));
+      if(upvalue_count)
+        upvals = state.make_blob<UpvalLoc>(upvalue_count);
 
       for(size_t i = 0; i != free_variables.size(); i++) {
         if(free_variables[i].lexical_level == 0) {
           ((unsigned*)localfreevars->data)[localfreevar_i++] = free_variables[i].index;
         } else {
-          ((unsigned*)upvals->data)[upvalue_i++] = free_variables[i].index;
+          // Note whether the variable is local to the function that will be creating the closure
+          UpvalLoc l(free_variables[i].lexical_level == 1, free_variables[i].index);
+          upvals->blob_set(upvalue_i, l);
         }
       }
 
@@ -2165,7 +2207,15 @@ struct State {
   ///// (VM) VIRTUAL MACHINE
 
   // Return that properly unwinds the stack
+
+  // - Closes over upvalues so they can still be accessed after this function's
+  // frame is gone
+
+  // - Pops the function's frame
 #define VM_RETURN(x) { \
+  for(size_t i = 0; i != prototype->free_variable_count; i++) { \
+    f.upvalues[i]->upvalue_close(); \
+  } \
   vm_frames.pop_back(); \
   vm_depth--; \
   return x; }
@@ -2181,8 +2231,8 @@ struct State {
   // A frame containing information that needs to be tracked by the garbage collector
   struct VMFrame {
     VMFrame(Prototype* p_, Closure* c_, Value** stack_, Value** locals_):
-      p(p_), c(c_), stack(stack_), locals(locals_), upvalues(0), si(0), 
-      upvalue_count(0) {}
+      p(p_), c(c_), stack(stack_), locals(locals_), upvalues(0), si(0)
+      {}
     // Need to save pointers to the prototype and closure so they're considered roots
     Prototype* p;
     Closure* c;
@@ -2192,8 +2242,6 @@ struct State {
     Upvalue** upvalues;
     // Stack index
     unsigned si;
-    // Local and upvalue count
-    unsigned upvalue_count;
   };
 
   // Evaluation errors
@@ -2224,7 +2272,7 @@ struct State {
     vm_frames.push_back(&f);
 
     // Create upvalues, if necessary
-    if(prototype->local_free_variables->length) {
+    if(prototype->free_variable_count) {
       unsigned* data = (unsigned*) prototype->local_free_variables->data;
       
       f.upvalues = (Upvalue**) alloca(prototype->free_variable_count * sizeof(Upvalue*));
@@ -2303,11 +2351,18 @@ struct State {
           continue;
         }
         case OP_UPVALUE_GET: {
-          // Get upvalue
+          // Get upvalue index
           unsigned char index = bc[ip++];
           PIP_VM_VMSG("upvalue-get " << (unsigned)index);
           f.stack[f.si++] = closure->upvalues->data[index]->upvalue();
           continue;
+        }
+        case OP_UPVALUE_SET: {
+          // Get upvalue index
+          unsigned char index = bc[ip++];
+          Value* val = f.stack[--f.si];
+          PIP_VM_VMSG("upvalue-set " << (unsigned)index);
+          closure->upvalues->data[index]->upvalue_set(val);
         }
         case OP_CLOSE_OVER: {
           // Create a closure
@@ -2321,12 +2376,17 @@ struct State {
           c = allocate<Closure>();
           c->prototype = p;
           // Determine how many upvalues we have
-          size_t locs = (locations->length) / sizeof(unsigned);
+          size_t locs = locations->blob_length<UpvalLoc>();
           // Allocate the vector that will actually hold the upvalues
           upvalues = make_vector(locs);
           // Fill array
           for(size_t i = 0; i != locs; i++) {
-            vector_append(upvalues, f.upvalues[i]);
+            UpvalLoc l = locations->blob_ref<UpvalLoc>(i);
+            if(l.local)
+              vector_append(upvalues, f.upvalues[l.index]);
+            else
+              vector_append(upvalues, closure->upvalues->data[l.index]);
+//            vector_append(upvalues, f.upvalues[i]);
           }
           c->upvalues = upvalues->storage;
           // Replace prototype with closure
