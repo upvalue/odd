@@ -1,4 +1,4 @@
-CXXFLAGS := -O3 -g3 -fno-rtti -fno-exceptions #-DPIP_DEBUG
+CXXFLAGS := -O3 -g3 -fno-rtti -fno-exceptions -DPIP_DEBUG
 LDFLAGS := 
 
 ifneq ($(shell uname -s),Darwin)
@@ -9,7 +9,7 @@ endif
 
 all: pip
 
-pip: cli.cpp pip.hpp test/tests.cpp
+pip: cli.cpp pip.hpp test/runtime.cpp
 	@echo -n ' LD  ';
 	$(strip $(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $< $(LDFLAGS))
 

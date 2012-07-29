@@ -1,5 +1,5 @@
-// test/tests.cpp - basic internals tests
-// included to cli.cpp
+// test/runtime.cpp - basic internals tests
+// included in cli.cpp
 
 static void test_invariants(State& state) {
   Value* consts[] = { PIP_FALSE, PIP_TRUE, PIP_NULL, PIP_EOF };
@@ -28,7 +28,7 @@ static void test_gc_1(State& state) {
   String *string1 = 0, *string2 = 0;
   Blob* blob = NULL, *blob2 = NULL;
   Pair* pair = NULL;
-  PIP_FRAME(state, pair, blob, blob2, string1, string2);
+  PIP_FRAME(pair, blob, blob2, string1, string2);
 
   size_t len = sizeof(str) / sizeof(char);
   size_t len2 = len + 1;
@@ -68,7 +68,7 @@ static void test_symbols(State& state) {
   std::cout << "!! test_symbols" << std::endl;
   Symbol *sym1 = 0, *sym2 = 0, *sym3 = 0;
   State::Handle<Symbol> sym4(state);
-  PIP_FRAME(state, sym1, sym2, sym3);
+  PIP_FRAME(sym1, sym2, sym3);
 
   sym1 = state.make_symbol("symble");
   sym2 = state.make_symbol("symble");
@@ -96,7 +96,7 @@ static void test_symbols(State& state) {
 static void test_vectors(State& state) {
   std::cout << "!! test_vectors" << std::endl;
   Vector* v = 0;
-  PIP_FRAME(state, v);
+  PIP_FRAME(v);
   v = state.make_vector();
 
   //state.collect();
@@ -120,7 +120,7 @@ static void test_reader(State& state) {
   std::fstream fs("test/read.ss");
   State::Reader reader(state, fs, file);
   Value* x = 0;
-  PIP_FRAME(state, x);
+  PIP_FRAME(x);
   while(true) {
     x = reader.read();
     if(x == PIP_EOF) break;
@@ -138,7 +138,7 @@ Value* eval_string(State& state, const std::string& string) {
   Value* x = 0;
   Value* check = 0;
   Prototype* p = 0;
-  PIP_FRAME(state, x, p, check);
+  PIP_FRAME(x, p, check);
   std::cout << "!! compile_string: " << string << std::endl;
   while(true) {
     x = reader.read();
@@ -188,13 +188,21 @@ void test_compiler(State& state) {
   //test_eval(state, "((lambda (x) ((lambda () ((lambda () x)))) #t))", PIP_TRUE);
   // Define lambda shortcut
   test_eval(state, "(define (name) #t) (name)", PIP_TRUE);
+  // If
+  test_eval(state, "(if #t #t #f)", PIP_TRUE);
+  // One-arm if
+  test_eval(state, "(if #t #t)", PIP_TRUE);
+  test_eval(state, "(if #f #f)", PIP_UNSPECIFIED);
+  // Begin
+  test_eval(state, "(begin)", PIP_UNSPECIFIED);
+  test_eval(state, "(begin #f #f #t)", PIP_TRUE);
 }
 
 void test() {
   State* state = new State;
 
   std::cout << "!! sizeof(State) " << sizeof(State) << " [" << FriendlySize(sizeof(State)) << "]" << std::endl;
-  state->collect_before_every_allocation = false;
+  state->collect_before_every_allocation = true;
   test_gc_1(*state);
   test_symbols(*state);
   test_vectors(*state);
@@ -206,7 +214,7 @@ void test() {
     cc.compile(PIP_TRUE);
     Prototype* p = 0;
     {
-      PIP_FRAME(*state, p);
+      PIP_E_FRAME(*state, p);
       p = cc.end();
       std::cout << state->apply(p, 0, 0, 0) << std::endl;
     }

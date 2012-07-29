@@ -52,12 +52,14 @@
 // Checking for exceptions
 #define PIP_CHECK(x) if((x)->active_exception()) return (x);
 
-// Debug mesages
+// Trace messages
 #define PIP_GC_MSG(x) std::cout << x << std::endl
 #define PIP_CC_MSG(x) \
     for(size_t _x = (depth); _x; _x--) \
       std::cout << '>'; std::cout << "CC: " << x << std::endl;
 #define PIP_CC_VMSG(x) PIP_CC_MSG(x)
+#define PIP_CC_EMIT(x) PIP_CC_MSG((last_insn) << ": " << x)
+
 #define PIP_VM_MSG(x) \
   for(size_t _x = (vm_depth); _x != 1; _x--) \
     std::cout << '>'; \
@@ -494,7 +496,7 @@ void Value::upvalue_close() {
 // explicitly registered with the garbage collector using two methods: Frames
 // and Handles. A Frame is a stack-allocated structure that keeps track of as
 // many variables as needed. You create a frame in each function you want to
-// track variables in like so: PIP_FRAME(state, var1, var2). A Handle is a
+// track variables in like so: PIP_FRAME(var1, var2). A Handle is a
 // heap-allocated structure that keeps track of one variable, and is useful
 // when your variables have lifetimes beyond the execution of a single
 // function.
@@ -542,11 +544,16 @@ struct Frame {
   Frame* previous;
 };
 
-#define PIP_FRAME(state, ...) \
+// Frame with explicit state argument
+#define PIP_E_FRAME(state, ...) \
   pip::FrameHack __pip_frame_hacks[] = { __VA_ARGS__ }; \
   pip::Frame __pip_frame((state), (FrameHack*) __pip_frame_hacks, sizeof(__pip_frame_hacks) / sizeof(pip::FrameHack))
 
-#define PIP_S_FRAME(...) PIP_FRAME((*this), __VA_ARGS__)
+// For general use
+
+// Assumes there is a variable State& state
+#define PIP_FRAME(...) PIP_E_FRAME((state), __VA_ARGS__)
+#define PIP_S_FRAME(...) PIP_E_FRAME((*this), __VA_ARGS__)
 
 struct State {
   struct VMFrame;
@@ -588,6 +595,7 @@ struct State {
       // Special forms
       "define",
       "set!",
+      "begin",
       "lambda",
       "#named-lambda",
       "if",
@@ -643,6 +651,7 @@ struct State {
     S_PIP_EVAL,
     S_DEFINE,
     S_SET,
+    S_BEGIN,
     S_LAMBDA,
     S_NAMED_LAMBDA,
     S_IF,
@@ -1479,7 +1488,7 @@ struct State {
               ungetc(c);
               
               Symbol* s = 0;
-              PIP_FRAME(state, s);
+              PIP_FRAME(s);
               s = state.make_symbol(token_buffer);
               token_value = state.make_box(s, true, file, line);
 
@@ -1568,7 +1577,7 @@ struct State {
       Value *head = 0, *tail = 0, *elt = 0, *swap = 0;
       // Save the line this list begins on
       size_t l = line; 
-      PIP_FRAME(state, initial, head, tail, elt, swap);
+      PIP_FRAME(initial, head, tail, elt, swap);
       // If we've been given an initial element (say quote in a quoted expression), attach it
       if(initial != NULL) {
         swap = state.cons(initial, PIP_NULL);
@@ -1678,7 +1687,7 @@ struct State {
             }
             size_t l = line;
             Value *cell = 0, *cell2 = 0, *value = 0, *symbol = 0;
-            PIP_FRAME(state, cell, cell2, value, symbol);
+            PIP_FRAME(cell, cell2, value, symbol);
             value = read();
             PIP_CHECK(value);
             if(value == PIP_EOF) return parse_error("unexpected EOF after quote");
@@ -1726,16 +1735,19 @@ struct State {
     OP_BAD = 0,
     OP_PUSH_IMMEDIATE = 1,
     OP_PUSH_CONSTANT = 2,
-    OP_GLOBAL_SET = 3,
-    OP_GLOBAL_GET = 4,
-    OP_LOCAL_SET = 5,
-    OP_LOCAL_GET = 6,
-    OP_UPVALUE_SET = 7,
-    OP_UPVALUE_GET = 8,
-    OP_CLOSE_OVER = 9,
-    OP_RETURN = 10,
-    OP_APPLY = 11,
-    OP_TAIL_APPLY = 12
+    OP_POP = 3,
+    OP_GLOBAL_SET = 4,
+    OP_GLOBAL_GET = 5,
+    OP_LOCAL_SET = 6,
+    OP_LOCAL_GET = 7,
+    OP_UPVALUE_SET = 8,
+    OP_UPVALUE_GET = 9,
+    OP_CLOSE_OVER = 10,
+    OP_RETURN = 11,
+    OP_APPLY = 12,
+    OP_TAIL_APPLY = 13,
+    OP_JUMP_IF_FALSE = 14,
+    OP_JUMP = 15,
   };
 
   struct UpvalLoc {
@@ -1831,7 +1843,7 @@ struct State {
       state(state_), parent(parent_),
       local_free_variable_count(0), upvalue_count(0),
       stack_max(0), stack_size(0), locals(0), constants(state), closure(false),
-      name(state_), env(0), depth(depth_) {
+      name(state_), env(0), depth(depth_), last_insn(0) {
       if(!env_) env = &state.global_env;
       else env = new Handle<Vector>(state, env_);
     }
@@ -1843,7 +1855,7 @@ struct State {
     // The parent procedure -- necessary for free variables
     Compiler* parent;
     // The wordcode
-    std::vector<ptrdiff_t> code;
+    std::vector<size_t> code;
     // A vector containing combinations of instruction offsets and source location info for debugging and tracebacks
     std::vector<std::pair<unsigned, SourceInfo> > debuginfo;
     // A vector containing free variable locations
@@ -1859,10 +1871,21 @@ struct State {
     Handle<Vector>* env;
     // The depth of the function (for debug message purposes)
     size_t depth;
+    // Location of last instruction emitted (for debug message purposes)
+    size_t last_insn;
+
+    // Location of last applications emitted, which will be replaced with tail
+    // calls 
+    size_t last_apply1, last_apply2;
 
     // Code generation
-    void emit(ptrdiff_t byte) {
-      code.push_back(byte);
+    void emit(size_t word) {
+      last_insn = code.size();
+      code.push_back(word);
+    }
+
+    void emit_arg(size_t word) {
+      code.push_back(word);
     }
 
     // In order to push a constant onto the stack, we have to save it and store
@@ -1871,7 +1894,7 @@ struct State {
     void push_constant(Value* constant) {
       push();
       Vector* cs = *constants;
-      PIP_FRAME(state, cs, constant);
+      PIP_FRAME(cs, constant);
       // Lazily create constant vector
       if(cs == PIP_FALSE) {
         cs = state.make_vector();
@@ -1882,7 +1905,7 @@ struct State {
         if(cs->vector_ref(i) == constant) {
           // Constant already exists, don't append it to vector
           emit(OP_PUSH_CONSTANT);
-          emit(i);
+          emit_arg(i);
           PIP_CC_VMSG("push-constant " << constant << " " << i << " (existing constant)");
           return;
         }
@@ -1890,8 +1913,8 @@ struct State {
       // Constant does not exist, add to vector and then push
       unsigned i = state.vector_append(cs, constant);
       emit(OP_PUSH_CONSTANT);
-      emit(i);
-      PIP_CC_VMSG("emit push-constant " << constant << " " << i);
+      emit_arg(i);
+      PIP_CC_EMIT("push-constant " << constant << " " << i);
     }
 
     // Stack size management; determines how much memory will be allocated for
@@ -1946,6 +1969,12 @@ struct State {
       syntax_error(form, ss.str());
     }
 
+    Value* arity_error_most(Global name, Value* form, size_t expected, unsigned got) {
+      std::ostringstream ss;
+      ss << "malformed " << state.global_symbol(name) << ": expected at most " << expected << " arguments, but got " << got;
+      syntax_error(form, ss.str());
+    }
+
     Value* syntax_error(Global name, Value* form, const std::string& str) {
       std::ostringstream ss;
       ss << "malformed " << state.global_symbol(name) << ": " << str;
@@ -1991,6 +2020,41 @@ struct State {
       return free_variables.size() - 1;
     }
 
+    // Compile a variable reference
+    Value* compile_ref(Value* exp) {
+      annotate(exp);
+      Value* name = unbox(exp);
+      Lookup lookup;
+      Value* type = state.env_ref(**env, name, lookup);
+      if(type == state.global_symbol(S_SPECIAL))
+        return syntax_error(exp, "special forms cannot be used as values");
+      if(type == state.global_symbol(S_VARIABLE)) {
+        switch(lookup.scope) {
+          case REF_GLOBAL:
+            push_constant(name);
+            emit(OP_GLOBAL_GET);
+            PIP_CC_EMIT("global-get " << name);
+            // No stack change - the name will be popped, but the value
+            // will be pushed
+            break;
+          case REF_LOCAL:
+            emit(OP_LOCAL_GET);
+            emit_arg(lookup.index);
+            PIP_CC_EMIT("local-get " << name << ' ' << lookup.index);
+            push();
+            break;
+          case REF_UP:
+            unsigned index = register_free_variable(lookup);
+            emit(OP_UPVALUE_GET);
+            emit_arg(index);
+            PIP_CC_EMIT("upvalue-get " << name << ' ' << index);
+            push();
+            break;
+        } 
+      } else PIP_ASSERT(0);
+      return PIP_FALSE;
+    }
+
     // Generate a set! (used by both define and set!)
     // Assumes value is already on the stack
     void generate_set(Lookup& lookup, Value* name) {
@@ -1998,13 +2062,13 @@ struct State {
         case REF_GLOBAL:
           push_constant(name);
           emit(OP_GLOBAL_SET);
-          PIP_CC_VMSG("emit global-set " << name);
+          PIP_CC_EMIT("global-set " << name);
           pop(2);
           break;
         case REF_LOCAL:
           emit(OP_LOCAL_SET);
-          emit(lookup.index);
-          PIP_CC_VMSG("emit local-set " << (unsigned) lookup.index);
+          emit_arg(lookup.index);
+          PIP_CC_EMIT("local-set " << (unsigned) lookup.index);
           pop();
           break;
         case REF_UP: assert(0);
@@ -2012,7 +2076,53 @@ struct State {
     }
 
     // Special forms
-    Value* compile_set(size_t argc, Value* exp) {
+    Value* compile_define(size_t argc, Value* exp, bool tail) {
+      // There's a goto here (yuck) because we'll restart the compilation
+      // process if this define is a function definition
+restart:
+      Value* chk = 0;
+      if(argc != 2) return arity_error(S_DEFINE, exp, 2, argc);
+      Value* name = unbox(exp->cadr());
+      Value* args = 0;
+      if(name->get_type() != SYMBOL) {
+        // Parse a lambda shortcut, e.g. (define (x) #t) becomes 
+        // (define x (named-lambda x () #t))
+        if(name->get_type() == PAIR) {
+          args = name->cdr();
+          name = name->car();
+          if(unbox(name)->get_type() != SYMBOL)
+            return syntax_error(S_DEFINE, exp, "first argument to define a function must be a symbol");
+          Value* named_lambda = 0, *tmp = 0;
+          PIP_FRAME(exp, name, args, named_lambda, tmp);
+          // Get the argument list and body
+          tmp = state.cons(args, exp->cddr());
+          // Put the function's name in front of them
+          tmp = state.cons(name, tmp);
+          // Finally put all that in a (named-lambda ...) expression
+          named_lambda = state.cons(state.global_symbol(S_NAMED_LAMBDA), tmp);
+          named_lambda = state.cons_source(named_lambda, PIP_NULL, exp);
+          // This is kind of hacky, but we're just going to twiddle the
+          // expression a little bit and start parsing again
+          exp->cdr()->set_car(name);
+          exp->cdr()->set_cdr(named_lambda);
+          goto restart;
+        } else return syntax_error(S_DEFINE, exp, "first argument to define must be a symbol");
+      }
+      // TODO: Handle (define name (lambda () #t))
+      unsigned slot = state.env_def(**env, name, state.global_symbol(S_VARIABLE));
+      // Compile body for set!
+      PIP_FRAME(name);
+      chk = compile(exp->cddr()->car());
+      PIP_CHECK(chk);
+      // Global variable
+      Lookup lookup;
+      lookup.scope = (*env)->vector_ref(0) == PIP_FALSE ? REF_GLOBAL : REF_LOCAL;
+      lookup.index = slot;
+      generate_set(lookup, name);
+      return PIP_FALSE;
+    }
+
+    Value* compile_set(size_t argc, Value* exp, bool tail) {
       Value* chk = 0;
       // set always has two arguments
       if(argc != 2) return arity_error(S_SET, exp, 2, argc);
@@ -2038,58 +2148,82 @@ struct State {
       return PIP_FALSE;
     }
 
-    Value* compile_define(size_t argc, Value* exp) {
-      // There's a goto here (yuck) because we'll restart the compilation
-      // process if this define is a function definition
-restart:
-      Value* chk = 0;
-      if(argc != 2) return arity_error(S_DEFINE, exp, 2, argc);
-      Value* name = unbox(exp->cadr());
-      Value* args = 0;
-      if(name->get_type() != SYMBOL) {
-        // Parse a lambda shortcut, e.g. (define (x) #t) becomes 
-        // (define x (named-lambda x () #t))
-        if(name->get_type() == PAIR) {
-          args = name->cdr();
-          name = name->car();
-          if(unbox(name)->get_type() != SYMBOL)
-            return syntax_error(S_DEFINE, exp, "first argument to define a function must be a symbol");
-          Value* named_lambda = 0, *tmp = 0;
-          PIP_FRAME(state, exp, name, args, named_lambda, tmp);
-          // Get the argument list and body
-          tmp = state.cons(args, exp->cddr());
-          // Put the function's name in front of them
-          tmp = state.cons(name, tmp);
-          // Finally put all that in a (named-lambda ...) expression
-          named_lambda = state.cons(state.global_symbol(S_NAMED_LAMBDA), tmp);
-          named_lambda = state.cons_source(named_lambda, PIP_NULL, exp);
-          // This is kind of hacky, but we're just going to twiddle the
-          // expression a little bit and start parsing again
-          exp->cdr()->set_car(name);
-          exp->cdr()->set_cdr(named_lambda);
-          goto restart;
-        } else return syntax_error(S_DEFINE, exp, "first argument to define must be a symbol");
+    Value* compile_begin(size_t argc, Value* exp, bool tail) {
+      if(argc == 0) {
+        return compile(PIP_UNSPECIFIED, tail);
+      } else {
+        Value* body = exp->cdr();
+        Value* elt = 0, *chk = 0;
+        PIP_FRAME(body, elt, chk);
+        while(body != PIP_NULL) {
+          elt = body->car();
+          if(body->cdr() == PIP_NULL) {
+            return compile(elt, tail);
+          } else {
+            chk = compile(elt, false);
+            PIP_CHECK(chk);
+            body = body->cdr();
+            // Pop result
+            emit(OP_POP);
+            pop();
+          }
+        }
       }
-      // TODO: Handle (define name (lambda () #t))
-      unsigned slot = state.env_def(**env, name, state.global_symbol(S_VARIABLE));
-      // Compile body for set!
-      PIP_FRAME(state, name);
-      chk = compile(exp->cddr()->car());
+    }
+
+    Value* compile_if(size_t argc, Value* exp, bool tail) {
+      if(argc != 2 && argc != 3)
+        if(argc < 2) return arity_error(S_IF, exp, 2, argc);
+        else return arity_error_most(S_IF, exp, 3, argc);
+      Value* chk = 0, *condition = 0, *then_branch = 0, *else_branch = 0;
+      PIP_FRAME(chk, condition, then_branch, else_branch);
+
+      condition = exp->cadr();
+      then_branch = exp->cddr()->car();
+      else_branch = argc == 2 ? PIP_UNSPECIFIED : exp->cddr()->cdr()->car();
+
+      chk = compile(condition);
       PIP_CHECK(chk);
-      // Global variable
-      Lookup lookup;
-      lookup.scope = (*env)->vector_ref(0) == PIP_FALSE ? REF_GLOBAL : REF_LOCAL;
-      lookup.index = slot;
-      generate_set(lookup, name);
+      // Jump to the else branch if the condition is false
+      emit(OP_JUMP_IF_FALSE);
+      // Emit placeholder for argument
+      size_t jmp1 = code.size();
+      emit_arg(0);
+      // JMP_IF_FALSE will pop condition
+      pop();
+      PIP_CC_EMIT("jump-if-false");
+      size_t old_stack = stack_size;
+      // Emit 'then' code
+      chk = compile(then_branch);
+      PIP_CHECK(chk);
+      pop(stack_size - old_stack);
+      // Jmp to the rest of the program
+      emit(OP_JUMP);
+      // Emit placeholder for argument
+      size_t jmp2 = code.size();
+      emit_arg(0);
+      PIP_CC_EMIT("jump");
+      // Location of first jump (beginning of else branch)
+      size_t lbl1 = code.size();
+      chk = compile(else_branch);
+      PIP_CHECK(chk);
+      pop(stack_size - old_stack);
+      // Location of second jump
+      size_t lbl2 = code.size();
+
+      // Replace jumps
+      code[jmp1] = lbl1;
+      code[jmp2] = lbl2;
+
+      // Ensure space for result
+      push();
+
+      PIP_CC_VMSG("if jmp1 " << lbl1 << " jmp2 " << lbl2);
+
       return PIP_FALSE;
     }
 
-    Value* compile_if(size_t argc, Value* exp) {
-
-      return PIP_FALSE;
-    }
-
-    Value* compile_lambda(size_t form_argc, Value* exp, Value* name) {
+    Value* compile_lambda(size_t form_argc, Value* exp, bool tail, Value* name) {
       // For checking subcompilation results
       Value* chk = 0;
       if(form_argc < 2) return arity_error(S_LAMBDA, exp, 2, form_argc);
@@ -2100,7 +2234,7 @@ restart:
       bool variable_arity = false;
       Value *new_env = 0, *args = 0, *body = 0;
       Prototype* proto = 0;
-      PIP_FRAME(state, exp, new_env, args, body, proto);
+      PIP_FRAME(exp, new_env, args, body, proto);
       // Create a new environment for the function
       new_env = state.make_vector();
       // Make the current environment its parent environment
@@ -2133,7 +2267,9 @@ restart:
       cc.name = static_cast<String*>(name);
       body = exp->cddr();
       while(body != PIP_NULL) {
-        chk = cc.compile(body->car());
+        // Compile body expression. Note that if cdr() is NULL, this is the
+        // tail expression and might be subject to tail call optimization
+        chk = cc.compile(body->car(), body->cdr() == NULL);
         PIP_CHECK(chk);
         body = body->cdr();
       }
@@ -2141,14 +2277,14 @@ restart:
       push_constant(proto);
       // If the function's a closure, we'll have to close over it
       if(cc.closure) {
-        PIP_CC_VMSG("emit close-over");
+        PIP_CC_EMIT("close-over");
         emit(OP_CLOSE_OVER);
       }
       return PIP_FALSE;
     }
 
     // Compile a normal function application
-    Value* compile_apply(Value* exp) {
+    Value* compile_apply(Value* exp, bool tail) {
       Value* chk = 0;
       // First, compile the arguments. We'll determine how many arguments
       // were passed by comparing the stack size before and after
@@ -2168,49 +2304,19 @@ restart:
       chk = compile(exp->car());
       PIP_CHECK(chk);
 
-      emit(OP_APPLY);
+      emit(tail ? OP_TAIL_APPLY : OP_APPLY);
       PIP_ASSERT(argc < 255);
-      emit((unsigned char) argc); 
-      PIP_CC_VMSG("emit apply " << argc);
-      // The application will pop the arguments and the function once finished
+      emit_arg((unsigned char) argc); 
+      PIP_CC_EMIT((tail ? "tail-apply" : "apply") << ' ' << argc);
+      // The application will pop the arguments and the function once finished,
+      // but will push a result
       pop(stack_size - old_stack_size);
-      return PIP_FALSE;
-    }
-
-    // Compile a variable reference
-    Value* compile_ref(Value* exp) {
-      annotate(exp);
-      Value* name = unbox(exp);
-      Lookup lookup;
-      Value* type = state.env_ref(**env, name, lookup);
-      if(type == state.global_symbol(S_SPECIAL))
-        return syntax_error(exp, "special forms cannot be used as values");
-      if(type == state.global_symbol(S_VARIABLE)) {
-        switch(lookup.scope) {
-          case REF_GLOBAL:
-            push_constant(name);
-            emit(OP_GLOBAL_GET);
-            PIP_CC_VMSG("emit global-get " << name);
-            push();
-            break;
-          case REF_LOCAL:
-            emit(OP_LOCAL_GET);
-            emit((unsigned char)lookup.index);
-            PIP_CC_VMSG("emit local-get " << name << ' ' << lookup.index);
-            break;
-          case REF_UP:
-            unsigned index = register_free_variable(lookup);
-            emit(OP_UPVALUE_GET);
-            emit((unsigned char) index);
-            PIP_CC_VMSG("emit upvalue-get " << name << ' ' << index);
-            break;
-        } 
-      } else PIP_ASSERT(0);
+      push();
       return PIP_FALSE;
     }
 
     // Compile a single expression, returns #f or an error if one occurred
-    Value* compile(Value* exp) {
+    Value* compile(Value* exp, bool tail = false) {
       // Dispatch based on an object's type
       switch(exp->get_type()) {
         // Constants: note that these are only immediate constants, such as #t
@@ -2219,8 +2325,8 @@ restart:
         case FIXNUM:
         case CONSTANT:
           emit(OP_PUSH_IMMEDIATE);
-          emit((ptrdiff_t) exp);
-          PIP_CC_VMSG("emit push-immediate " << exp);
+          emit_arg((ptrdiff_t) exp);
+          PIP_CC_EMIT("push-immediate " << exp);
           push();
           break;
         // Variable references
@@ -2244,13 +2350,16 @@ restart:
             size_t argc = length(exp->cdr());
             // define
             if(op == state.global_symbol(S_DEFINE)) {
-              return compile_define(argc, exp);
+              return compile_define(argc, exp, tail);
             // set!
             } else if(op == state.global_symbol(S_SET)) {
-              return compile_set(argc, exp);
+              return compile_set(argc, exp, tail);
+            // begin
+            } else if(op == state.global_symbol(S_BEGIN)) {
+              return compile_begin(argc, exp, tail);
             // lambda
             } else if(op == state.global_symbol(S_LAMBDA)) {
-              return compile_lambda(argc, exp, PIP_FALSE);
+              return compile_lambda(argc, exp, tail, PIP_FALSE);
             // named-lambda
             } else if(op == state.global_symbol(S_NAMED_LAMBDA)) {  
               // This is a little hacky, but we're going to extract the name
@@ -2261,13 +2370,13 @@ restart:
               Value* rest = exp->cddr();
               exp->set_cdr(rest);
 
-              return compile_lambda(argc-1, exp, name);
+              return compile_lambda(argc-1, exp, tail, name);
             } else if(op == state.global_symbol(S_IF)) {
-              return compile_if(argc, exp);
+              return compile_if(argc, exp, tail);
             } else assert(0);
           } else {
             // function application
-            return compile_apply(exp);
+            return compile_apply(exp, tail);
           }
           PIP_ASSERT(0);
         }
@@ -2280,17 +2389,17 @@ restart:
 
     // Creates the actual Prototype at the end of compilation
     Prototype* end(unsigned arguments = 0, bool variable_arity = false) {
+      PIP_ASSERT(stack_size == 1);
       emit(OP_RETURN);
-      PIP_CC_VMSG("emit return");
+      PIP_CC_EMIT("return");
       Prototype* p = 0;
 
       Blob* codeblob = 0, *localfreevars = 0, *upvals = 0;
-      PIP_FRAME(state, p, codeblob, localfreevars, upvals);
+      PIP_FRAME(p, codeblob, localfreevars, upvals);
       p = state.allocate<Prototype>();
       // Copy some data from the compiler to Scheme blobs
-      codeblob = state.make_blob<ptrdiff_t>(code.size());
-      memcpy(codeblob->data, &code[0], code.size() * sizeof(ptrdiff_t));
-//      std::copy(code.begin(), code.end(), codeblob->data);
+      codeblob = state.make_blob<size_t>(code.size());
+      memcpy(codeblob->data, &code[0], code.size() * sizeof(size_t));
       p->code = codeblob;
 
       // Free variable handling
@@ -2381,7 +2490,7 @@ restart:
     PIP_VM_MSG("entering function ");
     // Get pointer to code
     // NOTE: could be moved if moving garbage collector is ever used
-    ptrdiff_t* bc = (ptrdiff_t*)(prototype->code->data);
+    size_t* wc = (size_t*)(prototype->code->data);
 
     // Set up call frame
     VMFrame f(prototype, closure, 
@@ -2428,20 +2537,28 @@ restart:
       }
     }
 
+    // Some common things you will see:
+    // f.stack[f.si-1] Get the top of the stack 
+    // f.stack[--f.si] Pop the top of the stack
+    // wc[ip++] Get the next instruction and advance the instruction pointer
+
     // Evaluate procedure
     unsigned ip = 0;
     while(1) {
-      switch(bc[ip++]) {
+      switch(wc[ip++]) {
         case OP_PUSH_IMMEDIATE:
-          f.stack[f.si++] = (Value*)(ptrdiff_t) bc[ip++]; 
+          f.stack[f.si++] = (Value*) wc[ip++]; 
           continue;
         case OP_PUSH_CONSTANT:
-          f.stack[f.si++] = f.p->constants->vector_ref(bc[ip++]);
+          f.stack[f.si++] = f.p->constants->vector_ref(wc[ip++]);
+          continue;
+        case OP_POP:
+          --f.si;
           continue;
         case OP_GLOBAL_SET: {
           // Get the global name
           Symbol* k = PIP_CAST(Symbol, f.stack[f.si-1]);
-          f.si--;
+          --f.si;
           // Pop the value off the stack
           Value* v = f.stack[--f.si];
           PIP_VM_VMSG("global-set " << k << ' ' << v);
@@ -2459,7 +2576,7 @@ restart:
         }
         case OP_LOCAL_SET: {
           // Get the local's index
-          unsigned char index = bc[ip++];
+          size_t index = wc[ip++];
           Value* val = f.stack[--f.si];
           PIP_VM_VMSG("local-set " << (unsigned) index << " " << val);
           f.locals[index] = val;
@@ -2467,21 +2584,21 @@ restart:
         }
         case OP_LOCAL_GET: {
           // Get the local index
-          unsigned char index = bc[ip++];
+          size_t index = wc[ip++];
           PIP_VM_VMSG("local-get " << (unsigned)index);
           f.stack[f.si++] = f.locals[index];
           continue;
         }
         case OP_UPVALUE_GET: {
           // Get upvalue index
-          unsigned char index = bc[ip++];
+          size_t index = wc[ip++];
           PIP_VM_VMSG("upvalue-get " << (unsigned)index);
           f.stack[f.si++] = closure->upvalues->data[index]->upvalue();
           continue;
         }
         case OP_UPVALUE_SET: {
           // Get upvalue index
-          unsigned char index = bc[ip++];
+          size_t index = wc[ip++];
           Value* val = f.stack[--f.si];
           PIP_VM_VMSG("upvalue-set " << (unsigned)index);
           closure->upvalues->data[index]->upvalue_set(val);
@@ -2508,7 +2625,6 @@ restart:
               vector_append(upvalues, f.upvalues[l.index]);
             else
               vector_append(upvalues, closure->upvalues->data[l.index]);
-//            vector_append(upvalues, f.upvalues[i]);
           }
           c->upvalues = upvalues->storage;
           // Replace prototype with closure
@@ -2521,9 +2637,10 @@ restart:
           Value* ret = f.si ? f.stack[--f.si] : PIP_UNSPECIFIED;
           VM_RETURN(ret);
         }
+        case OP_TAIL_APPLY:
         case OP_APPLY: {
           // Retrieve argument count
-          unsigned char argc = bc[ip++];
+          size_t argc = wc[ip++];
           PIP_VM_VMSG("apply " << (unsigned)argc);
           // Pop the function, which should be at the top of the stack
           Value* fn = f.stack[f.si-1];
@@ -2538,8 +2655,22 @@ restart:
           PIP_VM_VMSG("apply result: " << tmp);
           continue;
         }
+        case OP_JUMP_IF_FALSE: {
+          size_t insn = wc[ip++];
+          PIP_VM_VMSG("jump-if-false " << (f.stack[f.si-1] == PIP_FALSE ? "jmping" : "not jmping") << " " << insn);
+          Value* condition = f.stack[--f.si];
+          if(condition == PIP_FALSE) {
+            ip = insn;
+          } 
+          continue;
+        }
+        case OP_JUMP: {
+          PIP_VM_VMSG("jump " << wc[ip]);
+          ip = wc[ip];
+          continue;
+        }
         default: {
-          std::cout << (int)bc[ip-1] << std::endl;
+          std::cout << (ptrdiff_t)wc[ip-1] << std::endl;
           assert(!"bad instruction");
         }
       }
@@ -2588,6 +2719,7 @@ inline std::ostream& operator<<(std::ostream& os, Value* x) {
       if(x == PIP_FALSE) return os << "#f";
       if(x == PIP_EOF) return os << "#<eof>";
       if(x == PIP_NULL) return os << "()";
+      if(x == PIP_UNSPECIFIED) return os << "#<unspecified>";
       break;
     case SYMBOL:
       return os << x->symbol_name()->string_data();
