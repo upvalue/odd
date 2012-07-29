@@ -5,7 +5,7 @@ LDFLAGS :=
 
 all: pip
 
-pip: main.cpp pip.hpp
+pip: cli.cpp pip.hpp
 	@echo -n ' LD  ';
 	$(strip $(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $< $(LDFLAGS))
 

@@ -410,8 +410,14 @@ struct Prototype : Value {
   Vector* constants;
   Blob* code;
   Blob* debuginfo;
+  // A list of local free variables referenced by other functions, which will
+  // be converted into upvalues when the function ends
+  Blob* local_free_variables;
+  // A list of upvalues, which will be used to turn this into a closure if necessary
+  Blob* upvalues;
   unsigned stack_max;
   unsigned locals;
+  unsigned free_variable_count;
   unsigned arguments;
 
   static const Type CLASS_TYPE = PROTOTYPE;
@@ -668,15 +674,22 @@ struct State {
         case CLOSURE:
         case PAIR:
         case SYMBOL:
-          recursive_mark(static_cast<Pair*>(x)->car);
-          x = static_cast<Pair*>(x)->cdr;
+          recursive_mark(static_cast<Pair*>(x)->cdr);
+          x = static_cast<Pair*>(x)->car;
           continue;
         // Three pointers
-        case PROTOTYPE:
         case EXCEPTION:
           recursive_mark(static_cast<Exception*>(x)->tag);
           recursive_mark(static_cast<Exception*>(x)->message);
           x = static_cast<Exception*>(x)->irritants;
+          continue;
+        // Four pointers
+        case PROTOTYPE:
+          recursive_mark(static_cast<Prototype*>(x)->code);
+          recursive_mark(static_cast<Prototype*>(x)->debuginfo);
+          recursive_mark(static_cast<Prototype*>(x)->local_free_variables);
+          recursive_mark(static_cast<Prototype*>(x)->upvalues);
+          x = static_cast<Prototype*>(x)->constants;
           continue;
         // Special types
         case VECTOR_STORAGE: {
@@ -855,10 +868,21 @@ struct State {
     
     for(size_t i = 0; i != vm_frames.size(); i++) {
       VMFrame* f = vm_frames[i];
+      // Mark prototype
       recursive_mark(f->p);
+      // Mark closure
       recursive_mark(f->c);
+      // Mark function stack
       for(size_t j = 0; j != f->si; j++) {
         recursive_mark(f->stack[j]);
+      }
+      // Mark local variables
+      for(size_t j = 0; j != f->p->locals; j++) {
+        recursive_mark(f->locals[j]);
+      }
+      // Mark upvalues (if necessary)
+      for(size_t j = 0; j != f->p->free_variable_count; j++) {
+        recursive_mark(f->upvalues[j]);
       }
     }
 
@@ -1626,6 +1650,7 @@ struct State {
   // necessary.
   // -->
   
+  // Some structures that are shared by the virtual machine and compiler
   // Virtual machine instructions
   enum {
     OP_BAD = 0,
@@ -1637,11 +1662,11 @@ struct State {
     OP_LOCAL_GET = 6,
     OP_UPVALUE_SET = 7,
     OP_UPVALUE_GET = 8,
+    OP_CLOSE_OVER = 9,
     OP_RETURN = 10,
     OP_APPLY = 11,
     OP_TAIL_APPLY = 12
   };
-
 
   // Environments
 
@@ -1666,37 +1691,68 @@ struct State {
     PIP_S_FRAME(env, key, value);
     unsigned slot = vector_append(env, key);
     vector_append(env, value);
-    return ((slot - 1) / 1) - 1;
+    return ((slot - 1) / 2) - 1;
   }
 
+  // Look up an environment variable (the result is rather complex, and returned in
+  // a structure)
 
-  // Set an environment variable
   enum RefScope { REF_GLOBAL, REF_UP, REF_LOCAL };
-  Value* env_ref(Vector* env, Value* key, RefScope& scope, unsigned& index) {
+  struct Lookup {
+    Lookup(): scope(REF_LOCAL), index(0), level(0) {}
+
+    RefScope scope;
+    unsigned index;
+    unsigned level;
+  };
+
+  Value* env_ref(Vector* env, Value* key, Lookup& lookup) {
     Value *start_env = env;
+    // Search through environments
     while(env->get_type() == VECTOR) {
+      // Search through an environment
       for(size_t i = 1; i != env->vector_length(); i += 2) {
+        // We found a match
         if(env->vector_ref(i) == key) {
+          // If this environment has no parent environment, it's global
           if(env->vector_ref(0) == PIP_FALSE) {
-            scope = REF_GLOBAL;
+            lookup.scope = REF_GLOBAL;
           } else {
-            scope = env == start_env ? REF_LOCAL : REF_UP;
+            // Otherwise, if we're still searching the original environment,
+            // it's a local variable, and if not, it's an upvalue
+            lookup.scope = env == start_env ? REF_LOCAL : REF_UP;
           }
-          index = (i - 1) / 2;
+          // Calculate index value from location (we have to compensate for the
+          // fact that both keys and values are stored, and start at 1)
+          lookup.index = (i - 1) / 2;
           return env->vector_ref(i+1);
         }
       }
+      // Search parent environment, if it exists
+      lookup.level++;
       env = static_cast<Vector*>(env->vector_ref(0));
     }
+    // Lookup failed
     return PIP_FALSE;
   }
 
   Handle<Vector> global_env;
 
+  // A structure describing the location of a free variable relative to the
+  // function it's being used in
+  struct FreeVariableInfo {
+    // The lexical location of the variable
+    unsigned lexical_level, lexical_index;
+    // The upvalue's index at runtime, either in the upvalues array of the
+    // preceding function, or in the locals array of the currently executing
+    // function
+    unsigned index;
+  };
+
   // An instance of the compiler, created for each procedure
   struct Compiler {
-    Compiler(State& state_, Vector* env_ = NULL, size_t depth_ = 0): 
-      state(state_), stack_max(0), stack_size(0), locals(0), constants(state), closure(false),
+    Compiler(State& state_, Compiler* parent_, Vector* env_ = NULL, size_t depth_ = 0): 
+      state(state_), parent(parent_), stack_max(0), stack_size(0), locals(0), constants(state), closure(false),
       env(0), depth(depth_) {
       if(!env_) env = &state.global_env;
       else env = new Handle<Vector>(state, env_);
@@ -1706,10 +1762,14 @@ struct State {
     }
 
     State& state;
+    // The parent procedure -- necessary for free_variables
+    Compiler* parent;
     // The bytecode
     std::vector<unsigned char> code;
     // A vector containing combinations of instruction offsets and source location info for debugging and tracebacks
     std::vector<std::pair<unsigned, SourceInfo> > debuginfo;
+    // A vector containing free_variable locations
+    std::vector<FreeVariableInfo> free_variables;
     unsigned stack_max, stack_size, locals;
     Handle<Vector> constants;
     bool closure;
@@ -1818,11 +1878,43 @@ struct State {
       return state.make_exception(State::S_PIP_COMPILE, out);
     }
 
+    // free_variable handling
+    unsigned register_free_variable(Lookup lookup) {
+      FreeVariableInfo l;
+      // Check for existing free_variable
+      for(unsigned i = 0; i != free_variables.size(); i++) {
+        l = free_variables[i];
+        if(l.lexical_level == lookup.level && l.lexical_index == lookup.index)
+          return i;
+      }
+      // New free_variable - register it with this and all preceding functions as
+      // necessary. 
+      l.lexical_level = lookup.level;
+      l.lexical_index = lookup.index;
+      PIP_CC_VMSG("register free variable <" << l.lexical_level << ", " << l.lexical_index << '>');
+      Lookup lookup_copy(lookup);
+      lookup_copy.level--;
+      if(lookup.level != 0) {
+        // Register with preceding function, and make this a closure if it isn't already
+        closure = true;
+        l.index = parent->register_free_variable(lookup_copy);
+      } else {
+        // If the "level" is 0, it's actually a local variable, so we
+        // don't need necessarily need to make this function a closure
+        l.index = l.lexical_index;
+      }
+      free_variables.push_back(l);
+      return free_variables.size() - 1;
+    }
+
     // Compile a single expression, returns #f or an error if one occurred
     Value* compile(Value* exp) {
       Value* chk = 0;
+      // Dispatch based on an object's type
       switch(exp->get_type()) {
-        // Constants
+        // Constants: note that these are only immediate constants, such as #t
+        // and #f, and not complex values that the compiler considers
+        // constants, such as '(list)
         case CONSTANT:
           emit(OP_PUSH_IMMEDIATE);
           emit((unsigned char)(((size_t) exp) & 255));
@@ -1834,13 +1926,12 @@ struct State {
         case BOX: {
           annotate(exp);
           Value* name = unbox(exp);
-          RefScope scope;
-          unsigned index;
-          Value* type = state.env_ref(**env, name, scope, index);
+          Lookup lookup;
+          Value* type = state.env_ref(**env, name, lookup);
           if(type == state.global_symbol(S_SPECIAL))
             return syntax_error(exp, "special forms cannot be used as values");
           if(type == state.global_symbol(S_VARIABLE)) {
-            switch(scope) {
+            switch(lookup.scope) {
               case REF_GLOBAL:
                 push_constant(name);
                 emit(OP_GLOBAL_GET);
@@ -1849,11 +1940,15 @@ struct State {
                 break;
               case REF_LOCAL:
                 emit(OP_LOCAL_GET);
-                emit((unsigned char)index);
-                PIP_CC_VMSG("emit local-get " << name << ' ' << index);
+                emit((unsigned char)lookup.index);
+                PIP_CC_VMSG("emit local-get " << name << ' ' << lookup.index);
                 break;
               case REF_UP:
-                assert(false);
+                unsigned index = register_free_variable(lookup);
+                emit(OP_UPVALUE_GET);
+                emit((unsigned char) index);
+                PIP_CC_VMSG("emit upvalue-get " << name << ' ' << index);
+                break;
             } 
           } else assert(0);
           break;
@@ -1863,9 +1958,8 @@ struct State {
           if(!listp(exp)) return error(exp, "dotted lists not allowed in source");
           annotate(exp);
           // Check for special forms
-          RefScope scope;
-          unsigned index;
-          Value* type = state.env_ref(**env, unbox(exp->car()), scope, index);
+          Lookup lookup;
+          Value* type = state.env_ref(**env, unbox(exp->car()), lookup);
           // This is a special form
           if(type == state.global_symbol(S_SPECIAL)) {
             Symbol* op = PIP_CAST(Symbol, unbox(exp->car()));
@@ -1881,17 +1975,22 @@ struct State {
               // Compile body
               compile(exp->cddr()->car());
               // Global variable
-              if(**env == *state.global_env) {
-                // NOTE: Causes allocation
-                push_constant(name);
-                emit(OP_GLOBAL_SET);
-                PIP_CC_VMSG("emit global-set " << name);
-                pop(2);
-              } else {
-                locals++;
-                emit(OP_LOCAL_SET);
-                emit(slot);
-                pop();
+              switch(lookup.scope) {
+                case REF_GLOBAL: {
+                  // NOTE: Causes allocation
+                  push_constant(name);
+                  emit(OP_GLOBAL_SET);
+                  PIP_CC_VMSG("emit global-set " << name);
+                  pop(2);
+                  break;
+                }
+                case REF_LOCAL: {
+                  locals++;
+                  emit(OP_LOCAL_SET);
+                  emit(slot);
+                  pop();
+                  break;
+                }
               }
             // set!
             } else if(op == state.global_symbol(S_SET)) {
@@ -1901,15 +2000,27 @@ struct State {
               if(name->get_type() != SYMBOL)
                 return syntax_error(S_SET, exp, "first argument to set! must be a symbol");
               // look up variable
-              unsigned index;
-              RefScope scope;
-              Value* type = state.env_ref(**env, name, scope, index);
+              Lookup lookup;
+              Value* type = state.env_ref(**env, name, lookup);
               if(type == state.global_symbol(S_SPECIAL))
                 return syntax_error(exp, "special forms cannot be used as variables");
               else if(type == state.global_symbol(S_VARIABLE)) {
-                switch(scope) {
+                // compile body
+                compile(exp->cddr()->car());
+                
+                switch(lookup.scope) {
                   case REF_GLOBAL:
-                  case REF_LOCAL: assert(0);
+                    push_constant(name);
+                    emit(OP_GLOBAL_SET);
+                    PIP_CC_VMSG("emit global-set " << name);
+                    pop(2);
+                    break;
+                  case REF_LOCAL:
+                    emit(OP_LOCAL_SET);
+                    emit(lookup.index);
+                    PIP_CC_VMSG("emit local-set " << (unsigned) lookup.index);
+                    pop();
+                    break;
                   case REF_UP: assert(0);
                 }
               } else assert(0);
@@ -1945,7 +2056,7 @@ struct State {
                 }
               }
               PIP_CC_MSG("compiling subprocedure");
-              Compiler cc(state, PIP_CAST(Vector, new_env), depth+1);
+              Compiler cc(state, this, PIP_CAST(Vector, new_env), depth+1);
               // Compile body
               body = exp->cddr();
               while(body != PIP_NULL) {
@@ -1955,6 +2066,10 @@ struct State {
               }
               proto = cc.end(argc, variable_arity);
               push_constant(proto);
+              if(cc.closure) {
+                PIP_CC_VMSG("emit close-over");
+                emit(OP_CLOSE_OVER);
+              }
             }
           } else {
             // function application
@@ -1999,12 +2114,43 @@ struct State {
       emit(OP_RETURN);
       PIP_CC_VMSG("emit return");
       Prototype* p = 0;
-      Blob* codeblob = 0;
-      PIP_FRAME(state, p, codeblob);
+
+      Blob* codeblob = 0, *localfreevars = 0, *upvals = 0;
+      PIP_FRAME(state, p, codeblob, localfreevars, upvals);
       p = state.allocate<Prototype>();
+      // Copy some data from the compiler to Scheme blobs
       codeblob = state.make_blob(code.size());
       std::copy(code.begin(), code.end(), codeblob->data);
       p->code = codeblob;
+      // Upvalues
+
+      // Determine how large these blobs need to be 
+      size_t localfreevar_count = 0, upvalue_count = 0, localfreevar_i = 0,
+             upvalue_i = 0;
+      for(size_t i = 0; i != free_variables.size(); i++) {
+        if(free_variables[i].lexical_level == 0)
+          localfreevar_count++;
+        else
+          upvalue_count++;
+      }
+
+      // Populate them
+      localfreevars = state.make_blob(localfreevar_count * sizeof(unsigned));
+      upvals = state.make_blob(upvalue_count * sizeof(unsigned));
+
+      for(size_t i = 0; i != free_variables.size(); i++) {
+        if(free_variables[i].lexical_level == 0) {
+          ((unsigned*)localfreevars->data)[localfreevar_i++] = free_variables[i].index;
+        } else {
+          ((unsigned*)upvals->data)[upvalue_i++] = free_variables[i].index;
+        }
+      }
+
+      p->local_free_variables = localfreevars;
+      p->free_variable_count = localfreevar_count;
+    
+      p->upvalues = upvals;
+
       p->stack_max = stack_max;
       p->locals = locals;
       // TODO: Compress vector
@@ -2034,15 +2180,20 @@ struct State {
 
   // A frame containing information that needs to be tracked by the garbage collector
   struct VMFrame {
-    VMFrame(Prototype* p_, Closure* c_, Value** stack_, Value** locals_): p(p_), c(c_), stack(stack_), locals(locals_), si(0) {}
+    VMFrame(Prototype* p_, Closure* c_, Value** stack_, Value** locals_):
+      p(p_), c(c_), stack(stack_), locals(locals_), upvalues(0), si(0), 
+      upvalue_count(0) {}
     // Need to save pointers to the prototype and closure so they're considered roots
     Prototype* p;
     Closure* c;
     // Storage for stack and locals
     Value** stack;
     Value** locals;
+    Upvalue** upvalues;
     // Stack index
     unsigned si;
+    // Local and upvalue count
+    unsigned upvalue_count;
   };
 
   // Evaluation errors
@@ -2071,6 +2222,20 @@ struct State {
     memset(f.locals, 0, prototype->locals * sizeof(Value*));
     // Push call frame
     vm_frames.push_back(&f);
+
+    // Create upvalues, if necessary
+    if(prototype->local_free_variables->length) {
+      unsigned* data = (unsigned*) prototype->local_free_variables->data;
+      
+      f.upvalues = (Upvalue**) alloca(prototype->free_variable_count * sizeof(Upvalue*));
+      memset(f.upvalues, 0, prototype->free_variable_count * sizeof(Upvalue*));
+
+      for(size_t i = 0; i != prototype->free_variable_count; i++) {
+        unsigned index = data[i];
+        f.upvalues[i] = allocate<Upvalue>();
+        f.upvalues[i]->local = &f.locals[index];
+      }
+    }
 
     // Load arguments
 
@@ -2122,11 +2287,50 @@ struct State {
           f.stack[f.si++] = k->value;
           continue;
         }
+        case OP_LOCAL_SET: {
+          // Get the local's index
+          unsigned char index = bc[ip++];
+          Value* val = f.stack[--f.si];
+          PIP_VM_VMSG("local-set " << (unsigned) index << " " << val);
+          f.locals[index] = val;
+          continue;
+        }
         case OP_LOCAL_GET: {
           // Get the local index
           unsigned char index = bc[ip++];
-          PIP_VM_VMSG("get-local-index " << (unsigned)index);
+          PIP_VM_VMSG("local-get " << (unsigned)index);
           f.stack[f.si++] = f.locals[index];
+          continue;
+        }
+        case OP_UPVALUE_GET: {
+          // Get upvalue
+          unsigned char index = bc[ip++];
+          PIP_VM_VMSG("upvalue-get " << (unsigned)index);
+          f.stack[f.si++] = closure->upvalues->data[index]->upvalue();
+          continue;
+        }
+        case OP_CLOSE_OVER: {
+          // Create a closure
+          PIP_VM_VMSG("close-over");
+          Closure* c = 0;
+          Prototype* p = PIP_CAST(Prototype, f.stack[f.si-1]);
+          Blob* locations = p->upvalues;
+          Vector* upvalues = 0;
+          PIP_S_FRAME(c, p, locations, upvalues);
+          // Allocate the closure
+          c = allocate<Closure>();
+          c->prototype = p;
+          // Determine how many upvalues we have
+          size_t locs = (locations->length) / sizeof(unsigned);
+          // Allocate the vector that will actually hold the upvalues
+          upvalues = make_vector(locs);
+          // Fill array
+          for(size_t i = 0; i != locs; i++) {
+            vector_append(upvalues, f.upvalues[i]);
+          }
+          c->upvalues = upvalues->storage;
+          // Replace prototype with closure
+          f.stack[f.si-1] = c;
           continue;
         }
         case OP_RETURN: {
@@ -2269,6 +2473,7 @@ inline std::ostream& operator<<(std::ostream& os, Value* x) {
       return os << "#<exception " << x->exception_tag() << ' ' << x->exception_message() << '>';
     }
     case PROTOTYPE: return os << "#<prototype>";
+    case UPVALUE: return os << "#<upvalue " << (x->upvalue_closed() ? "(closed) " : "") << " " << x->upvalue() << ')' << std::endl;
     default:
       return os << "#<unknown value " << (size_t) x << " type: " << x->get_type() << ">";
   }

@@ -1,8 +1,5 @@
-// main.cpp - odd command line interface
-
-#include "pip.hpp"
-
-using namespace pip;
+// test/tests.cpp - basic internals tests
+// included to cli.cpp
 
 static void test_invariants(State& state) {
   Value* consts[] = { PIP_FALSE, PIP_TRUE, PIP_NULL, PIP_EOF };
@@ -133,7 +130,7 @@ static void test_reader(State& state) {
 
 Value* eval_string(State& state, const std::string& string) {
   unsigned file = state.register_string("string", string);
-  State::Compiler cc(state);
+  State::Compiler cc(state, NULL);
   std::stringstream ss;
   ss << std::noskipws;
   ss << string;
@@ -181,8 +178,10 @@ void test_compiler(State& state) {
   test_compile_string(state, "((lambda () #t))", PIP_TRUE);
   // Argument function and application
   test_compile_string(state, "((lambda (x) x) #t)", PIP_TRUE);
-  // Closures
-  //test_compile_string(state, "((lambda (x) ((lambda () x))) #t)", PIP_TRUE);
+  // Set!
+  test_compile_string(state, "(define z #f) (set! z #t) z", PIP_TRUE);
+  test_compile_string(state, "((lambda (x) (set! x #t) x) #f)", PIP_TRUE);
+  test_compile_string(state, "((lambda (x) ((lambda () x))) #t)", PIP_TRUE);
 }
 
 void test() {
@@ -197,7 +196,7 @@ void test() {
   test_compiler(*state);
 
   { 
-    State::Compiler cc(*state);
+    State::Compiler cc(*state, NULL);
     cc.compile(PIP_TRUE);
     Prototype* p = 0;
     {
@@ -210,10 +209,4 @@ void test() {
   std::cout << "Collections "<< state->collections << std::endl;
 
   delete state;
-}
-
-int main(void) {
-  test();
-
-  return 0;
 }
