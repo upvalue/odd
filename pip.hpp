@@ -1302,10 +1302,14 @@ struct State {
         sweep_cursor = blocks[block_cursor]->begin;
     }
 
-    // Update all roots
+    // Now that every object has been copied, we just need to update pointers.
+
+    // First we'll sweep through the program's roots, then we'll sweep over the
+    // heap (which can be easily iterated over at this point),  checking every
+    // object's field for a forwarded pointer.
+
     PIP_GC_MSG("updating roots with new pointers");
 
-    // Symbols are roots (for now)
     for(symbol_table_t::iterator i = symbol_table.begin(); i != symbol_table.end(); i++)
       update_forward((Value**) &i->second);
 

@@ -131,7 +131,7 @@ static void bench_boehm() {
 
 static void pip_populate(State& state, int depth, Pair* node) {
   Pair* cell = 0;
-  PIP_FRAME(state, cell, node);
+  PIP_FRAME(cell, node);
   if(depth <= 0) return;
   depth--;
 
@@ -150,7 +150,7 @@ static Pair* pip_make_tree(State& state, int depth) {
     return state.cons(PIP_FALSE, PIP_FALSE);
   } else {
     Value *kar = 0, *kdr = 0, *cell = 0;
-    PIP_FRAME(state, kar, kdr, cell);
+    PIP_FRAME(kar, kdr, cell);
     kar = pip_make_tree(state, depth-1);
     kdr = pip_make_tree(state, depth-1);
     cell = (Pair*)state.cons(kar, kdr);
@@ -163,7 +163,7 @@ static void pip_time_construction(State& state, int depth) {
   long bu_time = 0, td_time = 0;
   int iterations = numiters(depth);
   Pair* temp_tree = 0;
-  PIP_FRAME(state, temp_tree);
+  PIP_FRAME(temp_tree);
   
   start = CURRENT_TIME();
   for(int i = 0; i < iterations; ++i) {
@@ -185,7 +185,7 @@ static void bench_pip() {
 
   Pair *root = 0, *long_lived_tree = 0, *temp_tree = 0;
   Blob* array = 0;
-  PIP_FRAME(state, root, long_lived_tree, temp_tree, array);
+  PIP_FRAME(root, long_lived_tree, temp_tree, array);
 
   temp_tree = pip_make_tree(state, kStretchTreeDepth);
   temp_tree = 0;
