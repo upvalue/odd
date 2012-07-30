@@ -6,6 +6,7 @@
 // <http://www.boost.org/LICENSE_1_0.txt>
 
 // Welcome to Pip Scheme!
+
 // Pip is an implementation of the Scheme programming language. In addition to
 // that, it's also something of a guided tour through language implementation.
 // You can use the following "table of contents" to navigate the source code.
@@ -33,7 +34,6 @@
 #include <fstream>
 #include <sstream>
 #include <iostream>
-#include <list>
 #include <vector>
 #ifdef __APPLE__
 # include <boost/unordered_map.hpp>
@@ -182,6 +182,7 @@ enum Type {
   PROTOTYPE,
   CLOSURE,
   UPVALUE,
+  NATIVE_FUNCTION,
   // Immediate values
   FIXNUM,
   CONSTANT,
@@ -414,7 +415,7 @@ struct Box : Value {
 
 Value* Value::box_value() const { PIP_ASSERT(get_type() == BOX); return static_cast<const Box*>(this)->value; };
 
-// Prototype for a procedure containing constants, code, and debugging
+// Prototype for a function containing constants, code, and debugging
 // information. May be executed directly if the function does not reference
 // free variables.
 struct Prototype : Value {
@@ -436,7 +437,7 @@ struct Prototype : Value {
   static const Type CLASS_TYPE = PROTOTYPE;
 };
 
-// A closure, aka a procedure which references free variables
+// A closure, aka a function which references free variables
 struct Closure : Value {
   Prototype* prototype;
   // Vector containing Upvalues
@@ -575,7 +576,8 @@ struct State {
     global_env(*this),
     
     // Virtual machine
-    vm_depth(0) {
+    vm_depth(0),
+    vm_trampoline_function(0) {
 
     // Initialize garbage collector
     Block* first = new Block(PIP_HEAP_ALIGNMENT, false, mark_bit);
@@ -807,7 +809,6 @@ struct State {
     State& state;
     T* ref;
     Handle<Value> *previous, *next;
-    std::list<Handle<Value>*>::iterator location;
   
     T* operator*() const { return ref; }
     T* operator->() const { return ref; }
@@ -897,7 +898,7 @@ struct State {
           x = x->upvalue();
           continue;
         }
-        default: PIP_ASSERT(!"recursive_mark bad;"); return;
+        default: std::cerr << x->get_type() << std::endl; PIP_ASSERT(!"recursive_mark bad;"); return;
       }
     }
   }
@@ -1076,7 +1077,6 @@ struct State {
         recursive_mark(f->upvalues[j]);
       }
     }
-
   }
 
   void compact() {
@@ -1706,8 +1706,8 @@ struct State {
 
   // <--
   // The Pip compiler is a simple, one-pass compiler. An instance of the
-  // compiler is created for each procedure (for the purposes of the compiler,
-  // something like a library source file is considered a procedure). There is
+  // compiler is created for each function (for the purposes of the compiler,
+  // something like a library source file is considered a function). There is
   // no separate parsing step; the compiler operates directly on s-expressions.
   // It is a little hairy in places because of this, but doing everything in
   // one pass makes it much shorter.
@@ -1718,11 +1718,11 @@ struct State {
   // Perhaps the most complex machinery in the compiler is the handling of free
   // variables (for Pip's purposes, a "free variable" is defined as any
   // variable that might exist after its function returns; I'm not sure that's
-  // the right definition but I'm not changing it now). When a procedure
+  // the right definition but I'm not changing it now). When a function
   // references, either by setting or getting, any variable from a higher
-  // procedure, the compiler causes that variable to be pulled into every
-  // procedure from that procedure on down as an "upvalue", which is basically
-  // a heap-allocated pointer. All of those procedures become Closures, a
+  // function, the compiler causes that variable to be pulled into every
+  // function from that function on down as an "upvalue", which is basically
+  // a heap-allocated pointer. All of those functions become Closures, a
   // combination of a function and a set of upvalues. These variables are then
   // set and retreived through the Upvalue structure. This ensures that access
   // to all variables is O(1) and that large structures do not need to be
@@ -1837,7 +1837,7 @@ struct State {
     unsigned index;
   };
 
-  // An instance of the compiler, created for each procedure
+  // An instance of the compiler, created for each function
   struct Compiler {
     Compiler(State& state_, Compiler* parent_, Vector* env_ = NULL, size_t depth_ = 0): 
       state(state_), parent(parent_),
@@ -1852,7 +1852,7 @@ struct State {
     }
 
     State& state;
-    // The parent procedure -- necessary for free variables
+    // The parent function -- necessary for free variables
     Compiler* parent;
     // The wordcode
     std::vector<size_t> code;
@@ -2194,7 +2194,7 @@ restart:
       PIP_CC_EMIT("jump-if-false");
       size_t old_stack = stack_size;
       // Emit 'then' code
-      chk = compile(then_branch);
+      chk = compile(then_branch, tail);
       PIP_CHECK(chk);
       pop(stack_size - old_stack);
       // Jmp to the rest of the program
@@ -2205,7 +2205,7 @@ restart:
       PIP_CC_EMIT("jump");
       // Location of first jump (beginning of else branch)
       size_t lbl1 = code.size();
-      chk = compile(else_branch);
+      chk = compile(else_branch, tail);
       PIP_CHECK(chk);
       pop(stack_size - old_stack);
       // Location of second jump
@@ -2261,15 +2261,15 @@ restart:
           }
         }
       }
-      // Compile the procedure's body
-      PIP_CC_MSG("compiling subprocedure");
+      // Compile the function's body
+      PIP_CC_MSG("compiling subfunction");
       Compiler cc(state, this, PIP_CAST(Vector, new_env), depth+1);
       cc.name = static_cast<String*>(name);
       body = exp->cddr();
       while(body != PIP_NULL) {
-        // Compile body expression. Note that if cdr() is NULL, this is the
+        // Compile body expression. Note that if cdr() is PIP_NULL, this is the
         // tail expression and might be subject to tail call optimization
-        chk = cc.compile(body->car(), body->cdr() == NULL);
+        chk = cc.compile(body->car(), body->cdr() == PIP_NULL);
         PIP_CHECK(chk);
         body = body->cdr();
       }
@@ -2435,18 +2435,20 @@ restart:
 
   ///// (VM) VIRTUAL MACHINE
 
-  // Return that properly unwinds the stack
-
   // - Closes over upvalues so they can still be accessed after this function's
   // frame is gone
 
   // - Pops the function's frame
-#define VM_RETURN(x) { \
+#define VM_POP_FRAME() \
   for(size_t i = 0; i != prototype->local_free_variable_count; i++) { \
     f.upvalues[i]->upvalue_close(); \
   } \
   vm_frames.pop_back(); \
-  vm_depth--; \
+  vm_depth--; 
+  // Return that properly unwinds the stack
+
+#define VM_RETURN(x) { \
+  VM_POP_FRAME(); \
   Value* res = (x); \
   return res; }
 
@@ -2457,6 +2459,11 @@ restart:
   }
 
   size_t vm_depth;
+  // Passing arguments for tail calls. No need to protect 
+  // for garbage collector because no allocations will be triggered while
+  // trampolining.
+  std::vector<Value*> vm_trampoline_arguments;
+  Value* vm_trampoline_function;
 
   // A frame containing information that needs to be tracked by the garbage collector
   struct VMFrame {
@@ -2483,10 +2490,16 @@ restart:
     return make_exception(State::S_PIP_EVAL, "attempt to apply non-function");
   }
 
-  // Attempt to apply non-function eg (#t)
-  // Apply bytecode function
-  Value* apply(Prototype* prototype, Closure* closure, size_t argc, Value* args[]) {
+  // Apply Scheme function
+  Value* vm_apply(Prototype* prototype, Closure* closure, size_t argc, Value* args[], bool& trampoline) {
+    // Track how many frames have been lost due to tail calls for debugging
+    // purposes eg if we're in a loop and an error occurs on the 857th
+    // iteration, we'll be able to print that information
+    size_t frames_lost = 0;
+    // Track virtual machine depth
     vm_depth++;
+    // A goto (yuck) for tail call optimization
+
     PIP_VM_MSG("entering function ");
     // Get pointer to code
     // NOTE: could be moved if moving garbage collector is ever used
@@ -2542,7 +2555,7 @@ restart:
     // f.stack[--f.si] Pop the top of the stack
     // wc[ip++] Get the next instruction and advance the instruction pointer
 
-    // Evaluate procedure
+    // Evaluate function
     unsigned ip = 0;
     while(1) {
       switch(wc[ip++]) {
@@ -2637,7 +2650,23 @@ restart:
           Value* ret = f.si ? f.stack[--f.si] : PIP_UNSPECIFIED;
           VM_RETURN(ret);
         }
-        case OP_TAIL_APPLY:
+        case OP_TAIL_APPLY: {
+          frames_lost++;
+          // Retrieve argument count
+          size_t argc = wc[ip++];
+          PIP_VM_VMSG("tail-apply " << argc);
+          // Pop the function, which should be at the top of the stack
+          Value* fn = f.stack[f.si-1];
+          f.si--;
+          vm_trampoline_arguments.clear();
+          for(size_t i = 0; i != argc; i++) {
+            vm_trampoline_arguments.push_back(f.stack[f.si-argc+i]);
+          }
+          vm_trampoline_function = fn;
+          trampoline = true;
+          VM_RETURN(PIP_UNSPECIFIED);
+          continue;
+        }
         case OP_APPLY: {
           // Retrieve argument count
           size_t argc = wc[ip++];
@@ -2677,13 +2706,31 @@ restart:
     }
   }
 
-  // Safe apply which also unwraps closures
+  // Apply frontend
   Value* apply(Value* function, size_t argc, Value* args[]) {
+    size_t frames_lost = 0;
+tail:
+    bool trampoline = false;
+    // Kind of confusingly, this may not be a prototype, but we'll consider it
+    // one here to allow code re-use
+    Prototype* prototype = static_cast<Prototype*>(function);
+    Closure* closure = 0;
+    Value* result = 0;
     switch(function->get_type()) {
+      case CLOSURE: 
+        // If it's a closure, extract the prototype and then the closure
+        prototype = static_cast<Closure*>(function)->prototype;
+        closure = static_cast<Closure*>(function);
       case PROTOTYPE:
-        return apply(PIP_CAST(Prototype, function), 0, argc, args);
-      case CLOSURE:
-        return apply(PIP_CAST(Prototype, PIP_CAST(Closure, function)->prototype), PIP_CAST(Closure, function), argc, args);
+        // Fall-through
+        result = vm_apply(prototype, closure, argc, args, trampoline);
+        if(trampoline && !result->active_exception()) {
+          function = vm_trampoline_function;
+          argc = vm_trampoline_arguments.size();
+          args = &vm_trampoline_arguments[0];
+          frames_lost++;
+          goto tail;
+        } else return result;
       default:
         PIP_ASSERT(!"bad application");
         break;

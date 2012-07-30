@@ -150,7 +150,7 @@ Value* eval_string(State& state, const std::string& string) {
     }
   }
   p = cc.end();
-  x = state.apply(p, 0, 0, 0);
+  x = state.apply(p, 0, 0);
   return x;
 }
 
@@ -196,6 +196,8 @@ void test_compiler(State& state) {
   // Begin
   test_eval(state, "(begin)", PIP_UNSPECIFIED);
   test_eval(state, "(begin #f #f #t)", PIP_TRUE);
+  // Tail call
+  test_eval(state, "((lambda () ((lambda () #t))))", PIP_TRUE);
 }
 
 void test() {
@@ -216,7 +218,7 @@ void test() {
     {
       PIP_E_FRAME(*state, p);
       p = cc.end();
-      std::cout << state->apply(p, 0, 0, 0) << std::endl;
+      std::cout << state->apply(p, 0, 0) << std::endl;
     }
   }
 
