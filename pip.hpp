@@ -53,7 +53,7 @@
 #define PIP_CHECK(x) if((x)->active_exception()) return (x);
 
 // Trace messages
-#define PIP_GC_MSG(x) std::cout << x << std::endl
+#define PIP_GC_MSG(x) std::cout << "GC: " << x << std::endl
 #define PIP_CC_MSG(x) \
     for(size_t _x = (depth); _x; _x--) \
       std::cout << '>'; std::cout << "CC: " << x << std::endl;
@@ -168,6 +168,9 @@ struct SourceInfo {
 #define PIP_UNSPECIFIED ((pip::Value*) 18)
 
 // C++ object types (which may not match up exactly with Scheme predicates)
+
+// NOTE: Adding a type requires several modifications; search for
+// 'recursive_mark' and 'minimum_size'
 enum Type {
   TRANSIENT,
   PAIR,
@@ -507,6 +510,13 @@ void Value::upvalue_close() {
 // certain amount of memory is in use (the "load factor", by default 77%), it
 // allocates twice as much memory. It can also allocate more memory if a very
 // large object (over 4kb) is allocated.
+
+// In addition to normal collection, Pip has support for doing a full
+// compaction on the heap, reducing fragmentation to 0. Currently, this can
+// only be used manually and only at the top-level of program execution. So
+// although it might not benefit a normal program's execution, it could be used
+// eg while a game is loading levels to prevent fragmentation over time, or
+// triggered at a time interval in a long running application server.
 // -->
 
 ///// GARBAGE COLLECTOR TRACKING
@@ -631,11 +641,16 @@ struct State {
     for(size_t i = 0; i != globals.size(); i++)
       delete globals[i]; 
 
-    for(size_t i = 0; i != blocks.size(); i++)
-      delete blocks[i];
+    delete_blocks();
 
     for(size_t i = 0; i != source_contents.size(); i++)
       delete source_contents[i];
+  }
+
+  void delete_blocks() {
+    for(size_t i = 0; i != blocks.size(); i++)
+      delete blocks[i];
+    blocks.clear();
   }
 
   ///// RUNTIME
@@ -669,10 +684,33 @@ struct State {
   }
 
   ///// CONSTRUCTORS
+
+  // Returns how much memory to subtract if an object will not contain source
+  // code information
+  template <class T> 
+  static ptrdiff_t src_size(bool yes) { return yes ? 0 : -(sizeof(((T*)0)->src)); }
+
+  // Returns how much memory to use when an object contains an array at the end
+  template <class T>
+  static ptrdiff_t array_size(size_t elts) { return (sizeof(T) * elts) - sizeof(T); }
+
+  Box* make_box(Value* value, bool has_source_info, unsigned file = 0, unsigned line = 0) {
+    Box* box = 0;
+    PIP_S_FRAME(value, box);
+    box = allocate<Box>(src_size<Box>(has_source_info));
+    box->value = value;
+    if(has_source_info) {
+      box->set_header_bit(BOX, Value::BOX_HAS_SOURCE_BIT);
+      box->src.file = file;
+      box->src.line = line;
+    }
+    return box;
+  }
+
   Pair* cons(Value* car, Value* cdr, bool has_source_info = false, unsigned file = 0, unsigned line = 0) {
     Pair* p = NULL;
     PIP_S_FRAME(p, car, cdr);
-    p = allocate<Pair>(has_source_info ? 0 : -(sizeof(((Pair*)0)->src)));
+    p = allocate<Pair>(src_size<Pair>(has_source_info));
     p->car = car;
     p->cdr = cdr;
     if(has_source_info) {
@@ -695,7 +733,7 @@ struct State {
   }
 
   Blob* make_blob(ptrdiff_t length) {
-    Blob* b = allocate<Blob>(length - 1);
+    Blob* b = allocate<Blob>(array_size<unsigned char>(length));
     b->length = length;
     return b;
   }
@@ -709,6 +747,7 @@ struct State {
     String* str = allocate<String>(cstr.length());
     cstr.copy(str->data, cstr.length());
     str->data[cstr.length()] = 0;
+    str->length = cstr.length();
     return str;
   }
 
@@ -735,19 +774,6 @@ struct State {
     return make_symbol(str);
   }
 
-  Box* make_box(Value* value, bool has_source_info, unsigned file = 0, unsigned line = 0) {
-    Box* box = 0;
-    PIP_S_FRAME(value, box);
-    box = allocate<Box>(has_source_info ? 0 : -(sizeof(((Box*)0)->src)));
-    box->value = value;
-    if(has_source_info) {
-      box->set_header_bit(BOX, Value::BOX_HAS_SOURCE_BIT);
-      box->src.file = file;
-      box->src.line = line;
-    }
-    return box;
-  }
-
   Vector* make_vector(unsigned capacity = 2) {
     capacity = capacity > 2 ? capacity : 2;
     Vector* v = 0;
@@ -755,7 +781,7 @@ struct State {
     PIP_S_FRAME(v, s);
     v = allocate<Vector>();
     v->capacity = capacity;
-    s = allocate<VectorStorage>((capacity * sizeof(Value*)) - sizeof(Value*));
+    s = allocate<VectorStorage>(array_size<Value*>(capacity));
     v->storage = s;
     return v;
   }
@@ -777,6 +803,8 @@ struct State {
   }
 
   ///// GARBAGE COLLECTOR
+
+  static const size_t POINTER_ALIGNMENT = sizeof(void*);
 
   // Handles are auto-tracked heap-allocated pointers
   template <class T>
@@ -1009,22 +1037,6 @@ struct State {
     return address;
   }
 
-  struct HeapSweep {
-    HeapSweep(State& state_): state(state_), block_cursor(0), cursor(0), block(state_.blocks[0]) {
-    }
-    
-    State& state;
-    size_t block_cursor;
-    char* cursor;
-    Block* block;
-
-    bool done() { return block_cursor == state.blocks.size(); }
-
-    void next(size_t& oblock, Value*& ocursor) {
-
-    }
-  };
-
   // If collection is called early, finish iterating over and marking the heap
   void finish_mark() {
     while(block_cursor != blocks.size()) {
@@ -1078,27 +1090,8 @@ struct State {
       }
     }
   }
-
-  void compact() {
-    // Quick collection
-    finish_mark();
-    mark_bit = !mark_bit;
-    mark_heap();
-
-    // Create a new block to copy the heap to
-    Block* heap = new Block(align(PIP_HEAP_ALIGNMENT, heap_size), false, mark_bit);
-
-    // Loop over live memory, allocating from the new block. The new
-    // allocation is called the "forwarding pointer" and the object's
-    // 'size' field is used to store the forwarding pointer (the newly
-    // allocated space stores the object's size)
-
-
-    // Loop over the heap and copy all objects, updating pointers as
-    // you go.
-  }
-
-  void reset_sweep() {
+  
+  void reset_sweep_cursor() {
     sweep_cursor = blocks[0]->begin;
     block_cursor = 0;
   }
@@ -1111,7 +1104,7 @@ struct State {
     finish_mark();
 
     // Reset sweep cursor
-    reset_sweep();
+    reset_sweep_cursor();
 
     // If growth is necessary
 
@@ -1157,6 +1150,7 @@ struct State {
     mark_heap();
   }
 
+  // Allocation
   Value* allocate(Type type, size_t size) {
     if(collect_before_every_allocation) {
       collect();
@@ -1167,7 +1161,7 @@ struct State {
 
     // Align along pointer-sized boundary to ensure that our immediate
     // value scheme will work.
-    size = align(sizeof(void*), size);
+    size = align(POINTER_ALIGNMENT, size);
 
     if(size >= PIP_HEAP_ALIGNMENT) {
       size = align(PIP_HEAP_ALIGNMENT, size);
@@ -1215,10 +1209,202 @@ struct State {
     return x;
   }
   
+  // The actual entry point of the garbage collector
   template <class T> T* allocate(ptrdiff_t additional = 0) {
     return static_cast<T*>(allocate(static_cast<Type>(T::CLASS_TYPE), sizeof(T) + additional));
   }
 
+  ///// COMPACTION
+
+  // Determine the minimum size of an object; used to remove fragmentation
+  // while compacting
+  static size_t minimum_size(Value* x) {
+    size_t size;
+    switch(x->get_type()) {
+      // Simple cases
+      case SYMBOL: size = sizeof(Symbol); break;
+      case VECTOR: size = sizeof(Vector); break;
+      case EXCEPTION: size = sizeof(Exception); break;
+      case CLOSURE: size = sizeof(Closure); break;
+      case PROTOTYPE: size = sizeof(Prototype); break; 
+      case UPVALUE: size = sizeof(Upvalue); break;
+      //case NATIVE_FUNCTION: size =  sizeof(NativeFunction));
+      case PAIR: size = sizeof(Pair) + src_size<Pair>(x->pair_has_source()); break;
+      case BOX: size = sizeof(Box) + src_size<Box>(x->box_has_source()); break;
+      case VECTOR_STORAGE:
+        size = sizeof(VectorStorage) + array_size<Value*>(static_cast<VectorStorage*>(x)->length);
+        break;
+      case STRING: {
+        size = sizeof(String) + array_size<unsigned char>(static_cast<String*>(x)->length);
+        break;
+      }
+      case BLOB:
+        size = sizeof(Blob) + array_size<unsigned char>(static_cast<Blob*>(x)->length);
+        break;
+        // Should not occur
+      case TRANSIENT: case FIXNUM: case CONSTANT: assert(!"bad");
+     }
+     return align(POINTER_ALIGNMENT, size);
+   }
+
+  void update_forward(Value** ref) {
+    Value* obj = *ref;
+    // If object is immedate or pointer has already been updated, no need to
+    // deal with it
+    if(obj->immediatep() || obj->header != TRANSIENT) return;
+    // Update pointer
+    (*ref) = ((Value*) obj->size);
+  }
+
+  void compact() {
+    // Quick collection
+    finish_mark();
+    reset_sweep_cursor();
+    mark_bit = !mark_bit;
+    mark_heap();
+
+    // Create a new block to copy the heap to
+    Block* heap = new Block(align(PIP_HEAP_ALIGNMENT, heap_size), false, mark_bit);
+
+    // Loop over live memory, allocating from the new block. The new allocation
+    // is called the "forwarded object" and the object's 'size" field is
+    // re-used to store a pointer to this forwarded object. (The newly
+    // allocated object contains the size information, for when it's needed)
+
+    char* bump = heap->begin;
+
+    PIP_GC_MSG("copying heap");
+    // TODO: Sweep code is duplicated 3-4 times. 
+    while(block_cursor != blocks.size()) {
+      Block* b = blocks[block_cursor];
+      while(sweep_cursor != b->end) {
+        Value* sweep_cursor_v = (Value*) sweep_cursor;
+
+        if(markedp(sweep_cursor_v)) {
+          // Bump allocate from the new heap
+          Value* copy = (Value*) bump;
+          size_t min_size = minimum_size(sweep_cursor_v);
+          bump += min_size;
+ 
+          memcpy(copy, sweep_cursor_v, min_size);
+          copy->size = min_size;
+          // Increment before we delete the object's size
+          sweep_cursor += sweep_cursor_v->size;
+          // Install forwarding pointer
+          sweep_cursor_v->size = (size_t) copy;
+          sweep_cursor_v->header = TRANSIENT;
+        } else {
+          sweep_cursor += sweep_cursor_v->get_size_unsafe();
+        }
+      }
+      block_cursor++;
+      if(block_cursor != blocks.size())
+        sweep_cursor = blocks[block_cursor]->begin;
+    }
+
+    // Update all roots
+    PIP_GC_MSG("updating roots with new pointers");
+
+    // Symbols are roots (for now)
+    for(symbol_table_t::iterator i = symbol_table.begin(); i != symbol_table.end(); i++)
+      update_forward((Value**) &i->second);
+
+    for(Frame* f = frame_list; f != NULL; f = f->previous)
+      for(size_t i = 0; i != f->root_count; i++)
+        update_forward(f->roots[i]);
+
+    for(Handle<Value>* i = handle_list; i != NULL; i = i->previous)
+      update_forward(&i->ref);
+    
+    for(size_t i = 0; i != vm_frames.size(); i++) {
+      VMFrame* f = vm_frames[i];
+      // Mark prototype
+      update_forward((Value**) &f->p);
+      // Mark closure
+      update_forward((Value**) &f->c);
+      // Mark function stack
+      for(size_t j = 0; j != f->si; j++) {
+        update_forward(&f->stack[j]);
+      }
+      // Mark local variables
+      for(size_t j = 0; j != f->p->locals; j++) {
+        update_forward(&f->locals[j]);
+      }
+      // Mark upvalues (if necessary)
+      for(size_t j = 0; j != f->p->local_free_variable_count; j++) {
+        update_forward((Value**)&f->upvalues[j]);
+      }
+    }
+
+    PIP_GC_MSG("updating heap with new pointers");
+    char* sweep = heap->begin;
+    while(sweep != bump) {
+      Value* x = (Value*) sweep;
+      sweep += x->size;
+#define PIP_FWD(type, field) update_forward((Value**) &(((type*) x)->field))
+      switch(x->get_type_unsafe()) {
+        // Atomic
+        case STRING: case BLOB:
+          continue;
+        // One pointer
+        case VECTOR:
+        case BOX:
+          update_forward(&((Box*) x)->value);
+          continue;
+        case CLOSURE:
+        case PAIR:
+        case SYMBOL:
+          update_forward(&((Pair*) x)->car);
+          update_forward(&((Pair*) x)->cdr);
+          continue;
+        case EXCEPTION:
+          PIP_FWD(Exception, tag);
+          PIP_FWD(Exception, message);
+          PIP_FWD(Exception, irritants);
+          continue;
+        case PROTOTYPE:
+          PIP_FWD(Prototype, code);
+          PIP_FWD(Prototype, debuginfo);
+          PIP_FWD(Prototype, local_free_variables);
+          PIP_FWD(Prototype, upvalues);
+          PIP_FWD(Prototype, name);
+          continue;
+        case VECTOR_STORAGE: {
+          VectorStorage* s = static_cast<VectorStorage*>(x);
+          if(s->length) {
+            for(size_t i = 0; i != s->length; i++) {
+              update_forward(&s->data[i]);
+            }
+          }
+          continue;
+        }
+        case UPVALUE:
+          if(x->upvalue_closed()) {
+            update_forward(((Upvalue*) x)->local);
+          } else {
+            update_forward(&((Upvalue*) x)->converted);
+          }
+          continue;
+        case TRANSIENT: case FIXNUM: case CONSTANT: assert(!"Bad");
+#undef PIP_FWD
+      }
+    }
+
+    PIP_GC_MSG("forwarded all program roots");
+    
+    // Delete heap and replace with new heap
+    delete_blocks();
+    blocks.push_back(heap);
+    reset_sweep_cursor();
+
+    // Note the size of the hole at the end of the heap
+    // Ensure we have enough room at the end for a Value
+    PIP_ASSERT(heap->end - bump >= align(POINTER_ALIGNMENT, sizeof(Value*)));
+    // Determine the size
+    Value* hole = (Value*) bump;
+    hole->header = TRANSIENT;
+    hole->size = (heap->end - bump);
+  }
 
   ///// BASIC FUNCTIONS
 
@@ -1228,7 +1414,7 @@ struct State {
       VectorStorage* s = 0;
       PIP_S_FRAME(vec, s);
       size_t capacity = vec->capacity * 2;
-      s = allocate<VectorStorage>((capacity * sizeof(Value*)) - sizeof(Value*));
+      s = allocate<VectorStorage>(array_size<Value*>(capacity));
       memcpy(s->data, vec->storage->data, (vec->storage->length * sizeof(Value*)));
       s->length = vec->storage->length;
       vec->capacity = capacity;
@@ -2775,7 +2961,8 @@ inline std::ostream& operator<<(std::ostream& os, Value* x) {
     case BLOB:
         return os << "#<blob " << x->blob_length() << '>';
     case STRING:
-        return os << x->string_data();
+        return os << "\"" <<  x->string_data() << "\"";
+    case VECTOR_STORAGE: return os << "#<vector-storage>" << std::endl;
     case VECTOR:
         os << "#(";
         for(size_t i = 0; i != x->vector_length(); i++) {

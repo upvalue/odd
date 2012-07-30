@@ -200,29 +200,48 @@ void test_compiler(State& state) {
   test_eval(state, "((lambda () ((lambda () #t))))", PIP_TRUE);
 }
 
-void test() {
-  State* state = new State;
+void test_compaction(State& state) {
+  std::cout << "!! test_compaction " << std::endl;
+  state.compact();
+  std::cout << "!! rerunning some tests" << std::endl;
+  test_gc_1(state);
+  test_symbols(state);
+  test_vectors(state);
+  test_reader(state);
+  test_compiler(state);
+}
 
+void run_test_suite(State& state) {
   std::cout << "!! sizeof(State) " << sizeof(State) << " [" << FriendlySize(sizeof(State)) << "]" << std::endl;
-  state->collect_before_every_allocation = true;
-  test_gc_1(*state);
-  test_symbols(*state);
-  test_vectors(*state);
-  test_reader(*state);
-  test_compiler(*state);
+  state.collect_before_every_allocation = true;
+  test_gc_1(state);
+  test_symbols(state);
+  test_vectors(state);
+  test_reader(state);
+  test_compiler(state);
 
   { 
-    State::Compiler cc(*state, NULL);
+    State::Compiler cc(state, NULL);
     cc.compile(PIP_TRUE);
     Prototype* p = 0;
     {
-      PIP_E_FRAME(*state, p);
+      PIP_E_FRAME(state, p);
       p = cc.end();
-      std::cout << state->apply(p, 0, 0) << std::endl;
+      std::cout << state.apply(p, 0, 0) << std::endl;
     }
   }
 
-  std::cout << "Collections "<< state->collections << std::endl;
+  std::cout << "!! collections: " << state.collections << " heap size: " << FriendlySize(state.heap_size) << std::endl;
+}
+
+void test() {
+  State* state = new State;
+  
+  run_test_suite(*state);
+  state->compact();
+  run_test_suite(*state);
+  state->compact();
+  run_test_suite(*state);
 
   delete state;
 }
