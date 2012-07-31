@@ -25,8 +25,8 @@ using namespace std;
 static const int kStretchTreeDepth    = 20;      // about 16Mb
 static const int kLongLivedTreeDepth  = 16;  // about 4Mb
 static const int kArraySize  = 500000;  // about 4Mb
-static const int kMinTreeDepth = 4;
-static const int kMaxTreeDepth = 20;
+static const int kMinTreeDepth = MIN_TREE_DEPTH;
+static const int kMaxTreeDepth = MAX_TREE_DEPTH;
 
 // Time tracking
 unsigned

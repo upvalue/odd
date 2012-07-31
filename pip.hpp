@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+
 #include <limits>
 #include <fstream>
 #include <sstream>
@@ -478,6 +479,15 @@ void Value::upvalue_close() {
   u->converted = *u->local;
 }
 
+struct NativeFunction : Value {
+  typedef void (*ptr_t)(State&, unsigned, Value* args[]);
+
+  unsigned arguments;
+  ptr_t pointer;
+
+  static const Type CLASS_TYPE = NATIVE_FUNCTION;
+};
+
 ///// (GC) Garbage collector
 
 // <--
@@ -515,8 +525,7 @@ void Value::upvalue_close() {
 // compaction on the heap, reducing fragmentation to 0. Currently, this can
 // only be used manually and only at the top-level of program execution. So
 // although it might not benefit a normal program's execution, it could be used
-// eg while a game is loading levels to prevent fragmentation over time, or
-// triggered at a time interval in a long running application server.
+// eg while a game is loading levels to prevent fragmentation over time
 // -->
 
 ///// GARBAGE COLLECTOR TRACKING
@@ -882,7 +891,7 @@ struct State {
         // based on their structure (eg all objects with two pointers are
         // marked as though they were pairs)
         // Atomic
-        case STRING: case BLOB:
+        case NATIVE_FUNCTION: case STRING: case BLOB:
           return;
         // One pointer
         case VECTOR:
@@ -1228,7 +1237,7 @@ struct State {
       case CLOSURE: size = sizeof(Closure); break;
       case PROTOTYPE: size = sizeof(Prototype); break; 
       case UPVALUE: size = sizeof(Upvalue); break;
-      //case NATIVE_FUNCTION: size =  sizeof(NativeFunction));
+      case NATIVE_FUNCTION: size =  sizeof(NativeFunction); break;
       case PAIR: size = sizeof(Pair) + src_size<Pair>(x->pair_has_source()); break;
       case BOX: size = sizeof(Box) + src_size<Box>(x->box_has_source()); break;
       case VECTOR_STORAGE:
@@ -1348,24 +1357,27 @@ struct State {
 #define PIP_FWD(type, field) update_forward((Value**) &(((type*) x)->field))
       switch(x->get_type_unsafe()) {
         // Atomic
-        case STRING: case BLOB:
+        case NATIVE_FUNCTION: case STRING: case BLOB:
           continue;
         // One pointer
         case VECTOR:
         case BOX:
-          update_forward(&((Box*) x)->value);
+          PIP_FWD(Box, value);
           continue;
+        // Two pointers
         case CLOSURE:
         case PAIR:
         case SYMBOL:
           update_forward(&((Pair*) x)->car);
           update_forward(&((Pair*) x)->cdr);
           continue;
+        // Three pointers
         case EXCEPTION:
           PIP_FWD(Exception, tag);
           PIP_FWD(Exception, message);
           PIP_FWD(Exception, irritants);
           continue;
+        // Five pointers
         case PROTOTYPE:
           PIP_FWD(Prototype, code);
           PIP_FWD(Prototype, debuginfo);
@@ -1389,7 +1401,7 @@ struct State {
             update_forward(&((Upvalue*) x)->converted);
           }
           continue;
-        case TRANSIENT: case FIXNUM: case CONSTANT: assert(!"Bad");
+        default: case TRANSIENT: case FIXNUM: case CONSTANT: assert(!"Bad");
 #undef PIP_FWD
       }
     }
@@ -1615,14 +1627,14 @@ struct State {
     // Error handling
 
     Token lex_error(const std::string& msg) {
-      std::stringstream ss;
+      std::ostringstream ss;
       ss << state.source_names[file] << ':' << line << ": " << msg;
       token_value = state.make_exception(State::S_PIP_READ, ss.str());
       return TK_EXCEPTION;
     }
 
     Value* parse_error(const std::string& msg) {
-      std::stringstream ss;
+      std::ostringstream ss;
       ss << state.source_names[file] << ':' << line << ": " << msg;
       return state.make_exception(State::S_PIP_READ, ss.str());
     }
@@ -1782,7 +1794,7 @@ struct State {
         PIP_READ_CHECK_TK(token);
 
         if(token == TK_EOF) {
-          std::stringstream ss;
+          std::ostringstream ss;
           ss << "unterminated list beginning on line " << line;
           return parse_error(ss.str());
         }
@@ -2688,7 +2700,6 @@ restart:
     size_t frames_lost = 0;
     // Track virtual machine depth
     vm_depth++;
-    // A goto (yuck) for tail call optimization
 
     PIP_VM_MSG("entering function ");
     // Get pointer to code
