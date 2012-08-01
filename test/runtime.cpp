@@ -114,6 +114,32 @@ static void test_vectors(State& state) {
   std::cout << v << std::endl;
 }
 
+static void test_tables(State& state) {
+  Table* table = NULL;
+  String* str = NULL;
+  PIP_FRAME(table, str);
+  std::cout << "!! test_tables" << std::endl;
+
+  table = state.make_table(); 
+
+  for(int i = 0; i != 100; i++) {
+    bool found = false;
+    state.table_set(table, Value::make_fixnum(i), Value::make_fixnum(i));
+
+    assert(state.table_get(table, Value::make_fixnum(i), found) == Value::make_fixnum(i));
+    assert(found);
+  }
+
+  str = state.make_string("hello");
+
+  state.table_set(table, str, Value::make_fixnum(12345));
+  bool found = false;
+  assert(state.table_get(table, str, found) == Value::make_fixnum(12345));
+  assert(found);
+
+  // TODO: deletions
+}
+
 static void test_reader(State& state) {
   std::cout << "!! test_reader" << std::endl;
   unsigned file = state.register_file("test/read.ss");
@@ -207,23 +233,13 @@ void test_compiler(State& state) {
   //test_eval(state, "(define-syntax hello (er-macro-transformer (lambda (x r c) #t))) (hello)", PIP_TRUE);
 }
 
-void test_compaction(State& state) {
-  std::cout << "!! test_compaction " << std::endl;
-  state.compact();
-  std::cout << "!! rerunning some tests" << std::endl;
-  test_gc_1(state);
-  test_symbols(state);
-  test_vectors(state);
-  test_reader(state);
-  test_compiler(state);
-}
-
 void run_test_suite(State& state) {
   std::cout << "!! sizeof(State) " << sizeof(State) << " [" << FriendlySize(sizeof(State)) << "]" << std::endl;
   state.collect_before_every_allocation = true;
   test_gc_1(state);
   test_symbols(state);
   test_vectors(state);
+  test_tables(state);
   test_reader(state);
   test_compiler(state);
 

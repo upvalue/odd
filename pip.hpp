@@ -44,6 +44,12 @@
 # include <unordered_map> // TODO: Alternatives to c++0x hash tables
 #endif
 
+#if defined(_LP64)
+# define ODD_64_BIT 1
+#else
+# define ODD_64_BIT 0
+#endif
+
 // Assertions. Since these can be quite expensive, they're only enabled when
 // PIP_DEBUG is explicitly defined.
 #ifdef PIP_DEBUG
@@ -188,6 +194,7 @@ enum Type {
   CLOSURE,
   UPVALUE,
   NATIVE_FUNCTION,
+  TABLE,
   // Immediate values
   FIXNUM,
   CONSTANT,
@@ -345,6 +352,13 @@ struct Value {
   static const int NATIVE_FUNCTION_VARIABLE_ARITY_BIT = 1 << 15;
 
   bool native_function_variable_arity() const { return get_header_bit(NATIVE_FUNCTION, NATIVE_FUNCTION_VARIABLE_ARITY_BIT); }
+
+  // Tables
+  static const int TABLE_ACT_AS_SET_BIT = 1 << 15;
+  static const int TABLE_WEAK_BIT = 1 << 14;
+
+  bool table_act_as_set() const { return get_header_bit(TABLE, TABLE_ACT_AS_SET_BIT); }
+  bool table_weak_bit() const { return get_header_bit(TABLE, TABLE_WEAK_BIT); }
 };
 
 struct Pair : Value {
@@ -504,6 +518,16 @@ struct NativeFunction : Value {
   static const Type CLASS_TYPE = NATIVE_FUNCTION;
 };
 
+#define PIP_TABLE_UPPER_LIMIT 0.77
+
+struct Table : Value {
+
+  Blob *flags;
+  VectorStorage *keys, *values;
+  unsigned buckets, size, occupied, upper_bound;
+
+  static const Type CLASS_TYPE = TABLE;
+};
 
 ///// GARBAGE COLLECTOR TRACKING
 
@@ -525,6 +549,7 @@ struct FrameHack {
   PIP_(Closure)
   PIP_(Upvalue)
   PIP_(NativeFunction)
+  PIP_(Table)
 #undef PIP_
   
   ~FrameHack() {}
@@ -601,6 +626,7 @@ struct State {
       "#pip#read",
       "#pip#compile",
       "#pip#eval",
+      "#pip#table",
       // Special forms
       "define",
       "set!",
@@ -667,6 +693,7 @@ struct State {
     S_PIP_READ,
     S_PIP_COMPILE,
     S_PIP_EVAL,
+    S_PIP_TABLE,
     S_DEFINE,
     S_SET,
     S_BEGIN,
@@ -806,7 +833,28 @@ struct State {
     return make_exception(global_symbol(g), smsg, PIP_FALSE);
   }
 
+  Table* make_table() {
+    return allocate<Table>();
+  }
+
   ///// BASIC FUNCTIONS
+
+  static bool equals(Value* a, Value* b) {
+    // TYPENOTE
+    if(a->get_type() != b->get_type()) return false;
+    switch(a->get_type()) {
+      // Identity
+      case FIXNUM:
+      case CONSTANT:
+      case SYMBOL:
+        return a == b;
+      case STRING:
+        return strcmp(PIP_CAST(String, a)->data, PIP_CAST(String, b)->data) == 0;
+    }
+    std::cerr << "equals not implemented for type " << a->get_type();
+    PIP_ASSERT(!"equals not implemented for type");
+    return false;
+  }
 
   void defun(const std::string& cname, NativeFunction::ptr_t ptr, unsigned arguments, bool variable_arity) {
     NativeFunction* fn = 0;
@@ -820,6 +868,18 @@ struct State {
     name = make_symbol(cname);
     env_def(*global_env, name, global_symbol(S_VARIABLE));
     name->value = fn;
+  }
+
+  VectorStorage* vector_storage_realloc(size_t capacity, VectorStorage* old) {
+    VectorStorage* data = 0;
+    PIP_S_FRAME(old, data);
+
+    data = allocate<VectorStorage>((capacity * sizeof(Value*)) - sizeof(Value*));
+    if(old) {
+      data->length = old->length;
+      memcpy(data->data, old->data, data->length * sizeof(Value*));
+    }
+    return data;
   }
 
   unsigned vector_append(Vector* vec, Value* value) {
@@ -890,6 +950,318 @@ struct State {
       (*tail) = swap;
     }
   }
+
+  ///// HASH TABLES
+
+  // Flag manipulation
+  static int table_flag_index(Blob* flags, int i) {
+    // i>>4 = find byte in int
+    // 0-15 => 0
+    // 16-31 => 1
+    // etc
+
+    // i & 15
+    // 0-15 => 0-15
+    // 16-31 => 0-15
+    // etc
+    return ((int*)flags->data)[i>>4] >> ((i & 15) << 1);
+  }
+
+  static int table_flag_empty(Blob* flags, int i)  {
+    return table_flag_index(flags, i) & 2; // 10
+  }
+
+  static int table_flag_deleted(Blob* flags, int i)  {
+    return table_flag_index(flags, i) & 1; // 01
+  }
+
+  static int table_flag_either(Blob* flags, int i)  {
+    return table_flag_index(flags, i) & 3; // 11
+  }
+
+  static void table_flag_set_empty_false(Blob* flags, int i) {
+    ((int*)flags->data)[i>>4] &= ~(2 << ((i & 15) << 1));
+  }
+
+  static void table_flag_set_isboth_false(Blob* flags, int i) {
+    ((int*)flags->data)[i>>4] &= ~(3 << ((i & 15) << 1));
+  }
+
+  static void table_flag_set_deleted_true(Blob* flags, int i) {
+    ((int*)flags->data)[i>>4] |= 1 << ((i & 15) << 1);
+  }
+
+  static size_t table_step(ptrdiff_t k, ptrdiff_t mask) {
+    return (((k)>>3 ^ (k) << 3) | 1) & mask;
+  }
+
+  // Return the size of a table flag blob, which can store 16 flags in
+  // 4 bytes.
+  static size_t table_flag_blob_size(size_t m) {
+    return (m < 16 ? 1 : m >> 4) * sizeof(int);
+  }
+
+#if ODD_64_BIT
+
+  static ptrdiff_t wang_integer_hash(ptrdiff_t key) {
+    key = (~key) + (key << 21); // key = (key << 21) - key - 1;
+    key = key ^ (key >> 24);
+    key = (key + (key << 3)) + (key << 8); // key * 265
+    key = key ^ (key >> 14);
+    key = (key + (key << 2)) + (key << 4); // key * 21
+    key = key ^ (key >> 28);
+    key = key + (key << 31);
+    return key;
+  }
+
+#else
+
+  static ptrdiff_t wang_integer_hash(int key) {
+    key = ~key + (key << 15); // key = (key << 15) - key - 1;
+    key = key ^ (key >> 12);
+    key = key + (key << 2);
+    key = key ^ (key >> 4);
+    key = key * 2057; // key = (key + (key << 3)) + (key << 11);
+    key = key ^ (key >> 16);
+    return key;
+  }
+
+#endif
+
+  static ptrdiff_t x31_string_hash(const char* s) {
+    ptrdiff_t h = *s;
+    if(h) for(++s; *s; ++s) h = (h << 5) - h + *s;
+    return h;
+  }
+
+  static ptrdiff_t hash_value(Value* x, bool& unhashable) {
+    unhashable = false;
+    switch(x->get_type()) {
+      case STRING: return x31_string_hash(x->string_data());
+      // For atomic values, identity is value
+      case SYMBOL:
+      case FIXNUM:
+      case CONSTANT:
+        return wang_integer_hash((ptrdiff_t) x);
+      // Unhashable stuff
+      default: 
+        unhashable = true;
+        return 0;
+    }
+  }
+
+  void table_resize(Table* table, unsigned new_buckets) {
+    PIP_ASSERT(table->get_type() == TABLE);
+
+    Blob* new_flags = 0;
+    VectorStorage *new_keys = 0, *new_values = 0;
+
+    PIP_S_FRAME(new_flags, new_keys, new_values);
+
+    bool rehash = false;
+
+    // Round new buckets to nearest power of 2
+    unsigned x = new_buckets;
+    (--(x), (x)|=(x)>>1, (x)|=(x)>>2, (x)|=(x)>>4, (x)|=(x)>>8, (x)|=(x)>>16, ++(x));
+    new_buckets = x;
+
+    if(new_buckets < 4)
+      new_buckets = 4;
+
+    // If the requested size is too small
+    if(table->size >= (new_buckets * PIP_TABLE_UPPER_LIMIT + 0.5)) {
+      rehash = false;
+    } else {
+      // Allocate new flags for re-hashing
+
+      new_flags = make_blob(table_flag_blob_size(new_buckets));
+      memset(new_flags->data, 0xaa, table_flag_blob_size(new_buckets));
+      // If we are expanding the table
+      if(table->buckets < new_buckets) {
+        new_keys = vector_storage_realloc(new_buckets, table->keys);
+        new_keys->length = new_buckets;
+        table->keys = new_keys;
+        if(!table->table_act_as_set()) {
+          new_values = vector_storage_realloc(new_buckets, table->values);
+          new_values->length = new_buckets;
+          table->values = new_values;
+        }
+      }
+    }
+
+    // Rehashing is needed
+    if(rehash) {
+      for(unsigned j = 0; j != table->buckets; j++) {
+        // If this bucket is empty or deleted
+        if(table_flag_either(table->flags, j) == 0) {
+          Value* key = table->keys->data[j];
+          Value* value = NULL;
+          int new_mask = new_buckets - 1;
+          if(!table->table_act_as_set()) {
+            value = table->values->data[j];
+          }
+
+          table_flag_set_deleted_true(table->flags, j);
+
+          // Kick out process
+          while(1) {
+            ptrdiff_t step, k, i;
+            bool unhashable = false;
+
+            k = hash_value(key, unhashable);
+            // Nothing that's already in the table should be unhashable...
+            PIP_ASSERT(!unhashable);
+            i = k & new_mask;
+            step = table_step(k, new_mask);
+            while(!table_flag_empty(new_flags, i))
+              i = (i + step) & new_mask;
+            table_flag_set_empty_false(new_flags, i);
+            // If bucket is taken, kick it out
+            if(i < table->buckets && table_flag_either(table->flags, i) == 0) {
+              Value* swap = table->keys->data[i];
+              table->keys->data[i] = key;
+              key = swap;
+              if(!table->table_act_as_set()) {
+                swap = table->values->data[i];
+                table->values->data[i] = value;
+                value = swap;
+              }
+              // Mark as deleted in old hash table
+              table_flag_set_deleted_true(table->flags, i);
+            } else {
+              // Write element and jump out of loop
+              table->keys->data[i] = key;
+              if(!table->table_act_as_set())
+                table->values->data[i] = value;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // Shrinking is needed
+    if(table->buckets > new_buckets) {
+      new_keys = vector_storage_realloc(new_buckets, table->keys);
+      new_keys->length = new_buckets;
+      table->keys = new_keys;
+      if(!table->table_act_as_set()) {
+        new_values = vector_storage_realloc(new_buckets, table->values);
+        new_values->length = new_buckets;
+        table->values = new_values;
+      }
+    }
+
+    table->flags = new_flags;
+    table->buckets = new_buckets;
+    table->occupied = table->size;
+    table->upper_bound = table->buckets * PIP_TABLE_UPPER_LIMIT + 0.5;
+  }
+
+  Value* table_get(Table* table, Value* key, bool& found) {
+    PIP_ASSERT(table->get_type() == TABLE);
+
+    found = false;
+    if(table->buckets) {
+      ptrdiff_t step, hashed, i, last, mask;
+      mask = table->buckets - 1;
+      bool unhashable = false;
+      hashed = hash_value(key, unhashable);
+      PIP_ASSERT(!unhashable);
+      i = hashed & mask;
+      step = table_step(hashed, mask);
+      last = i;
+      // Search table
+      while((!table_flag_empty(table->flags, i) && (table_flag_deleted(table->flags, i))) || !equals(table->keys->data[i], key)) {
+        i = (i + step) & mask;
+        if(i == last)
+          return PIP_FALSE;
+      }
+      // If this bucket is not empty or deleted, it's the right one
+      if(!table_flag_either(table->flags, i)) {
+        found = true;
+        if(table->table_act_as_set()) {
+          return PIP_FALSE;
+        } else {
+          return table->values->data[i];
+        }
+      }
+    }
+    return PIP_FALSE;
+  }  
+
+  Value* table_set(Table* table, Value* key, Value* value) {
+    PIP_ASSERT(table->get_type() == TABLE);
+
+    PIP_S_FRAME(table, key, value);
+    // Check to see if updating is necessary
+    if(table->occupied >= table->upper_bound) {
+      // Clear deleted elements
+      if(table->buckets > (table->size * 2))
+        table_resize(table, table->buckets - 1);
+      // Expand the hash table
+      else
+        table_resize(table, table->buckets + 1);
+    }
+
+    bool unhashable = false;
+    ptrdiff_t x, step, k, i, site, last, mask = table->buckets - 1;
+    x = site = table->buckets;
+    k = hash_value(key, unhashable);
+    if(unhashable) {
+      std::ostringstream ss;
+      ss << "unhashable value " << key;
+      return make_exception(S_PIP_TABLE, ss.str());
+    }
+    PIP_ASSERT(!unhashable);
+    i = k & mask;
+    if(table_flag_empty(table->flags, i)) {
+      x = i;
+    } else {
+      step = table_step(k, mask);
+      last = i;
+
+      // Search through deleted/colliding buckets for a place to put this
+      while(!table_flag_empty(table->flags, i) && ((table_flag_deleted(table->flags, i)) || !equals(table->keys->data[i], key))) {
+
+        if(table_flag_deleted(table->flags, i))
+          site = i;
+        i = (i + step) & mask;
+        if(i == last) {
+          x = site;
+          break;
+        }
+      }
+
+      if(x == table->buckets) {
+        if(table_flag_empty(table->flags, i) && site != table->buckets) {
+          x = site;
+        } else {
+          x = i;
+        }
+      }
+    }
+
+    // Not present at all
+    if(table_flag_empty(table->flags, x)) {
+      table->keys->data[x] = key;
+      table_flag_set_isboth_false(table->flags, x);
+      ++table->size;
+      ++table->occupied;
+    } else if(table_flag_deleted(table->flags, x)) {
+      // Deleted
+      table->keys->data[x] = key;
+      table_flag_set_isboth_false(table->flags, x);
+      ++table->size;
+    }
+
+    if(!table->table_act_as_set()) {
+      table->values->data[x] = value;
+    }
+
+    return PIP_UNSPECIFIED;
+  }
+
 
   ///// (GC) Garbage collector
 
@@ -1029,7 +1401,7 @@ struct State {
           x = static_cast<Pair*>(x)->car;
           continue;
         // Three pointers
-        case EXCEPTION:
+        case TABLE: case EXCEPTION:
           recursive_mark(static_cast<Exception*>(x)->tag);
           recursive_mark(static_cast<Exception*>(x)->message);
           x = static_cast<Exception*>(x)->irritants;
@@ -1362,6 +1734,7 @@ struct State {
       case PROTOTYPE: size = sizeof(Prototype); break; 
       case UPVALUE: size = sizeof(Upvalue); break;
       case NATIVE_FUNCTION: size =  sizeof(NativeFunction); break;
+      case TABLE: size = sizeof(Table); break;
       case PAIR: size = sizeof(Pair) + src_size<Pair>(x->pair_has_source()); break;
       case BOX: size = sizeof(Box) + src_size<Box>(x->box_has_source()); break;
       case VECTOR_STORAGE:
@@ -1497,7 +1870,7 @@ struct State {
           update_forward(&((Pair*) x)->cdr);
           continue;
         // Three pointers
-        case EXCEPTION:
+        case TABLE: case EXCEPTION:
           PIP_FWD(Exception, tag);
           PIP_FWD(Exception, message);
           PIP_FWD(Exception, irritants);
@@ -2767,15 +3140,12 @@ restart:
   }
 
   Value* type_error(const std::string& name, size_t arg_number, Value* argument, Type expected, Type got) {
-    std::ostringstream out, argfmts;
-    argfmts << argument;
-    out << name << " expected argument " << arg_number << " to be " << 
-      expected << " but got " << got << '(';
-    std::string argfmt(argfmts.str());
-    out.write(argfmt.c_str(), argfmt.size());
-    out << ')';
+    std::ostringstream out;
+    out << name << " expected argument " << arg_number+1 << " to be " << 
+      expected << " but got " << got << " (" << argument << ')';
     return make_exception(State::S_PIP_EVAL, out.str());
   }
+
   // Apply Scheme function
   Value* vm_apply(Prototype* prototype, Closure* closure, size_t argc, Value* args[], bool& trampoline) {
     // Track how many frames have been lost due to tail calls for debugging
@@ -3053,20 +3423,21 @@ inline Frame::~Frame() {
 // TYPENOTE
 inline std::ostream& operator<<(std::ostream& os, Type& t) {
   switch(t) {
-    case TRANSIENT: os << "bad type";
-    case PAIR: os << "a pair";
-    case VECTOR: os << "a vector";
-    case VECTOR_STORAGE: os << "a vector-storage";
-    case BLOB: os << "a blob";
-    case STRING: os << "a string";
-    case SYMBOL: os << "a symbol";
-    case EXCEPTION: os << "an exception";
-    case BOX: os << "a box";
-    case PROTOTYPE: os << "a scheme function";
-    case CLOSURE: os << "a scheme closure";
-    case NATIVE_FUNCTION: os << "a native function";
-    case FIXNUM: os << "a fixnum";
-    case CONSTANT: os << "a constant";
+    case TRANSIENT: os << "bad type"; break;
+    case PAIR: os << "a pair"; break;
+    case VECTOR: os << "a vector"; break;
+    case VECTOR_STORAGE: os << "a vector-storage"; break;
+    case BLOB: os << "a blob"; break;
+    case STRING: os << "a string"; break;
+    case SYMBOL: os << "a symbol"; break;
+    case EXCEPTION: os << "an exception"; break;
+    case BOX: os << "a box"; break;
+    case PROTOTYPE: os << "a scheme function"; break;
+    case CLOSURE: os << "a scheme closure"; break;
+    case NATIVE_FUNCTION: os << "a native function"; break;
+    case TABLE: os << "a table"; break;
+    case FIXNUM: os << "a fixnum"; break;
+    case CONSTANT: os << "a constant"; break;
   }
   return os;
 }
@@ -3090,6 +3461,7 @@ inline Value* cdr(State& state, unsigned argc, Value* args[]) {
 
 inline void State::initialize_builtin_functions() {
   defun("car", &car, 1, false);
+  defun("cdr", &cdr, 1, false);
 }
 
 // Output
