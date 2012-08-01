@@ -13,11 +13,13 @@
 
 // 1. (PRELUDE) Preprocessor definitions and miscellaneous utilities
 // 2. (OBJ) Object representation - How Scheme types are represented in C++
-// 3. (GC) Garbage collector
-// 4. (READ) Expression reader and source code tracking
-// 5. (CC) Compiler
-// 6. (VM) Virtual Machine
-// 7. (UTIL) Utilities
+// 3. (RT) Runtime basics
+// 4. (GC) Garbage collector
+// 5. (READ) Expression reader and source code tracking
+// 6. (CC) Compiler
+// 7. (VM) Virtual Machine
+// 8. (UTIL) Utilities
+// 9. (STD) Standard Scheme functions implemented in C++
 
 // (PRELUDE)
 
@@ -30,12 +32,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-
 #include <limits>
 #include <fstream>
 #include <sstream>
 #include <iostream>
 #include <vector>
+
 #ifdef __APPLE__
 # include <boost/unordered_map.hpp>
 #else
@@ -170,8 +172,7 @@ struct SourceInfo {
 
 // C++ object types (which may not match up exactly with Scheme predicates)
 
-// NOTE: Adding a type requires several modifications; search for
-// 'recursive_mark' and 'minimum_size'
+// NOTE: Adding a type requires several modifications; search for "TYPENOTE"
 enum Type {
   TRANSIENT,
   PAIR,
@@ -191,6 +192,8 @@ enum Type {
   FIXNUM,
   CONSTANT,
 };
+
+std::ostream& operator<<(std::ostream& os, Type& t);
 
 struct Value {
   // The space that's been allocated for this object, for the garbage
@@ -223,6 +226,14 @@ struct Value {
   bool pointerp() const { return this && (bits() & 3) == 0; }
   // Anything that isn't a pointer is immediate
   bool immediatep() const { return !pointerp(); }
+  bool applicablep() const {
+    switch(get_type()) {
+      case CLOSURE:
+      case PROTOTYPE:
+      case NATIVE_FUNCTION: return true;
+      default: return false;
+    }
+  }
 
   // Methods for interacting with the header safely
   int get_header_bit(Type type, int bit) const { PIP_ASSERT(pointerp()); PIP_ASSERT(get_type() == type); return header & bit; }
@@ -329,6 +340,11 @@ struct Value {
   Value* upvalue() const;
   void upvalue_set(Value*);
   void upvalue_close();
+
+  // Native functions
+  static const int NATIVE_FUNCTION_VARIABLE_ARITY_BIT = 1 << 15;
+
+  bool native_function_variable_arity() const { return get_header_bit(NATIVE_FUNCTION, NATIVE_FUNCTION_VARIABLE_ARITY_BIT); }
 };
 
 struct Pair : Value {
@@ -480,7 +496,7 @@ void Value::upvalue_close() {
 }
 
 struct NativeFunction : Value {
-  typedef void (*ptr_t)(State&, unsigned, Value* args[]);
+  typedef Value* (*ptr_t)(State&, unsigned, Value* args[]);
 
   unsigned arguments;
   ptr_t pointer;
@@ -488,51 +504,13 @@ struct NativeFunction : Value {
   static const Type CLASS_TYPE = NATIVE_FUNCTION;
 };
 
-///// (GC) Garbage collector
-
-// <--
-// Pip's garbage collector is a mark-and-don't-sweep collector. The allocator
-// is a first-fit allocator: it allocates memory from the first appropriately
-// sized free chunk of memory it can find. It marks every chunk of memory it
-// sweeps over (or, if the chunk is already marked, it skips it). When the
-// allocator reaches the end of the heap, the meaning of the mark bit is
-// flipped, and the entire heap is considered garbage. Then the collector
-// immediately marks all live memory, and we know which objects are marked. The
-// benefit of a mark-and-don't-sweep collector is that the work is spread out
-// amongst allocations and should (in most cases) result in no large pauses to
-// the program. It requires no external data structures; the only overhead
-// being that each object needs a "size" and "mark" field (and in Pip's case,
-// the mark field is stored alongside type and other flags in a space efficient
-// manner). The main downside is fragmentation.
-
-// How does Pip mark live memory? It starts with the program's "roots" and
-// marks all their children and so on. But how do we find the roots? They are
-// explicitly registered with the garbage collector using two methods: Frames
-// and Handles. A Frame is a stack-allocated structure that keeps track of as
-// many variables as needed. You create a frame in each function you want to
-// track variables in like so: PIP_FRAME(var1, var2). A Handle is a
-// heap-allocated structure that keeps track of one variable, and is useful
-// when your variables have lifetimes beyond the execution of a single
-// function.
-
-// How does Pip get memory from the operating system? It starts by using a
-// small amount of memory (4 kilobytes). If, after a collection, more than a
-// certain amount of memory is in use (the "load factor", by default 77%), it
-// allocates twice as much memory. It can also allocate more memory if a very
-// large object (over 4kb) is allocated.
-
-// In addition to normal collection, Pip has support for doing a full
-// compaction on the heap, reducing fragmentation to 0. Currently, this can
-// only be used manually and only at the top-level of program execution. So
-// although it might not benefit a normal program's execution, it could be used
-// eg while a game is loading levels to prevent fragmentation over time
-// -->
 
 ///// GARBAGE COLLECTOR TRACKING
 
 // This structure is used in the GC tracking macros to take a normal
 // pointer to a Pip value of any type and obtain a Value** pointer to it
 struct FrameHack {
+  // TYPENOTE
 #define PIP_(t) FrameHack(t *& ref): ref((Value**) &ref) {}
   PIP_(Value)
   PIP_(Pair)
@@ -546,6 +524,7 @@ struct FrameHack {
   PIP_(Prototype)
   PIP_(Closure)
   PIP_(Upvalue)
+  PIP_(NativeFunction)
 #undef PIP_
   
   ~FrameHack() {}
@@ -575,7 +554,16 @@ struct Frame {
 #define PIP_FRAME(...) PIP_E_FRAME((state), __VA_ARGS__)
 #define PIP_S_FRAME(...) PIP_E_FRAME((*this), __VA_ARGS__)
 
+///// (RT) Runtime
+
+// <--
+// Each instance of the Pip runtime is contained within the State structure.
+// Pip is completely re-entrant. The State structure is a rather monolithic
+// struct that contains every detail of the runtime.
+// -->
+
 struct State {
+  // Some basic runtime code follows -- the garbage collector is farther down
   struct VMFrame;
   template <class T> struct Handle;
 
@@ -623,7 +611,8 @@ struct State {
       "quote",
       "quasiquote",
       "unquote",
-      "unquote-splicing"
+      "unquote-splicing",
+      "define-syntax"
     };
 
     for(size_t i = 0; i != GLOBAL_SYMBOL_COUNT; i++) {
@@ -632,6 +621,11 @@ struct State {
       globals.push_back(v);
     }
 
+    // Initialize reader
+    source_names.push_back("unknown");
+    source_contents.push_back(NULL);
+
+    // Initialize global environment for compiler
     global_env = make_vector();
 
     vector_append(*global_env, PIP_FALSE);
@@ -640,10 +634,8 @@ struct State {
       vector_append(*global_env, global_symbol(static_cast<Global>(i)));
       vector_append(*global_env, global_symbol(S_SPECIAL));
     }
-
-    // Initialize reader
-    source_names.push_back("unknown");
-    source_contents.push_back(NULL);
+    
+    initialize_builtin_functions();
   }
 
   ~State() {
@@ -685,12 +677,15 @@ struct State {
     S_QUASIQUOTE,
     S_UNQUOTE,
     S_UNQUOTE_SPLICING,
+    S_DEFINE_SYNTAX,
     GLOBAL_SYMBOL_COUNT
   };
 
   Symbol* global_symbol(Global g) {
     return static_cast<Symbol*>(**(globals[(size_t) g]));
   }
+
+  void initialize_builtin_functions();
 
   ///// CONSTRUCTORS
 
@@ -811,7 +806,133 @@ struct State {
     return make_exception(global_symbol(g), smsg, PIP_FALSE);
   }
 
-  ///// GARBAGE COLLECTOR
+  ///// BASIC FUNCTIONS
+
+  void defun(const std::string& cname, NativeFunction::ptr_t ptr, unsigned arguments, bool variable_arity) {
+    NativeFunction* fn = 0;
+    Symbol* name = 0;
+    PIP_S_FRAME(fn, name);
+    fn = allocate<NativeFunction>();
+    fn->arguments = arguments;
+    fn->pointer = ptr;
+    if(variable_arity) 
+      fn->set_header_bit(NATIVE_FUNCTION, Value::NATIVE_FUNCTION_VARIABLE_ARITY_BIT);
+    name = make_symbol(cname);
+    env_def(*global_env, name, global_symbol(S_VARIABLE));
+    name->value = fn;
+  }
+
+  unsigned vector_append(Vector* vec, Value* value) {
+    vec->storage->data[vec->storage->length++] = value;
+    if(vec->storage->length == vec->capacity) {
+      VectorStorage* s = 0;
+      PIP_S_FRAME(vec, s);
+      size_t capacity = vec->capacity * 2;
+      s = allocate<VectorStorage>(array_size<Value*>(capacity));
+      memcpy(s->data, vec->storage->data, (vec->storage->length * sizeof(Value*)));
+      s->length = vec->storage->length;
+      vec->capacity = capacity;
+      vec->storage = s;
+    }
+    return vec->storage->length - 1;
+  }
+
+  static void unwrap_source_info(Value* exp, SourceInfo& info) {
+    if(exp->get_type() == PAIR && exp->pair_has_source()) {
+      info = PIP_CAST(Pair, exp)->src;
+    } else if(exp->get_type() == BOX && exp->box_has_source()) {
+      info = PIP_CAST(Box, exp)->src;
+    }
+  }
+
+  void format_source_error(Value* exp, const std::string& msg, std::string& out) {
+    SourceInfo info;
+    unwrap_source_info(exp, info);
+    if(info.file) {
+      std::ostringstream ss;
+      ss << source_names[info.file] << ':' << info.line << ": " << msg << std::endl << "  " << source_contents[info.file]->at(info.line-1);
+      out = ss.str();
+    } else {
+      out = msg;
+    }
+  }
+
+  static bool listp(Value* lst) {
+    if(lst == PIP_NULL) return true;
+    if(lst->get_type() != PAIR) return false;
+    while(lst->get_type() == PAIR) {
+      lst = lst->cdr();
+      if(lst == PIP_NULL) return true;
+    }
+    return false;
+  }
+
+  // Returns length of list
+  static size_t length(Value* lst) {
+    size_t i = 0;
+    while(lst->get_type() == PAIR) {
+      i++;
+      lst = lst->cdr();
+    }
+    return i;
+  }
+
+  // A helpful function for building lists
+  void append_m(Value** head, Value** tail, Value* value) {
+    Value* h = *head, *t = *tail, *swap = NULL;
+    PIP_S_FRAME(h, t, swap, value);
+    swap = cons(value, PIP_NULL);
+    if(!h) {
+      (*head) = swap;
+      (*tail) = swap;
+    } else {
+      t->set_cdr(swap);
+      (*tail) = swap;
+    }
+  }
+
+  ///// (GC) Garbage collector
+
+  // NOTE: Garbage collector tracking macros are declared above the State
+  // structure
+
+  // <--
+  // Pip's garbage collector is a mark-and-don't-sweep collector. The allocator
+  // is a first-fit allocator: it allocates memory from the first appropriately
+  // sized free chunk of memory it can find. It marks every chunk of memory it
+  // sweeps over (or, if the chunk is already marked, it skips it). When the
+  // allocator reaches the end of the heap, the meaning of the mark bit is
+  // flipped, and the entire heap is considered garbage. Then the collector
+  // immediately marks all live memory, and we know which objects are marked. The
+  // benefit of a mark-and-don't-sweep collector is that the work is spread out
+  // amongst allocations and should (in most cases) result in no large pauses to
+  // the program. It requires no external data structures; the only overhead
+  // being that each object needs a "size" and "mark" field (and in Pip's case,
+  // the mark field is stored alongside type and other flags in a space efficient
+  // manner). The main downside is fragmentation.
+
+  // How does Pip mark live memory? It starts with the program's "roots" and
+  // marks all their children and so on. But how do we find the roots? They are
+  // explicitly registered with the garbage collector using two methods: Frames
+  // and Handles. A Frame is a stack-allocated structure that keeps track of as
+  // many variables as needed. You create a frame in each function you want to
+  // track variables in like so: PIP_FRAME(var1, var2). A Handle is a
+  // heap-allocated structure that keeps track of one variable, and is useful
+  // when your variables have lifetimes beyond the execution of a single
+  // function.
+
+  // How does Pip get memory from the operating system? It starts by using a
+  // small amount of memory (4 kilobytes). If, after a collection, more than a
+  // certain amount of memory is in use (the "load factor", by default 77%), it
+  // allocates twice as much memory. It can also allocate more memory if a very
+  // large object (over 4kb) is allocated.
+
+  // In addition to normal collection, Pip has support for doing a full
+  // compaction on the heap, reducing fragmentation to 0. Currently, this can
+  // only be used manually and only at the top-level of program execution. So
+  // although it might not benefit a normal program's execution, it could be used
+  // eg while a game is loading levels to prevent fragmentation over time
+  // --> 
 
   static const size_t POINTER_ALIGNMENT = sizeof(void*);
 
@@ -881,6 +1002,7 @@ struct State {
   }
 
   void recursive_mark(Value* x) {
+    // TYPENOTE
     // Done in a while loop to save stack space
     while(x->pointerp() && !markedp(x)) {
       live_at_last_collection += x->get_size_unsafe();
@@ -890,6 +1012,7 @@ struct State {
         // Note that in order to save a little redunancy, objects are marked
         // based on their structure (eg all objects with two pointers are
         // marked as though they were pairs)
+
         // Atomic
         case NATIVE_FUNCTION: case STRING: case BLOB:
           return;
@@ -1228,6 +1351,7 @@ struct State {
   // Determine the minimum size of an object; used to remove fragmentation
   // while compacting
   static size_t minimum_size(Value* x) {
+    // TYPENOTE
     size_t size;
     switch(x->get_type()) {
       // Simple cases
@@ -1356,6 +1480,7 @@ struct State {
       sweep += x->size;
 #define PIP_FWD(type, field) update_forward((Value**) &(((type*) x)->field))
       switch(x->get_type_unsafe()) {
+        // TYPENOTE
         // Atomic
         case NATIVE_FUNCTION: case STRING: case BLOB:
           continue;
@@ -1420,75 +1545,6 @@ struct State {
     Value* hole = (Value*) bump;
     hole->header = TRANSIENT;
     hole->size = (heap->end - bump);
-  }
-
-  ///// BASIC FUNCTIONS
-
-  unsigned vector_append(Vector* vec, Value* value) {
-    vec->storage->data[vec->storage->length++] = value;
-    if(vec->storage->length == vec->capacity) {
-      VectorStorage* s = 0;
-      PIP_S_FRAME(vec, s);
-      size_t capacity = vec->capacity * 2;
-      s = allocate<VectorStorage>(array_size<Value*>(capacity));
-      memcpy(s->data, vec->storage->data, (vec->storage->length * sizeof(Value*)));
-      s->length = vec->storage->length;
-      vec->capacity = capacity;
-      vec->storage = s;
-    }
-    return vec->storage->length - 1;
-  }
-
-  static void unwrap_source_info(Value* exp, SourceInfo& info) {
-    if(exp->get_type() == PAIR && exp->pair_has_source()) {
-      info = PIP_CAST(Pair, exp)->src;
-    } else if(exp->get_type() == BOX && exp->box_has_source()) {
-      info = PIP_CAST(Box, exp)->src;
-    }
-  }
-
-  void format_source_error(Value* exp, const std::string& msg, std::string& out) {
-    SourceInfo info;
-    unwrap_source_info(exp, info);
-    if(info.file) {
-      std::ostringstream ss;
-      ss << source_names[info.file] << ':' << info.line << ": " << msg << std::endl << "  " << source_contents[info.file]->at(info.line-1);
-      out = ss.str();
-    } else {
-      out = msg;
-    }
-  }
-
-  static bool listp(Value* lst) {
-    if(lst == PIP_NULL) return true;
-    if(lst->get_type() != PAIR) return false;
-    while(lst->get_type() == PAIR) {
-      lst = lst->cdr();
-      if(lst == PIP_NULL) return true;
-    }
-    return false;
-  }
-
-  static size_t length(Value* lst) {
-    size_t i = 0;
-    while(lst->get_type() == PAIR) {
-      i++;
-      lst = lst->cdr();
-    }
-    return i;
-  } 
-
-  void append_m(Value** head, Value** tail, Value* value) {
-    Value* h = *head, *t = *tail, *swap = NULL;
-    PIP_S_FRAME(h, t, swap, value);
-    swap = cons(value, PIP_NULL);
-    if(!h) {
-      (*head) = swap;
-      (*tail) = swap;
-    } else {
-      t->set_cdr(swap);
-      (*tail) = swap;
-    }
   }
 
   ///// (READ) Expression reader and source code tracking 
@@ -2153,12 +2209,6 @@ struct State {
     }
 
     // error handling
-    Value* error(Value* form, const std::string& msg) {
-      std::string out;
-      state.format_source_error(form, msg, out);
-      return state.make_exception(State::S_PIP_COMPILE, out);
-    }
-
     Value* syntax_error(Value* form, const std::string& str) {
       std::string out;
       state.format_source_error(form, str, out);
@@ -2168,19 +2218,19 @@ struct State {
     Value* arity_error(Global name, Value* form, size_t expected, unsigned got) {
       std::ostringstream ss;
       ss << "malformed " << state.global_symbol(name) << ": expected " << expected << " arguments, but got " << got;
-      syntax_error(form, ss.str());
+      return syntax_error(form, ss.str());
     }
 
     Value* arity_error_most(Global name, Value* form, size_t expected, unsigned got) {
       std::ostringstream ss;
       ss << "malformed " << state.global_symbol(name) << ": expected at most " << expected << " arguments, but got " << got;
-      syntax_error(form, ss.str());
+      return syntax_error(form, ss.str());
     }
 
     Value* syntax_error(Global name, Value* form, const std::string& str) {
       std::ostringstream ss;
       ss << "malformed " << state.global_symbol(name) << ": " << str;
-      syntax_error(form, ss.str());
+      return syntax_error(form, ss.str());
     }
 
     Value* undefined_variable(Value* form) {
@@ -2230,7 +2280,7 @@ struct State {
       Value* type = state.env_ref(**env, name, lookup);
       if(type == state.global_symbol(S_SPECIAL))
         return syntax_error(exp, "special forms cannot be used as values");
-      if(type == state.global_symbol(S_VARIABLE)) {
+      else if(type == state.global_symbol(S_VARIABLE)) {
         switch(lookup.scope) {
           case REF_GLOBAL:
             push_constant(name);
@@ -2253,7 +2303,11 @@ struct State {
             push();
             break;
         } 
-      } else PIP_ASSERT(0);
+      } else if(type->applicablep()) {
+        // syntax
+      } else {
+        return undefined_variable(exp);
+      }
       return PIP_FALSE;
     }
 
@@ -2373,58 +2427,6 @@ restart:
       }
     }
 
-    Value* compile_if(size_t argc, Value* exp, bool tail) {
-      if(argc != 2 && argc != 3)
-        if(argc < 2) return arity_error(S_IF, exp, 2, argc);
-        else return arity_error_most(S_IF, exp, 3, argc);
-      Value* chk = 0, *condition = 0, *then_branch = 0, *else_branch = 0;
-      PIP_FRAME(chk, condition, then_branch, else_branch);
-
-      condition = exp->cadr();
-      then_branch = exp->cddr()->car();
-      else_branch = argc == 2 ? PIP_UNSPECIFIED : exp->cddr()->cdr()->car();
-
-      chk = compile(condition);
-      PIP_CHECK(chk);
-      // Jump to the else branch if the condition is false
-      emit(OP_JUMP_IF_FALSE);
-      // Emit placeholder for argument
-      size_t jmp1 = code.size();
-      emit_arg(0);
-      // JMP_IF_FALSE will pop condition
-      pop();
-      PIP_CC_EMIT("jump-if-false");
-      size_t old_stack = stack_size;
-      // Emit 'then' code
-      chk = compile(then_branch, tail);
-      PIP_CHECK(chk);
-      pop(stack_size - old_stack);
-      // Jmp to the rest of the program
-      emit(OP_JUMP);
-      // Emit placeholder for argument
-      size_t jmp2 = code.size();
-      emit_arg(0);
-      PIP_CC_EMIT("jump");
-      // Location of first jump (beginning of else branch)
-      size_t lbl1 = code.size();
-      chk = compile(else_branch, tail);
-      PIP_CHECK(chk);
-      pop(stack_size - old_stack);
-      // Location of second jump
-      size_t lbl2 = code.size();
-
-      // Replace jumps
-      code[jmp1] = lbl1;
-      code[jmp2] = lbl2;
-
-      // Ensure space for result
-      push();
-
-      PIP_CC_VMSG("if jmp1 " << lbl1 << " jmp2 " << lbl2);
-
-      return PIP_FALSE;
-    }
-
     Value* compile_lambda(size_t form_argc, Value* exp, bool tail, Value* name) {
       // For checking subcompilation results
       Value* chk = 0;
@@ -2485,6 +2487,70 @@ restart:
       return PIP_FALSE;
     }
 
+    Value* compile_if(size_t argc, Value* exp, bool tail) {
+      if(argc != 2 && argc != 3)
+        if(argc < 2) return arity_error(S_IF, exp, 2, argc);
+        else return arity_error_most(S_IF, exp, 3, argc);
+      Value* chk = 0, *condition = 0, *then_branch = 0, *else_branch = 0;
+      PIP_FRAME(chk, condition, then_branch, else_branch);
+
+      condition = exp->cadr();
+      then_branch = exp->cddr()->car();
+      else_branch = argc == 2 ? PIP_UNSPECIFIED : exp->cddr()->cdr()->car();
+
+      chk = compile(condition);
+      PIP_CHECK(chk);
+      // Jump to the else branch if the condition is false
+      emit(OP_JUMP_IF_FALSE);
+      // Emit placeholder for argument
+      size_t jmp1 = code.size();
+      emit_arg(0);
+      // JMP_IF_FALSE will pop condition
+      pop();
+      PIP_CC_EMIT("jump-if-false");
+      size_t old_stack = stack_size;
+      // Emit 'then' code
+      chk = compile(then_branch, tail);
+      PIP_CHECK(chk);
+      pop(stack_size - old_stack);
+      // Jmp to the rest of the program
+      emit(OP_JUMP);
+      // Emit placeholder for argument
+      size_t jmp2 = code.size();
+      emit_arg(0);
+      PIP_CC_EMIT("jump");
+      // Location of first jump (beginning of else branch)
+      size_t lbl1 = code.size();
+      chk = compile(else_branch, tail);
+      PIP_CHECK(chk);
+      pop(stack_size - old_stack);
+      // Location of second jump
+      size_t lbl2 = code.size();
+
+      // Replace jumps
+      code[jmp1] = lbl1;
+      code[jmp2] = lbl2;
+
+      // Ensure space for result
+      push();
+
+      PIP_CC_VMSG("if jmp1 " << lbl1 << " jmp2 " << lbl2);
+
+      return PIP_FALSE;
+    }
+
+    Value* compile_quote(size_t argc, Value* exp) {
+      if(argc != 1) return arity_error(S_QUOTE, exp, 1, argc);
+      // Immediates are stored directly in code
+      if(exp->cadr()->immediatep()) {
+        return compile(exp->cadr());
+      } else {
+        // Everything else is a constant
+        push_constant(exp->cadr());
+        return PIP_FALSE;
+      }
+    }
+
     // Compile a normal function application
     Value* compile_apply(Value* exp, bool tail) {
       Value* chk = 0;
@@ -2517,6 +2583,10 @@ restart:
       return PIP_FALSE;
     }
 
+    Value* compile_define_syntax(size_t argc, Value* exp, bool tail) {
+      return PIP_FALSE;
+    }
+
     // Compile a single expression, returns #f or an error if one occurred
     Value* compile(Value* exp, bool tail = false) {
       // Dispatch based on an object's type
@@ -2539,7 +2609,7 @@ restart:
         }
         case PAIR: {
           // Compile applications, including special forms, macros, and normal function applications
-          if(!listp(exp)) return error(exp, "dotted lists not allowed in source");
+          if(!listp(exp)) return syntax_error(exp, "dotted lists not allowed in source");
           // Note the source location of this application
           annotate(exp);
           // Check for special forms
@@ -2575,6 +2645,10 @@ restart:
               return compile_lambda(argc-1, exp, tail, name);
             } else if(op == state.global_symbol(S_IF)) {
               return compile_if(argc, exp, tail);
+            } else if(op == state.global_symbol(S_QUOTE)) {
+              return compile_quote(argc, exp);
+            } else if(op == state.global_symbol(S_DEFINE_SYNTAX)) {
+              return compile_define_syntax(argc, exp, tail);
             } else assert(0);
           } else {
             // function application
@@ -2692,6 +2766,16 @@ restart:
     return make_exception(State::S_PIP_EVAL, "attempt to apply non-function");
   }
 
+  Value* type_error(const std::string& name, size_t arg_number, Value* argument, Type expected, Type got) {
+    std::ostringstream out, argfmts;
+    argfmts << argument;
+    out << name << " expected argument " << arg_number << " to be " << 
+      expected << " but got " << got << '(';
+    std::string argfmt(argfmts.str());
+    out.write(argfmt.c_str(), argfmt.size());
+    out << ')';
+    return make_exception(State::S_PIP_EVAL, out.str());
+  }
   // Apply Scheme function
   Value* vm_apply(Prototype* prototype, Closure* closure, size_t argc, Value* args[], bool& trampoline) {
     // Track how many frames have been lost due to tail calls for debugging
@@ -2932,7 +3016,11 @@ tail:
           frames_lost++;
           goto tail;
         } else return result;
+      case NATIVE_FUNCTION: {
+        return static_cast<NativeFunction*>(function)->pointer(*this, argc, args);
+      }
       default:
+        std::cerr << "attempt to apply type " << function->get_type() << std::endl;
         PIP_ASSERT(!"bad application");
         break;
     }
@@ -2959,6 +3047,52 @@ inline Frame::~Frame() {
   PIP_ASSERT("odd::Frame FIFO order violated" && state.frame_list == this);
   state.frame_list = previous;
 }
+
+///// (STD) Standard Scheme functions implemented in C++
+
+// TYPENOTE
+inline std::ostream& operator<<(std::ostream& os, Type& t) {
+  switch(t) {
+    case TRANSIENT: os << "bad type";
+    case PAIR: os << "a pair";
+    case VECTOR: os << "a vector";
+    case VECTOR_STORAGE: os << "a vector-storage";
+    case BLOB: os << "a blob";
+    case STRING: os << "a string";
+    case SYMBOL: os << "a symbol";
+    case EXCEPTION: os << "an exception";
+    case BOX: os << "a box";
+    case PROTOTYPE: os << "a scheme function";
+    case CLOSURE: os << "a scheme closure";
+    case NATIVE_FUNCTION: os << "a native function";
+    case FIXNUM: os << "a fixnum";
+    case CONSTANT: os << "a constant";
+  }
+  return os;
+}
+
+#define PIP_CHECK_TYPE(expect, number) \
+  if(args[(number)]->get_type() != (expect)) { \
+    return state.type_error(fn_name, (number), args[(number)], (expect), args[(number)]->get_type()); \
+  }
+
+inline Value* car(State& state, unsigned argc, Value* args[]) {
+  static const char* fn_name = "car";
+  PIP_CHECK_TYPE(PAIR, 0);
+  return args[0]->car();
+}
+
+inline Value* cdr(State& state, unsigned argc, Value* args[]) {
+  static const char* fn_name = "car";
+  PIP_CHECK_TYPE(PAIR, 0);
+  return args[0]->cdr();
+}
+
+inline void State::initialize_builtin_functions() {
+  defun("car", &car, 1, false);
+}
+
+// Output
 
 inline std::ostream& operator<<(std::ostream& os, Value* x) {
   switch(x->get_type()) {

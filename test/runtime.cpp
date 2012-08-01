@@ -198,6 +198,13 @@ void test_compiler(State& state) {
   test_eval(state, "(begin #f #f #t)", PIP_TRUE);
   // Tail call
   test_eval(state, "((lambda () ((lambda () #t))))", PIP_TRUE);
+  // Quote
+  test_eval(state, "(quote #t)", PIP_TRUE);
+
+  // Built-in functions
+  test_eval(state, "(car (quote (#t)))", PIP_TRUE);
+  // define-syntax
+  //test_eval(state, "(define-syntax hello (er-macro-transformer (lambda (x r c) #t))) (hello)", PIP_TRUE);
 }
 
 void test_compaction(State& state) {
