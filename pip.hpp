@@ -1635,7 +1635,6 @@ struct State {
       case SYMBOL:
         return a == b;
       case STRING:
-        std::cout << "EQUALS: " << a << ' ' << b << std::endl << (strcmp(PIP_CAST(String, a)->data, PIP_CAST(String, b)->data) == 0) << std::endl;
         return strcmp(PIP_CAST(String, a)->data, PIP_CAST(String, b)->data) == 0;
       default: break;
     }
