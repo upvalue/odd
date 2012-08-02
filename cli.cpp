@@ -29,7 +29,7 @@ static void print_help(char** argv) {
 
 int main(int argc, char** argv) {
   // Parse options
-  for(size_t i = 1; i < argc; i++) {
+  for(int i = 1; i < argc; i++) {
     std::string arg(argv[i]);
     if(arg[0] == '-') {
       if(arg.length() > 1) {

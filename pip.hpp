@@ -13,8 +13,8 @@
 
 // 1. (PRELUDE) Preprocessor definitions and miscellaneous utilities
 // 2. (OBJ) Object representation - How Scheme types are represented in C++
-// 3. (RT) Runtime basics
-// 4. (GC) Garbage collector
+// 3. (GC) Garbage collector
+// 4. (RT) Runtime
 // 5. (READ) Expression reader and source code tracking
 // 6. (CC) Compiler
 // 7. (VM) Virtual Machine
@@ -57,6 +57,16 @@
 #else
 # define PIP_ASSERT(x) ((void)0)
 #endif
+
+// Try to give a graceful error message when internal errors occur
+#define PIP_FAIL0(desc) \
+  std::cerr << desc << std::endl; \
+  PIP_ASSERT(!0);
+
+#define PIP_FAIL(desc, ret) \
+  PIP_FAIL0(desc); \
+  return (ret); 
+
 
 // Checking for exceptions
 #define PIP_CHECK(x) if((x)->active_exception()) return (x);
@@ -166,8 +176,10 @@ struct SourceInfo {
 // would be. For instance, a Pair contains two pointers.
 // -->
 
-// Cast with assertions (will cause double evaluation; do not give an argument with side effects)
-#define PIP_CAST(klass, x) (PIP_ASSERT((x)->get_type() == pip::klass ::CLASS_TYPE), (klass *) (x))
+// Cast with assertions (will cause double evaluation; do not give an argument
+// with side effects)
+#define PIP_CAST(klass, x) \
+  (PIP_ASSERT((x)->get_type() == pip::klass ::CLASS_TYPE), (klass *) (x))
 
 // Constant values 
 #define PIP_FALSE ((pip::Value*) 0)
@@ -243,8 +255,15 @@ struct Value {
   }
 
   // Methods for interacting with the header safely
-  int get_header_bit(Type type, int bit) const { PIP_ASSERT(pointerp()); PIP_ASSERT(get_type() == type); return header & bit; }
-  void set_header_bit(Type type, int bit) { PIP_ASSERT(get_type() == type); header += bit; }
+  int get_header_bit(Type type, int bit) const {
+    PIP_ASSERT(pointerp()); PIP_ASSERT(get_type() == type);
+    return header & bit;
+  }
+
+  void set_header_bit(Type type, int bit) {
+    PIP_ASSERT(get_type() == type);
+    header += bit;
+  }
 
   // Set the header's type and mark (for the garbage collector)
   void set_header_unsafe(unsigned char type, bool mark, size_t mark_bit) {
@@ -263,7 +282,8 @@ struct Value {
 
   // Safely determine the type of an object
   Type get_type() const {
-    return fixnump() ? FIXNUM : (constantp() ? CONSTANT : static_cast<Type>(get_type_unsafe()));
+    return fixnump() ? FIXNUM :
+      (constantp() ? CONSTANT : static_cast<Type>(get_type_unsafe()));
   }
 
   // Type specific methods: simple getters and setters, object flags
@@ -278,7 +298,9 @@ struct Value {
   // True when the Pair has source code information attached
   static const int PAIR_HAS_SOURCE_BIT = 1 << 15;
 
-  bool pair_has_source() const { return get_header_bit(PAIR, PAIR_HAS_SOURCE_BIT); }
+  bool pair_has_source() const {
+    return get_header_bit(PAIR, PAIR_HAS_SOURCE_BIT);
+  }
 
   Value* car() const;
   Value* cdr() const;
@@ -304,7 +326,7 @@ struct Value {
   // Templated functions for dealing with structured data within blobs
   template <class T> unsigned blob_length() const;
   template <class T> T blob_ref(unsigned) const;
-  template <class T> T blob_set(unsigned, T& value) const;
+  template <class T> void blob_set(unsigned, T& value) const;
 
   // Strings
   const char* string_data() const;
@@ -319,7 +341,9 @@ struct Value {
   // True when an exception is active and should be passed on
   static const int EXCEPTION_ACTIVE_BIT = 1 << 15;
   
-  bool active_exception() const { return get_type() == EXCEPTION && (header & EXCEPTION_ACTIVE_BIT); }
+  bool active_exception() const {
+    return get_type() == EXCEPTION && (header & EXCEPTION_ACTIVE_BIT);
+  }
 
   Symbol* exception_tag() const;
   String* exception_message() const;
@@ -330,19 +354,25 @@ struct Value {
   // True when a box contains source code information
   static const int BOX_HAS_SOURCE_BIT = 1 << 15;
 
-  bool box_has_source() const { return get_header_bit(BOX, BOX_HAS_SOURCE_BIT); }
+  bool box_has_source() const {
+    return get_header_bit(BOX, BOX_HAS_SOURCE_BIT);
+  }
 
   Value* box_value() const;
 
   // Prototypes
   static const int PROTOTYPE_VARIABLE_ARITY_BIT = 1 << 15;
 
-  bool prototype_variable_arity() const { return get_header_bit(PROTOTYPE, PROTOTYPE_VARIABLE_ARITY_BIT); }
+  bool prototype_variable_arity() const {
+    return get_header_bit(PROTOTYPE, PROTOTYPE_VARIABLE_ARITY_BIT);
+  }
 
   // Upvalues
   static const int UPVALUE_CLOSED_BIT = 1 << 15;
 
-  bool upvalue_closed() const { return get_header_bit(UPVALUE, UPVALUE_CLOSED_BIT); }
+  bool upvalue_closed() const {
+    return get_header_bit(UPVALUE, UPVALUE_CLOSED_BIT);
+  }
 
   Value* upvalue() const;
   void upvalue_set(Value*);
@@ -351,14 +381,18 @@ struct Value {
   // Native functions
   static const int NATIVE_FUNCTION_VARIABLE_ARITY_BIT = 1 << 15;
 
-  bool native_function_variable_arity() const { return get_header_bit(NATIVE_FUNCTION, NATIVE_FUNCTION_VARIABLE_ARITY_BIT); }
+  bool native_function_variable_arity() const { 
+    return get_header_bit(NATIVE_FUNCTION, NATIVE_FUNCTION_VARIABLE_ARITY_BIT);
+  }
 
   // Tables
   static const int TABLE_ACT_AS_SET_BIT = 1 << 15;
   static const int TABLE_WEAK_BIT = 1 << 14;
 
-  bool table_act_as_set() const { return get_header_bit(TABLE, TABLE_ACT_AS_SET_BIT); }
-  bool table_weak_bit() const { return get_header_bit(TABLE, TABLE_WEAK_BIT); }
+  bool table_act_as_set() const {
+    return get_header_bit(TABLE, TABLE_ACT_AS_SET_BIT);
+  }
+  bool table_weak() const { return get_header_bit(TABLE, TABLE_WEAK_BIT); }
 };
 
 struct Pair : Value {
@@ -369,13 +403,31 @@ struct Pair : Value {
   static const Type CLASS_TYPE = PAIR;
 };
 
-Value* Value::car() const { PIP_ASSERT(get_type() == PAIR); return static_cast<const Pair*>(this)->car; }
-Value* Value::cdr() const { PIP_ASSERT(get_type() == PAIR); return static_cast<const Pair*>(this)->cdr; }
-Value* Value::cadr() const { PIP_ASSERT(get_type() == PAIR); return static_cast<const Pair*>(this)->cdr->car(); }
-Value* Value::cddr() const { PIP_ASSERT(get_type() == PAIR); return static_cast<const Pair*>(this)->cdr->cdr(); }
+Value* Value::car() const {
+  PIP_ASSERT(get_type() == PAIR);
+  return static_cast<const Pair*>(this)->car;
+}
+Value* Value::cdr() const {
+  PIP_ASSERT(get_type() == PAIR);
+  return static_cast<const Pair*>(this)->cdr;
+}
+Value* Value::cadr() const {
+  PIP_ASSERT(get_type() == PAIR);
+  return static_cast<const Pair*>(this)->cdr->car();
+}
+Value* Value::cddr() const {
+  PIP_ASSERT(get_type() == PAIR);
+  return static_cast<const Pair*>(this)->cdr->cdr();
+}
 
-void Value::set_car(Value* car_)  { PIP_ASSERT(get_type() == PAIR); static_cast<Pair*>(this)->car = car_; }
-void Value::set_cdr(Value* cdr_)  { PIP_ASSERT(get_type() == PAIR); static_cast<Pair*>(this)->cdr = cdr_; }
+void Value::set_car(Value* car_) { 
+  PIP_ASSERT(get_type() == PAIR);
+  static_cast<Pair*>(this)->car = car_;
+}
+void Value::set_cdr(Value* cdr_) {
+  PIP_ASSERT(get_type() == PAIR);
+  static_cast<Pair*>(this)->cdr = cdr_;
+}
 
 struct VectorStorage : Value {
   unsigned length;
@@ -384,7 +436,10 @@ struct VectorStorage : Value {
   static const Type CLASS_TYPE = VECTOR_STORAGE;
 };
 
-Value** Value::vector_storage_data() const { PIP_ASSERT(get_type() == VECTOR_STORAGE); return (Value**)static_cast<const VectorStorage*>(this)->data; }
+Value** Value::vector_storage_data() const {
+  PIP_ASSERT(get_type() == VECTOR_STORAGE);
+  return (Value**)static_cast<const VectorStorage*>(this)->data;
+}
 
 struct Vector : Value {
   VectorStorage* storage;
@@ -393,7 +448,10 @@ struct Vector : Value {
   static const Type CLASS_TYPE = VECTOR;
 };
 
-VectorStorage* Value::vector_storage() const { PIP_ASSERT(get_type() == VECTOR); return static_cast<const Vector*>(this)->storage; }
+VectorStorage* Value::vector_storage() const {
+  PIP_ASSERT(get_type() == VECTOR);
+  return static_cast<const Vector*>(this)->storage;
+}
 Value** Value::vector_data() { return vector_storage()->data; }
 Value* Value::vector_ref(size_t i) { return vector_storage()->data[i]; }
 void Value::vector_set(size_t i, Value* v) { vector_storage()->data[i] = v; }
@@ -406,18 +464,44 @@ struct Blob : Value {
   static const Type CLASS_TYPE = BLOB;
 };
 
-const char* Value::blob_data() const { PIP_ASSERT(get_type() == BLOB); return static_cast<const Blob*>(this)->data; }
-unsigned Value::blob_length() const { PIP_ASSERT(get_type() == BLOB); return static_cast<const Blob*>(this)->length; }
-template <class T> unsigned Value::blob_length() const { PIP_ASSERT(get_type() == BLOB); return static_cast<const Blob*>(this)->length / sizeof(T); }
-template <class T> T Value::blob_ref(unsigned i) const { PIP_ASSERT(get_type() == BLOB); return ((T*) static_cast<const Blob*>(this)->data)[i]; }
-template <class T> T Value::blob_set(unsigned i, T& val) const { PIP_ASSERT(get_type() == BLOB); ((T*) static_cast<const Blob*>(this)->data)[i] = val; }
+const char* Value::blob_data() const {
+  PIP_ASSERT(get_type() == BLOB); return static_cast<const Blob*>(this)->data;
+}
+
+unsigned Value::blob_length() const {
+  PIP_ASSERT(get_type() == BLOB);
+  return static_cast<const Blob*>(this)->length;
+}
+
+template <class T>
+unsigned Value::blob_length() const {
+  PIP_ASSERT(get_type() == BLOB); 
+  return static_cast<const Blob*>(this)->length / sizeof(T); 
+}
+
+template <class T> 
+T Value::blob_ref(unsigned i) const { 
+  PIP_ASSERT(get_type() == BLOB); return ((T*) 
+      static_cast<const Blob*>(this)->data)[i]; 
+}
+
+template <class T> 
+void Value::blob_set(unsigned i, T& val) const {
+  PIP_ASSERT(get_type() == BLOB);
+  ((T*) static_cast<const Blob*>(this)->data)[i] = val;
+}
 
 struct String : Blob {
   static const Type CLASS_TYPE = STRING;
 };
 
-const char* Value::string_data() const { PIP_ASSERT(get_type() == STRING); return static_cast<const String*>(this)->data; }
-unsigned Value::string_length() const { PIP_ASSERT(get_type() == STRING); return static_cast<const String*>(this)->length; }
+const char* Value::string_data() const {
+  PIP_ASSERT(get_type() == STRING); return static_cast<const String*>(this)->data;
+}
+unsigned Value::string_length() const {
+  PIP_ASSERT(get_type() == STRING);
+  return static_cast<const String*>(this)->length;
+}
 
 struct Symbol : Value {
   Value *name, *value;
@@ -425,8 +509,14 @@ struct Symbol : Value {
   static const Type CLASS_TYPE = SYMBOL;
 };
 
-Value* Value::symbol_name() const { PIP_ASSERT(get_type() == SYMBOL); return static_cast<const Symbol*>(this)->name; }
-Value* Value::symbol_value() const { PIP_ASSERT(get_type() == SYMBOL); return static_cast<const Symbol*>(this)->value; }
+Value* Value::symbol_name() const {
+  PIP_ASSERT(get_type() == SYMBOL);
+  return static_cast<const Symbol*>(this)->name;
+}
+Value* Value::symbol_value() const {
+  PIP_ASSERT(get_type() == SYMBOL);
+  return static_cast<const Symbol*>(this)->value;
+}
 
 struct Exception : Value {
   Symbol* tag;
@@ -436,9 +526,20 @@ struct Exception : Value {
   static const Type CLASS_TYPE = EXCEPTION;
 };
 
-Symbol* Value::exception_tag() const { PIP_ASSERT(get_type() == EXCEPTION); return static_cast<const Exception*>(this)->tag; };
-String* Value::exception_message() const { PIP_ASSERT(get_type() == EXCEPTION); return static_cast<const Exception*>(this)->message; };
-Value* Value::exception_irritants() const { PIP_ASSERT(get_type() == EXCEPTION); return static_cast<const Exception*>(this)->irritants; };
+Symbol* Value::exception_tag() const {
+  PIP_ASSERT(get_type() == EXCEPTION);
+  return static_cast<const Exception*>(this)->tag; 
+};
+
+String* Value::exception_message() const {
+  PIP_ASSERT(get_type() == EXCEPTION);
+  return static_cast<const Exception*>(this)->message;
+};
+
+Value* Value::exception_irritants() const {
+  PIP_ASSERT(get_type() == EXCEPTION);
+  return static_cast<const Exception*>(this)->irritants; 
+};
 
 struct Box : Value {
   Value* value;
@@ -447,7 +548,10 @@ struct Box : Value {
   static const Type CLASS_TYPE = BOX;
 };
 
-Value* Value::box_value() const { PIP_ASSERT(get_type() == BOX); return static_cast<const Box*>(this)->value; };
+Value* Value::box_value() const {
+  PIP_ASSERT(get_type() == BOX);
+  return static_cast<const Box*>(this)->value;
+};
 
 // Prototype for a function containing constants, code, and debugging
 // information. May be executed directly if the function does not reference
@@ -459,7 +563,8 @@ struct Prototype : Value {
   // A list of local free variables referenced by other functions, which will
   // be converted into upvalues when the function ends
   Blob* local_free_variables;
-  // A list of upvalues, which will be used to turn this into a closure if necessary
+  // A list of upvalues, which will be used to turn this into a closure if
+  // necessary
   Blob* upvalues;
   // The function's name, if available, or #f if not
   String* name;
@@ -521,15 +626,38 @@ struct NativeFunction : Value {
 #define PIP_TABLE_UPPER_LIMIT 0.77
 
 struct Table : Value {
-
   Blob *flags;
-  VectorStorage *keys, *values;
+  VectorStorage *keys;
+  VectorStorage *values;
   unsigned buckets, size, occupied, upper_bound;
 
   static const Type CLASS_TYPE = TABLE;
 };
 
 ///// GARBAGE COLLECTOR TRACKING
+
+// Handles are auto-tracked heap-allocated pointers
+template <class T>
+struct Handle {
+  Handle(State& state_): state(state_), ref(0) {
+    initialize();
+  }
+
+  Handle(State& state_, T* ref_): state(state_), ref(ref_) { 
+    initialize();
+  }
+
+  void initialize();
+  ~Handle();
+ 
+   State& state;
+  T* ref;
+  Handle<Value> *previous, *next;
+
+  T* operator*() const { return ref; }
+  T* operator->() const { return ref; }
+  void operator=(T* ref_) { ref = ref_; }  
+};
 
 // This structure is used in the GC tracking macros to take a normal
 // pointer to a Pip value of any type and obtain a Value** pointer to it
@@ -571,7 +699,8 @@ struct Frame {
 // Frame with explicit state argument
 #define PIP_E_FRAME(state, ...) \
   pip::FrameHack __pip_frame_hacks[] = { __VA_ARGS__ }; \
-  pip::Frame __pip_frame((state), (FrameHack*) __pip_frame_hacks, sizeof(__pip_frame_hacks) / sizeof(pip::FrameHack))
+  pip::Frame __pip_frame((state), (FrameHack*) __pip_frame_hacks, \
+      sizeof(__pip_frame_hacks) / sizeof(pip::FrameHack))
 
 // For general use
 
@@ -582,25 +711,657 @@ struct Frame {
 ///// (RT) Runtime
 
 // <--
-// Each instance of the Pip runtime is contained within the State structure.
-// Pip is completely re-entrant. The State structure is a rather monolithic
-// struct that contains every detail of the runtime.
+// Each instance of the Pip runtime is contained within the rather monolithic
+// State structure.  Pip is completely re-entrant. 
 // -->
 
 struct State {
-  // Some basic runtime code follows -- the garbage collector is farther down
   struct VMFrame;
-  template <class T> struct Handle;
 
+  ///// (GC) Garbage collector
+
+  // NOTE: Garbage collector tracking macros are declared above the State
+  // structure
+
+  // <--
+  // Pip's garbage collector is a mark-and-don't-sweep collector. The allocator
+  // is a first-fit allocator: it allocates memory from the first appropriately
+  // sized free chunk of memory it can find. It marks every chunk of memory it
+  // sweeps over (or, if the chunk is already marked, it skips it). When the
+  // allocator reaches the end of the heap, the meaning of the mark bit is
+  // flipped, and the entire heap is considered garbage. Then the collector
+  // immediately marks all live memory, and we know which objects are marked.
+  // The benefit of a mark-and-don't-sweep collector is that the work is spread
+  // out amongst allocations and should (in most cases) result in no large
+  // pauses to the program. It requires no external data structures; the only
+  // overhead being that each object needs a "size" and "mark" field (and in
+  // Pip's case, the mark field is stored alongside type and other flags in a
+  // space efficient manner). The main downside is fragmentation.
+
+  // How does Pip mark live memory? It starts with the program's "roots" and
+  // marks all their children and so on. But how do we find the roots? They are
+  // explicitly registered with the garbage collector using two methods: Frames
+  // and Handles. A Frame is a stack-allocated structure that keeps track of as
+  // many variables as needed. You create a frame in each function you want to
+  // track variables in like so: PIP_FRAME(var1, var2). A Handle is a
+  // heap-allocated structure that keeps track of one variable, and is useful
+  // when your variables have lifetimes beyond the execution of a single
+  // function.
+
+  // How does Pip get memory from the operating system? It starts by using a
+  // small amount of memory (4 kilobytes). If, after a collection, more than a
+  // certain amount of memory is in use (the "load factor", by default 77%), it
+  // allocates twice as much memory to avoid collecting too often. It can also
+  // allocate more memory if a very large object (over 4kb) is allocated.
+
+  // In addition to normal collection, Pip has support for doing a full
+  // compaction on the heap, reducing fragmentation to 0. Currently, this can
+  // only be used manually and only at the top-level of program execution. So
+  // although it might not benefit a normal program's execution, it could be
+  // used eg while a game is loading levels to prevent fragmentation over time
+  // --> 
+
+  static const size_t POINTER_ALIGNMENT = sizeof(void*);
+
+  struct Block {
+    size_t size;
+    char *begin, *end;
+  
+    Block(size_t size, bool mark, int mark_bit) {
+      begin = (char*) malloc(size);
+      end = begin + size;
+      ((Value*) begin)->set_header_unsafe(TRANSIENT, mark, mark_bit);
+      ((Value*) begin)->set_size_unsafe(size);
+    }
+
+    ~Block() {
+      free(begin);
+    }
+  };
+
+  std::vector<Block*> blocks;
+  Handle<Value>* handle_list;
+  std::vector<VMFrame*> vm_frames;
+  Frame* frame_list;
+  bool collect_before_every_allocation;
+  int mark_bit;
+  size_t heap_size, block_cursor, live_at_last_collection, collections;
+  char* sweep_cursor;
+
+  bool markedp(Value* x) {
+    return x->get_mark_unsafe() == mark_bit;
+  }
+
+  void recursive_mark(Value* x) {
+    // TYPENOTE
+    // Done in a while loop to save stack space
+    while(x->pointerp() && !markedp(x)) {
+      live_at_last_collection += x->get_size_unsafe();
+      x->flip_mark_unsafe();
+
+      switch(x->get_type_unsafe()) {
+        // Note that in order to save a little redunancy, objects are marked
+        // based on their structure (eg all objects with two pointers are
+        // marked as though they were pairs)
+
+        // Atomic
+        case NATIVE_FUNCTION: case STRING: case BLOB:
+          return;
+        // One pointer
+        case VECTOR:
+        case BOX:
+          x = static_cast<Box*>(x)->value;
+          continue;
+        // Two pointers 
+        case CLOSURE:
+        case PAIR:
+        case SYMBOL:
+          recursive_mark(static_cast<Pair*>(x)->cdr);
+          x = static_cast<Pair*>(x)->car;
+          continue;
+        // Three pointers
+        case TABLE: case EXCEPTION:
+          recursive_mark(static_cast<Exception*>(x)->tag);
+          recursive_mark(static_cast<Exception*>(x)->message);
+          x = static_cast<Exception*>(x)->irritants;
+          continue;
+        // Four pointers
+        case PROTOTYPE:
+          recursive_mark(static_cast<Prototype*>(x)->code);
+          recursive_mark(static_cast<Prototype*>(x)->debuginfo);
+          recursive_mark(static_cast<Prototype*>(x)->local_free_variables);
+          recursive_mark(static_cast<Prototype*>(x)->upvalues);
+          recursive_mark(static_cast<Prototype*>(x)->name);
+          x = static_cast<Prototype*>(x)->constants;
+          continue;
+        // Special types
+        case VECTOR_STORAGE: {
+          VectorStorage* s = static_cast<VectorStorage*>(x);
+          if(s->length) {
+            for(size_t i = 0; i != s->length - 1; i++) {
+              recursive_mark(s->data[i]);
+            }
+            x = s->data[s->length - 1];
+          }
+          continue;
+        }
+        case UPVALUE: { 
+          x = x->upvalue();
+          continue;
+        }
+        default:
+          PIP_FAIL0("recursive_mark got bad type " << x->get_type());
+      }
+    }
+  }
+
+  // This really is the meat of the garbage collector. It's just a
+  // first fit allocator that makes sure things are appropriately marked.
+  char* findfree(size_t required) {
+    char* address = NULL;
+    Value* sweep_cursor_v = NULL, *address_v = NULL;
+    Block* block = NULL;
+
+    while(block_cursor != blocks.size()) {
+
+      block = blocks[block_cursor];
+
+      PIP_ASSERT(sweep_cursor >= block->begin && sweep_cursor <= block->end);
+      while(sweep_cursor != block->end) {
+        sweep_cursor_v = (Value*) sweep_cursor;
+        // If this space is used, skip it
+        if(markedp(sweep_cursor_v)) {
+          sweep_cursor += sweep_cursor_v->get_size_unsafe();
+          sweep_cursor_v = (Value*) sweep_cursor;
+          // Should never go past the end of the heap
+          PIP_ASSERT(sweep_cursor <= block->end);
+          continue;
+        }
+
+        // Free space, figure out how large it is
+        size_t hole_size = sweep_cursor_v->get_size_unsafe();
+        // Should never have a hole that can't fit object prefix
+        PIP_ASSERT(hole_size >= sizeof(Value));
+      
+        // If the hole is not big enough, see if we can coalesce holes
+        // in front of it
+        while(hole_size < required) {
+          Value* next = (Value*) (sweep_cursor + hole_size);
+
+          if(next == (Value*) block->end) {
+            break;
+          }
+          PIP_ASSERT((char*)next <= block->end);
+
+          if(!markedp(next)) {
+            hole_size += next->get_size_unsafe();
+            sweep_cursor_v->set_size_unsafe(hole_size);
+          } else {
+            // End of the hole
+            break;
+          }
+        }
+
+        // If the hole is now large enough
+        if(hole_size >= required) {
+          // Take what we need from the front
+          address = sweep_cursor;
+          sweep_cursor += required;
+          sweep_cursor_v = (Value*) sweep_cursor;
+          // If the new hole is not large enough to hold an object, we
+          // will just append it to the end of this object
+          size_t new_hole_size = hole_size - required;
+          if(new_hole_size < sizeof(Value)+sizeof(size_t)) {
+            sweep_cursor += new_hole_size;
+            sweep_cursor_v = (Value*) sweep_cursor;
+          } else {
+            // If it is large enough, update size info
+            sweep_cursor_v->set_size_unsafe(new_hole_size);
+            sweep_cursor_v->set_header_unsafe(TRANSIENT, false, mark_bit);
+            PIP_ASSERT(!markedp(sweep_cursor_v));
+          }
+
+          // Determine how much memory we actually allocated
+          size_t actual_size = (size_t) (sweep_cursor - address);
+          address_v = (Value*) address;
+          memset(address, 0, actual_size);
+          address_v->set_size_unsafe(actual_size);
+          // Ensure object is marked (since we cleared it, it may or may
+          // not be considered marked based on mark_bit)
+          if(!markedp(address_v))
+            address_v->flip_mark_unsafe();
+
+          PIP_ASSERT(address_v->get_size_unsafe() == actual_size);
+          PIP_ASSERT(markedp(address_v));
+
+          // Done!
+          break;
+        }
+
+        // The hole is not big enough, mark as used and move on
+        sweep_cursor_v->flip_mark_unsafe();
+        PIP_ASSERT(markedp(sweep_cursor_v));
+      
+        sweep_cursor += hole_size;
+        sweep_cursor_v = (Value*) sweep_cursor;
+      }
+
+      // break out of inner loop
+      if(address) break;
+
+      block_cursor++;
+
+      if(block_cursor != blocks.size())
+        sweep_cursor = blocks[block_cursor]->begin;
+    }
+
+    // Addresses returned should always be marked as used
+    if(address)
+      PIP_ASSERT(markedp(address_v));
+    return address;
+  }
+
+  // If collection is called early, finish iterating over and marking the heap
+  void finish_mark() {
+    while(block_cursor != blocks.size()) {
+      Block* b = blocks[block_cursor];
+      PIP_ASSERT(sweep_cursor >= b->begin && sweep_cursor <= b->end);
+      while(sweep_cursor != b->end) {
+        Value* sweep_cursor_v = (Value*) sweep_cursor;
+        if(!markedp(sweep_cursor_v)) {
+          sweep_cursor_v->flip_mark_unsafe();
+          PIP_ASSERT(markedp(sweep_cursor_v));
+        }
+        sweep_cursor += sweep_cursor_v->get_size_unsafe();
+        PIP_ASSERT(sweep_cursor <= b->end);
+      }
+      block_cursor++;
+      if(block_cursor != blocks.size())
+        sweep_cursor = blocks[block_cursor]->begin;
+    }
+  }
+
+  // Mark all live memory
+  void mark_heap() {
+    // Symbols are roots (for now)
+    for(Frame* f = frame_list; f != NULL; f = f->previous)
+      for(size_t i = 0; i != f->root_count; i++)
+        recursive_mark(*f->roots[i]);
+
+    for(Handle<Value>* i = handle_list; i != NULL; i = i->previous)
+      recursive_mark(i->ref);
+    
+    for(size_t i = 0; i != vm_frames.size(); i++) {
+      VMFrame* f = vm_frames[i];
+      // Mark prototype
+      recursive_mark(f->p);
+      // Mark closure
+      recursive_mark(f->c);
+      // Mark function stack
+      for(size_t j = 0; j != f->si; j++) {
+        recursive_mark(f->stack[j]);
+      }
+      // Mark local variables
+      for(size_t j = 0; j != f->p->locals; j++) {
+        recursive_mark(f->locals[j]);
+      }
+      // Mark upvalues (if necessary)
+      for(size_t j = 0; j != f->p->local_free_variable_count; j++) {
+        recursive_mark(f->upvalues[j]);
+      }
+    }
+  }
+  
+  void reset_sweep_cursor() {
+    sweep_cursor = blocks[0]->begin;
+    block_cursor = 0;
+  }
+
+  void collect(size_t request = 0, bool force_request = false) {
+    collections++;
+
+    // If collection is called early, we have to sweep over everything
+    // and make sure it's marked as used
+    finish_mark();
+
+    // Reset sweep cursor
+    reset_sweep_cursor();
+
+    // If growth is necessary
+
+    // Determine whether we should grow
+    // This will happen if
+    // a) Most of the heap is in use
+    // b) A collection has failed to free up enough space for an allocation
+
+    size_t pressure = (live_at_last_collection * 100) / heap_size;
+    if(pressure >= PIP_LOAD_FACTOR || force_request) {
+      // We're gonna grow
+      size_t new_block_size = (heap_size);
+    
+      PIP_ASSERT(new_block_size >= request);
+
+      // Make absolutely sure we can accomodate that request
+      if(new_block_size < request)
+        new_block_size = align(PIP_HEAP_ALIGNMENT, (heap_size) + request);
+
+      Block* b = new Block(new_block_size, true, mark_bit);
+      blocks.push_back(b);
+
+      //PIP_ASSERT(!markedp((Value*)b->begin));
+
+      heap_size += new_block_size;
+
+      PIP_GC_MSG("growing heap from " <<
+          FriendlySize(heap_size - new_block_size)
+          << " to " << FriendlySize(heap_size)
+          << " because of " <<
+          (pressure >= PIP_LOAD_FACTOR ? "pressure" : "allocation failure"));
+    }
+
+    live_at_last_collection = 0;
+
+    // This is the beauty of the mark-and-don't-sweep algorithm. All
+    // the work has been done by the allocator, so now all we have to
+    // do is flip the mark bit so all memory is considered dead. Then
+    // we immediately mark live memory, and collection is done. No
+    // sweep required.
+    
+    // Flip mark bit so now all dead memory is known
+    mark_bit = !mark_bit;
+
+    // Mark all live memory
+    mark_heap();
+  }
+
+  // Allocation
+  Value* allocate(Type type, size_t size) {
+    if(collect_before_every_allocation) {
+      collect();
+    }
+  
+    // This function calls findfree and does some minor tweaks before
+    // and after
+
+    // Align along pointer-sized boundary to ensure that our immediate
+    // value scheme will work.
+    size = align(POINTER_ALIGNMENT, size);
+
+    if(size >= PIP_HEAP_ALIGNMENT) {
+      size = align(PIP_HEAP_ALIGNMENT, size);
+      Block* block = new Block(size, false, mark_bit);
+      blocks.push_back(block);
+      Value* x = (Value*) block->begin;
+      x->set_type_unsafe(type);
+      x->flip_mark_unsafe();
+      PIP_ASSERT(markedp(x));
+
+      heap_size += size;
+
+      PIP_GC_MSG("growing heap from " << FriendlySize(heap_size - size)
+        << " to " << FriendlySize(heap_size)
+        << " because of large object allocation");
+
+      return x;
+    }
+
+    // Try finding memory
+    char* address = findfree(size);
+
+    if(!address) {
+      collect(size);
+      address = findfree(size);
+      if(!address) {
+        collect(size, true);
+        address = findfree(size);
+        if(!address) {
+          std::cerr << "could not allocate " << size << " bytes " << std::endl;
+          // TODO: A graceful out
+          PIP_ASSERT(!"out of memory");
+        }
+      }
+    }
+
+    Value* x = (Value*) address;
+
+    x->set_type_unsafe(type);
+
+    PIP_ASSERT(x->get_size_unsafe() >= size);
+    PIP_ASSERT(markedp(x));
+    PIP_ASSERT(x->get_type_unsafe() == type);
+    PIP_ASSERT(x->pointerp());
+
+    return x;
+  }
+  
+  // The actual entry point of the garbage collector
+  template <class T> T* allocate(ptrdiff_t additional = 0) {
+    return static_cast<T*>(allocate(static_cast<Type>(T::CLASS_TYPE),
+                           sizeof(T) + additional));
+  }
+
+  ///// COMPACTION
+
+  // Determine the minimum size of an object; used to remove fragmentation
+  // while compacting
+  static size_t minimum_size(Value* x) {
+    // TYPENOTE
+    size_t size = 0;
+    switch(x->get_type()) {
+      // Simple cases
+      case SYMBOL: size = sizeof(Symbol); break;
+      case VECTOR: size = sizeof(Vector); break;
+      case EXCEPTION: size = sizeof(Exception); break;
+      case CLOSURE: size = sizeof(Closure); break;
+      case PROTOTYPE: size = sizeof(Prototype); break; 
+      case UPVALUE: size = sizeof(Upvalue); break;
+      case NATIVE_FUNCTION: size =  sizeof(NativeFunction); break;
+      case TABLE: size = sizeof(Table); break;
+      case PAIR:
+        size = sizeof(Pair) + src_size<Pair>(x->pair_has_source());
+        break;
+      case BOX:
+        size = sizeof(Box) + src_size<Box>(x->box_has_source());
+        break;
+      case VECTOR_STORAGE:
+        size = sizeof(VectorStorage) +
+               array_size<Value*>(static_cast<VectorStorage*>(x)->length);
+        break;
+      case STRING: {
+        size = sizeof(String) + 
+               array_size<unsigned char>(static_cast<String*>(x)->length);
+        break;
+      }
+      case BLOB:
+        size = sizeof(Blob) + 
+               array_size<unsigned char>(static_cast<Blob*>(x)->length);
+        break;
+        // Should not occur
+      case TRANSIENT: case FIXNUM: case CONSTANT:
+        PIP_FAIL0("minimum_size type should not occur: " << x->get_type());
+     }
+     return align(POINTER_ALIGNMENT, size);
+   }
+
+  void update_forward(Value** ref) {
+    Value* obj = *ref;
+    // If object is immedate or pointer has already been updated, no need to
+    // deal with it
+    if(obj->immediatep() || obj->header != TRANSIENT) return;
+    // Update pointer
+    (*ref) = ((Value*) obj->size);
+  }
+
+  void compact() {
+    // Quick collection
+    finish_mark();
+    reset_sweep_cursor();
+    mark_bit = !mark_bit;
+    mark_heap();
+
+    // Create a new block to copy the heap to
+    Block* heap = new Block(align(PIP_HEAP_ALIGNMENT, heap_size),
+                            false, mark_bit);
+
+    // Loop over live memory, allocating from the new block. The new allocation
+    // is called the "forwarded object" and the object's 'size" field is
+    // re-used to store a pointer to this forwarded object. (The newly
+    // allocated object contains the size information, for when it's needed)
+
+    char* bump = heap->begin;
+
+    PIP_GC_MSG("copying heap");
+    // TODO: Sweep code is duplicated 3-4 times. 
+    while(block_cursor != blocks.size()) {
+      Block* b = blocks[block_cursor];
+      while(sweep_cursor != b->end) {
+        Value* sweep_cursor_v = (Value*) sweep_cursor;
+
+        if(markedp(sweep_cursor_v)) {
+          // Bump allocate from the new heap
+          Value* copy = (Value*) bump;
+          size_t min_size = minimum_size(sweep_cursor_v);
+          bump += min_size;
+
+          memcpy(copy, sweep_cursor_v, min_size);
+          copy->size = min_size;
+          // Increment before we delete the object's size
+          sweep_cursor += sweep_cursor_v->size;
+          // Install forwarding pointer
+          sweep_cursor_v->size = (size_t) copy;
+
+          sweep_cursor_v->header = TRANSIENT;
+        } else {
+          sweep_cursor += sweep_cursor_v->get_size_unsafe();
+        }
+      }
+      block_cursor++;
+      if(block_cursor != blocks.size())
+        sweep_cursor = blocks[block_cursor]->begin;
+    }
+
+    // Now that every object has been copied, we just need to update pointers.
+
+    // First we'll sweep through the program's roots, then we'll sweep over the
+    // heap (which can be easily iterated over at this point),  checking every
+    // object's field for a forwarded pointer.
+
+    PIP_GC_MSG("updating roots with new pointers");
+
+    for(Frame* f = frame_list; f != NULL; f = f->previous)
+      for(size_t i = 0; i != f->root_count; i++)
+        update_forward(f->roots[i]);
+
+    for(Handle<Value>* i = handle_list; i != NULL; i = i->previous)
+      update_forward(&i->ref);
+    
+    for(size_t i = 0; i != vm_frames.size(); i++) {
+      VMFrame* f = vm_frames[i];
+      // Mark prototype
+      update_forward((Value**) &f->p);
+      // Mark closure
+      update_forward((Value**) &f->c);
+      // Mark function stack
+      for(size_t j = 0; j != f->si; j++) {
+        update_forward(&f->stack[j]);
+      }
+      // Mark local variables
+      for(size_t j = 0; j != f->p->locals; j++) {
+        update_forward(&f->locals[j]);
+      }
+      // Mark upvalues (if necessary)
+      for(size_t j = 0; j != f->p->local_free_variable_count; j++) {
+        update_forward((Value**)&f->upvalues[j]);
+      }
+    }
+
+    PIP_GC_MSG("updating heap with new pointers");
+    char* sweep = heap->begin;
+    while(sweep != bump) {
+      Value* x = (Value*) sweep;
+      sweep += x->size;
+#define PIP_FWD(type, field) update_forward((Value**) &(((type*) x)->field))
+      switch(x->get_type_unsafe()) {
+        // TYPENOTE
+        // Atomic
+        case NATIVE_FUNCTION: case STRING: case BLOB:
+          continue;
+        // One pointer
+        case VECTOR:
+        case BOX:
+          PIP_FWD(Box, value);
+          continue;
+        // Two pointers
+        case CLOSURE:
+        case PAIR:
+        case SYMBOL:
+          update_forward(&((Pair*) x)->car);
+          update_forward(&((Pair*) x)->cdr);
+          continue;
+        // Three pointers
+        case TABLE: case EXCEPTION:
+          PIP_FWD(Exception, tag);
+          PIP_FWD(Exception, message);
+          PIP_FWD(Exception, irritants);
+          continue;
+        // Five pointers
+        case PROTOTYPE:
+          PIP_FWD(Prototype, code);
+          PIP_FWD(Prototype, debuginfo);
+          PIP_FWD(Prototype, local_free_variables);
+          PIP_FWD(Prototype, upvalues);
+          PIP_FWD(Prototype, name);
+          continue;
+        case VECTOR_STORAGE: {
+          VectorStorage* s = static_cast<VectorStorage*>(x);
+          if(s->length) {
+            for(size_t i = 0; i != s->length; i++) {
+              update_forward(&s->data[i]);
+            }
+          }
+          continue;
+        }
+        case UPVALUE:
+          if(x->upvalue_closed()) {
+            update_forward(((Upvalue*) x)->local);
+          } else {
+            update_forward(&((Upvalue*) x)->converted);
+          }
+          continue;
+        default: case TRANSIENT: case FIXNUM: case CONSTANT:
+          PIP_FAIL0("compact encountered bad type: " << x->get_type()); 
+#undef PIP_FWD
+      }
+    }
+
+    PIP_GC_MSG("forwarded all program roots");
+    
+    // Delete heap and replace with new heap
+    delete_blocks();
+    blocks.push_back(heap);
+    reset_sweep_cursor();
+
+    // Note the size of the hole at the end of the heap
+    // Ensure we have enough room at the end for a Value
+    PIP_ASSERT((size_t)(heap->end - bump) >= align(POINTER_ALIGNMENT,
+          sizeof(Value*)));
+    // Determine the size
+    Value* hole = (Value*) bump;
+    hole->header = TRANSIENT;
+    hole->size = (heap->end - bump);
+  }
+
+  ///// RUNTIME
   State(): 
-
     // Garbage collector
     handle_list(0),
     frame_list(0), 
-    collect_before_every_allocation(false), heap_size(PIP_HEAP_ALIGNMENT),
-    mark_bit(1), block_cursor(0), sweep_cursor(0), live_at_last_collection(0),
-    collections(0),
+    collect_before_every_allocation(false), mark_bit(1),
+    heap_size(PIP_HEAP_ALIGNMENT),
+    block_cursor(0),  live_at_last_collection(0), collections(0),
+    sweep_cursor(0),
 
+    symbol_table(*this),
     // Reader
     source_counter(1),
    
@@ -638,8 +1399,17 @@ struct State {
       "quasiquote",
       "unquote",
       "unquote-splicing",
-      "define-syntax"
+      "define-syntax",
+      "let-syntax",
+      "letrec-syntax",
+      "define-library",
+      "import",
+      "export",
+      "rename",
+      "include"
     };
+
+    symbol_table = make_table();
 
     for(size_t i = 0; i != GLOBAL_SYMBOL_COUNT; i++) {
       Value* s = make_symbol(global_symbols[i]);
@@ -656,7 +1426,7 @@ struct State {
 
     vector_append(*global_env, PIP_FALSE);
 
-    for(size_t i = S_DEFINE; i != S_QUOTE+1; i++) {
+    for(size_t i = S_DEFINE; i != S_DEFINE_LIBRARY+1; i++) {
       vector_append(*global_env, global_symbol(static_cast<Global>(i)));
       vector_append(*global_env, global_symbol(S_SPECIAL));
     }
@@ -680,10 +1450,7 @@ struct State {
     blocks.clear();
   }
 
-  ///// RUNTIME
-  typedef unordered_map<std::string, Symbol*> symbol_table_t;
-
-  symbol_table_t symbol_table;
+  Handle<Table> symbol_table;
   std::vector<Handle<Value> *> globals;
 
   enum Global {
@@ -705,6 +1472,13 @@ struct State {
     S_UNQUOTE,
     S_UNQUOTE_SPLICING,
     S_DEFINE_SYNTAX,
+    S_LET_SYNTAX,
+    S_LETREC_SYNTAX,
+    S_DEFINE_LIBRARY,
+    S_IMPORT,
+    S_EXPORT,
+    S_RENAME,
+    S_INCLUDE,
     GLOBAL_SYMBOL_COUNT
   };
 
@@ -719,13 +1493,18 @@ struct State {
   // Returns how much memory to subtract if an object will not contain source
   // code information
   template <class T> 
-  static ptrdiff_t src_size(bool yes) { return yes ? 0 : -(sizeof(((T*)0)->src)); }
+  static ptrdiff_t src_size(bool yes) {
+    return yes ? 0 : -(sizeof(((T*)0)->src));
+  }
 
   // Returns how much memory to use when an object contains an array at the end
   template <class T>
-  static ptrdiff_t array_size(size_t elts) { return (sizeof(T) * elts) - sizeof(T); }
+  static ptrdiff_t array_size(size_t elts) {
+    return (sizeof(T) * elts) - sizeof(T);
+  }
 
-  Box* make_box(Value* value, bool has_source_info, unsigned file = 0, unsigned line = 0) {
+  Box* make_box(Value* value, bool has_source_info, unsigned file = 0,
+                unsigned line = 0) {
     Box* box = 0;
     PIP_S_FRAME(value, box);
     box = allocate<Box>(src_size<Box>(has_source_info));
@@ -738,7 +1517,8 @@ struct State {
     return box;
   }
 
-  Pair* cons(Value* car, Value* cdr, bool has_source_info = false, unsigned file = 0, unsigned line = 0) {
+  Pair* cons(Value* car, Value* cdr, bool has_source_info = false,
+            unsigned file = 0, unsigned line = 0) {
     Pair* p = NULL;
     PIP_S_FRAME(p, car, cdr);
     p = allocate<Pair>(src_size<Pair>(has_source_info));
@@ -782,27 +1562,33 @@ struct State {
     return str;
   }
 
-  Symbol* make_symbol(const std::string& str) {
+  String* make_string(String* copy) {
+    String* str = allocate<String>(copy->string_length());
+    memcpy(str->data, copy->data, copy->string_length());
+    str->length = copy->length;
+    return str;
+  }
+
+  Symbol* make_symbol(String* string) {
     Symbol* sym = 0;
-    symbol_table_t::const_iterator g = symbol_table.find(str);
-    // Intern symbol if it hasn't already been
-    if(g == symbol_table.end()) {
-      String* ostr = 0;
-      PIP_S_FRAME(sym, ostr);
+    bool found;
+    Value* search = table_get(*symbol_table, string, found);
+    if(!found) {
+      // Symbol doesn't exist yet, intern it
+      String* cpy = 0;
+      PIP_S_FRAME(sym, string, cpy);
       sym = allocate<Symbol>();
-      ostr = make_string(str.c_str());
-      sym->name = ostr;
-      std::pair<std::string, Symbol*> pair(str,sym);
-      symbol_table.insert(pair);
+      cpy = make_string(string);
+      sym->name = cpy;
+      table_set(*symbol_table, cpy, sym);
     } else {
-      sym = g->second;
+      sym = PIP_CAST(Symbol, search);
     }
     return sym;
   }
 
-  Symbol* make_symbol(String* string) {
-    std::string str(string->string_data());
-    return make_symbol(str);
+  Symbol* make_symbol(const std::string& str) {
+    return make_symbol(make_string(str));
   }
 
   Vector* make_vector(unsigned capacity = 2) {
@@ -849,14 +1635,17 @@ struct State {
       case SYMBOL:
         return a == b;
       case STRING:
+        std::cout << "EQUALS: " << a << ' ' << b << std::endl << (strcmp(PIP_CAST(String, a)->data, PIP_CAST(String, b)->data) == 0) << std::endl;
         return strcmp(PIP_CAST(String, a)->data, PIP_CAST(String, b)->data) == 0;
+      default: break;
     }
     std::cerr << "equals not implemented for type " << a->get_type();
     PIP_ASSERT(!"equals not implemented for type");
     return false;
   }
 
-  void defun(const std::string& cname, NativeFunction::ptr_t ptr, unsigned arguments, bool variable_arity) {
+  void defun(const std::string& cname, NativeFunction::ptr_t ptr,
+             unsigned arguments, bool variable_arity) {
     NativeFunction* fn = 0;
     Symbol* name = 0;
     PIP_S_FRAME(fn, name);
@@ -864,7 +1653,8 @@ struct State {
     fn->arguments = arguments;
     fn->pointer = ptr;
     if(variable_arity) 
-      fn->set_header_bit(NATIVE_FUNCTION, Value::NATIVE_FUNCTION_VARIABLE_ARITY_BIT);
+      fn->set_header_bit(NATIVE_FUNCTION,
+                         Value::NATIVE_FUNCTION_VARIABLE_ARITY_BIT);
     name = make_symbol(cname);
     env_def(*global_env, name, global_symbol(S_VARIABLE));
     name->value = fn;
@@ -874,10 +1664,10 @@ struct State {
     VectorStorage* data = 0;
     PIP_S_FRAME(old, data);
 
-    data = allocate<VectorStorage>((capacity * sizeof(Value*)) - sizeof(Value*));
+    data = allocate<VectorStorage>(array_size<Value*>(capacity));
     if(old) {
       data->length = old->length;
-      memcpy(data->data, old->data, data->length * sizeof(Value*));
+      memcpy(data->data, old->data, old->length * sizeof(Value*));
     }
     return data;
   }
@@ -887,11 +1677,8 @@ struct State {
     if(vec->storage->length == vec->capacity) {
       VectorStorage* s = 0;
       PIP_S_FRAME(vec, s);
-      size_t capacity = vec->capacity * 2;
-      s = allocate<VectorStorage>(array_size<Value*>(capacity));
-      memcpy(s->data, vec->storage->data, (vec->storage->length * sizeof(Value*)));
-      s->length = vec->storage->length;
-      vec->capacity = capacity;
+      s = vector_storage_realloc(vec->capacity * 2, vec->storage);
+      vec->capacity *= 2;
       vec->storage = s;
     }
     return vec->storage->length - 1;
@@ -905,12 +1692,14 @@ struct State {
     }
   }
 
-  void format_source_error(Value* exp, const std::string& msg, std::string& out) {
+  void format_source_error(Value* exp, const std::string& msg,
+                          std::string& out) {
     SourceInfo info;
     unwrap_source_info(exp, info);
     if(info.file) {
       std::ostringstream ss;
-      ss << source_names[info.file] << ':' << info.line << ": " << msg << std::endl << "  " << source_contents[info.file]->at(info.line-1);
+      ss << source_names[info.file] << ':' << info.line << ": " << msg << 
+        std::endl << "  " << source_contents[info.file]->at(info.line-1);
       out = ss.str();
     } else {
       out = msg;
@@ -1062,7 +1851,8 @@ struct State {
 
     // Round new buckets to nearest power of 2
     unsigned x = new_buckets;
-    (--(x), (x)|=(x)>>1, (x)|=(x)>>2, (x)|=(x)>>4, (x)|=(x)>>8, (x)|=(x)>>16, ++(x));
+    --x;
+    (x)|=(x)>>1, (x)|=(x)>>2, (x)|=(x)>>4, (x)|=(x)>>8, (x)|=(x)>>16, ++(x);
     new_buckets = x;
 
     if(new_buckets < 4)
@@ -1172,7 +1962,9 @@ struct State {
       step = table_step(hashed, mask);
       last = i;
       // Search table
-      while((!table_flag_empty(table->flags, i) && (table_flag_deleted(table->flags, i))) || !equals(table->keys->data[i], key)) {
+      while((!table_flag_empty(table->flags, i) && 
+            (table_flag_deleted(table->flags, i))) ||
+             !equals(table->keys->data[i], key)) {
         i = (i + step) & mask;
         if(i == last)
           return PIP_FALSE;
@@ -1222,7 +2014,9 @@ struct State {
       last = i;
 
       // Search through deleted/colliding buckets for a place to put this
-      while(!table_flag_empty(table->flags, i) && ((table_flag_deleted(table->flags, i)) || !equals(table->keys->data[i], key))) {
+      while(!table_flag_empty(table->flags, i) &&
+           ((table_flag_deleted(table->flags, i)) ||
+            !equals(table->keys->data[i], key))) {
 
         if(table_flag_deleted(table->flags, i))
           site = i;
@@ -1263,662 +2057,6 @@ struct State {
   }
 
 
-  ///// (GC) Garbage collector
-
-  // NOTE: Garbage collector tracking macros are declared above the State
-  // structure
-
-  // <--
-  // Pip's garbage collector is a mark-and-don't-sweep collector. The allocator
-  // is a first-fit allocator: it allocates memory from the first appropriately
-  // sized free chunk of memory it can find. It marks every chunk of memory it
-  // sweeps over (or, if the chunk is already marked, it skips it). When the
-  // allocator reaches the end of the heap, the meaning of the mark bit is
-  // flipped, and the entire heap is considered garbage. Then the collector
-  // immediately marks all live memory, and we know which objects are marked. The
-  // benefit of a mark-and-don't-sweep collector is that the work is spread out
-  // amongst allocations and should (in most cases) result in no large pauses to
-  // the program. It requires no external data structures; the only overhead
-  // being that each object needs a "size" and "mark" field (and in Pip's case,
-  // the mark field is stored alongside type and other flags in a space efficient
-  // manner). The main downside is fragmentation.
-
-  // How does Pip mark live memory? It starts with the program's "roots" and
-  // marks all their children and so on. But how do we find the roots? They are
-  // explicitly registered with the garbage collector using two methods: Frames
-  // and Handles. A Frame is a stack-allocated structure that keeps track of as
-  // many variables as needed. You create a frame in each function you want to
-  // track variables in like so: PIP_FRAME(var1, var2). A Handle is a
-  // heap-allocated structure that keeps track of one variable, and is useful
-  // when your variables have lifetimes beyond the execution of a single
-  // function.
-
-  // How does Pip get memory from the operating system? It starts by using a
-  // small amount of memory (4 kilobytes). If, after a collection, more than a
-  // certain amount of memory is in use (the "load factor", by default 77%), it
-  // allocates twice as much memory. It can also allocate more memory if a very
-  // large object (over 4kb) is allocated.
-
-  // In addition to normal collection, Pip has support for doing a full
-  // compaction on the heap, reducing fragmentation to 0. Currently, this can
-  // only be used manually and only at the top-level of program execution. So
-  // although it might not benefit a normal program's execution, it could be used
-  // eg while a game is loading levels to prevent fragmentation over time
-  // --> 
-
-  static const size_t POINTER_ALIGNMENT = sizeof(void*);
-
-  // Handles are auto-tracked heap-allocated pointers
-  template <class T>
-  struct Handle {
-    Handle(State& state_): state(state_), ref(0) {
-      initialize();
-    }
-
-    Handle(State& state_, T* ref_): state(state_), ref(ref_) {
-      initialize();
-    }
-
-    void initialize() {
-      previous = state.handle_list;
-      if(previous)
-        previous->next = (Handle<Value> *) this;
-      state.handle_list = (Handle<Value> *) this;
-      next = 0;
-    }
-
-    ~Handle() {
-      if(previous) previous->next = next;
-      if(next) next->previous = previous;
-      if(state.handle_list == (Handle<Value> *) this) {
-        PIP_ASSERT(!next);
-        state.handle_list = previous;
-      }
-    }
-
-    State& state;
-    T* ref;
-    Handle<Value> *previous, *next;
-  
-    T* operator*() const { return ref; }
-    T* operator->() const { return ref; }
-    void operator=(T* ref_) { ref = ref_; }  
-  };
-
-  struct Block {
-    size_t size;
-    char *begin, *end;
-  
-    Block(size_t size, bool mark, int mark_bit) {
-      begin = (char*) malloc(size);
-      end = begin + size;
-      ((Value*) begin)->set_header_unsafe(TRANSIENT, mark, mark_bit);
-      ((Value*) begin)->set_size_unsafe(size);
-    }
-
-    ~Block() {
-      free(begin);
-    }
-  };
-
-  std::vector<Block*> blocks;
-  Handle<Value>* handle_list;
-  std::vector<VMFrame*> vm_frames;
-  Frame* frame_list;
-  bool collect_before_every_allocation;
-  size_t heap_size, mark_bit, block_cursor, live_at_last_collection, collections;
-  char* sweep_cursor;
-
-  bool markedp(Value* x) {
-    return x->get_mark_unsafe() == mark_bit;
-  }
-
-  void recursive_mark(Value* x) {
-    // TYPENOTE
-    // Done in a while loop to save stack space
-    while(x->pointerp() && !markedp(x)) {
-      live_at_last_collection += x->get_size_unsafe();
-      x->flip_mark_unsafe();
-
-      switch(x->get_type_unsafe()) {
-        // Note that in order to save a little redunancy, objects are marked
-        // based on their structure (eg all objects with two pointers are
-        // marked as though they were pairs)
-
-        // Atomic
-        case NATIVE_FUNCTION: case STRING: case BLOB:
-          return;
-        // One pointer
-        case VECTOR:
-        case BOX:
-          x = static_cast<Box*>(x)->value;
-          continue;
-        // Two pointers 
-        case CLOSURE:
-        case PAIR:
-        case SYMBOL:
-          recursive_mark(static_cast<Pair*>(x)->cdr);
-          x = static_cast<Pair*>(x)->car;
-          continue;
-        // Three pointers
-        case TABLE: case EXCEPTION:
-          recursive_mark(static_cast<Exception*>(x)->tag);
-          recursive_mark(static_cast<Exception*>(x)->message);
-          x = static_cast<Exception*>(x)->irritants;
-          continue;
-        // Four pointers
-        case PROTOTYPE:
-          recursive_mark(static_cast<Prototype*>(x)->code);
-          recursive_mark(static_cast<Prototype*>(x)->debuginfo);
-          recursive_mark(static_cast<Prototype*>(x)->local_free_variables);
-          recursive_mark(static_cast<Prototype*>(x)->upvalues);
-          recursive_mark(static_cast<Prototype*>(x)->name);
-          x = static_cast<Prototype*>(x)->constants;
-          continue;
-        // Special types
-        case VECTOR_STORAGE: {
-          VectorStorage* s = static_cast<VectorStorage*>(x);
-          if(s->length) {
-            for(size_t i = 0; i != s->length - 1; i++) {
-              recursive_mark(s->data[i]);
-            }
-            x = s->data[s->length - 1];
-          }
-          continue;
-        }
-        case UPVALUE: { 
-          x = x->upvalue();
-          continue;
-        }
-        default: std::cerr << x->get_type() << std::endl; PIP_ASSERT(!"recursive_mark bad;"); return;
-      }
-    }
-  }
-
-  // This really is the meat of the garbage collector. It's just a
-  // first fit allocator that makes sure things are appropriately marked.
-  char* findfree(size_t required) {
-    char* address = NULL;
-    Value* sweep_cursor_v = NULL, *address_v = NULL;
-    Block* block = NULL;
-
-    while(block_cursor != blocks.size()) {
-
-      block = blocks[block_cursor];
-
-      PIP_ASSERT(sweep_cursor >= block->begin && sweep_cursor <= block->end);
-      while(sweep_cursor != block->end) {
-        sweep_cursor_v = (Value*) sweep_cursor;
-        // If this space is used, skip it
-        if(markedp(sweep_cursor_v)) {
-          sweep_cursor += sweep_cursor_v->get_size_unsafe();
-          sweep_cursor_v = (Value*) sweep_cursor;
-          // Should never go past the end of the heap
-          PIP_ASSERT(sweep_cursor <= block->end);
-          continue;
-        }
-
-        // Free space, figure out how large it is
-        size_t hole_size = sweep_cursor_v->get_size_unsafe();
-        // Should never have a hole that can't fit object prefix
-        PIP_ASSERT(hole_size >= sizeof(Value));
-      
-        // If the hole is not big enough, see if we can coalesce holes
-        // in front of it
-        while(hole_size < required) {
-          Value* next = (Value*) (sweep_cursor + hole_size);
-
-          if(next == (Value*) block->end) {
-            break;
-          }
-          PIP_ASSERT((char*)next <= block->end);
-
-          if(!markedp(next)) {
-            hole_size += next->get_size_unsafe();
-            sweep_cursor_v->set_size_unsafe(hole_size);
-          } else {
-            // End of the hole
-            break;
-          }
-        }
-
-        // If the hole is now large enough
-        if(hole_size >= required) {
-          // Take what we need from the front
-          address = sweep_cursor;
-          sweep_cursor += required;
-          sweep_cursor_v = (Value*) sweep_cursor;
-          // If the new hole is not large enough to hold an object, we
-          // will just append it to the end of this object
-          size_t new_hole_size = hole_size - required;
-          if(new_hole_size < sizeof(Value)+sizeof(size_t)) {
-            sweep_cursor += new_hole_size;
-            sweep_cursor_v = (Value*) sweep_cursor;
-          } else {
-            // If it is large enough, update size info
-            sweep_cursor_v->set_size_unsafe(new_hole_size);
-            sweep_cursor_v->set_header_unsafe(TRANSIENT, false, mark_bit);
-            PIP_ASSERT(!markedp(sweep_cursor_v));
-          }
-
-          // Determine how much memory we actually allocated
-          size_t actual_size = (size_t) (sweep_cursor - address);
-          address_v = (Value*) address;
-          memset(address, 0, actual_size);
-          address_v->set_size_unsafe(actual_size);
-          // Ensure object is marked (since we cleared it, it may or may
-          // not be considered marked based on mark_bit)
-          if(!markedp(address_v))
-            address_v->flip_mark_unsafe();
-
-          PIP_ASSERT(address_v->get_size_unsafe() == actual_size);
-          PIP_ASSERT(markedp(address_v));
-
-          // Done!
-          break;
-        }
-
-        // The hole is not big enough, mark as used and move on
-        sweep_cursor_v->flip_mark_unsafe();
-        PIP_ASSERT(markedp(sweep_cursor_v));
-      
-        sweep_cursor += hole_size;
-        sweep_cursor_v = (Value*) sweep_cursor;
-      }
-
-      // break out of inner loop
-      if(address) break;
-
-      block_cursor++;
-
-      if(block_cursor != blocks.size())
-        sweep_cursor = blocks[block_cursor]->begin;
-    }
-
-    // Addresses returned should always be marked as used
-    if(address)
-      PIP_ASSERT(markedp(address_v));
-    return address;
-  }
-
-  // If collection is called early, finish iterating over and marking the heap
-  void finish_mark() {
-    while(block_cursor != blocks.size()) {
-      Block* b = blocks[block_cursor];
-      PIP_ASSERT(sweep_cursor >= b->begin && sweep_cursor <= b->end);
-      while(sweep_cursor != b->end) {
-        Value* sweep_cursor_v = (Value*) sweep_cursor;
-        if(!markedp(sweep_cursor_v)) {
-          sweep_cursor_v->flip_mark_unsafe();
-          PIP_ASSERT(markedp(sweep_cursor_v));
-        }
-        sweep_cursor += sweep_cursor_v->get_size_unsafe();
-        PIP_ASSERT(sweep_cursor <= b->end);
-      }
-      block_cursor++;
-      if(block_cursor != blocks.size())
-        sweep_cursor = blocks[block_cursor]->begin;
-    }
-  }
-
-  // Mark all live memory
-  void mark_heap() {
-    // Symbols are roots (for now)
-    for(symbol_table_t::iterator i = symbol_table.begin(); i != symbol_table.end(); i++)
-      recursive_mark(i->second);
-
-    for(Frame* f = frame_list; f != NULL; f = f->previous)
-      for(size_t i = 0; i != f->root_count; i++)
-        recursive_mark(*f->roots[i]);
-
-    for(Handle<Value>* i = handle_list; i != NULL; i = i->previous)
-      recursive_mark(i->ref);
-    
-    for(size_t i = 0; i != vm_frames.size(); i++) {
-      VMFrame* f = vm_frames[i];
-      // Mark prototype
-      recursive_mark(f->p);
-      // Mark closure
-      recursive_mark(f->c);
-      // Mark function stack
-      for(size_t j = 0; j != f->si; j++) {
-        recursive_mark(f->stack[j]);
-      }
-      // Mark local variables
-      for(size_t j = 0; j != f->p->locals; j++) {
-        recursive_mark(f->locals[j]);
-      }
-      // Mark upvalues (if necessary)
-      for(size_t j = 0; j != f->p->local_free_variable_count; j++) {
-        recursive_mark(f->upvalues[j]);
-      }
-    }
-  }
-  
-  void reset_sweep_cursor() {
-    sweep_cursor = blocks[0]->begin;
-    block_cursor = 0;
-  }
-
-  void collect(size_t request = 0, bool force_request = false) {
-    collections++;
-
-    // If collection is called early, we have to sweep over everything
-    // and make sure it's marked as used
-    finish_mark();
-
-    // Reset sweep cursor
-    reset_sweep_cursor();
-
-    // If growth is necessary
-
-    // Determine whether we should grow
-    // This will happen if
-    // a) Most of the heap is in use
-    // b) A collection has failed to free up enough space for an allocation
-
-    size_t pressure = (live_at_last_collection * 100) / heap_size;
-    if(pressure >= PIP_LOAD_FACTOR || force_request) {
-      // We're gonna grow
-      size_t new_block_size = (heap_size);
-    
-      PIP_ASSERT(new_block_size >= request);
-
-      // Make absolutely sure we can accomodate that request
-      if(new_block_size < request)
-        new_block_size = align(PIP_HEAP_ALIGNMENT, (heap_size) + request);
-
-      Block* b = new Block(new_block_size, true, mark_bit);
-      blocks.push_back(b);
-
-      //PIP_ASSERT(!markedp((Value*)b->begin));
-
-      heap_size += new_block_size;
-
-      PIP_GC_MSG("growing heap from " << FriendlySize(heap_size - new_block_size) << " to " << FriendlySize(heap_size)
-                 << " because of " << (pressure >= PIP_LOAD_FACTOR ? "pressure" : "allocation failure"));
-    }
-
-    live_at_last_collection = 0;
-
-    // This is the beauty of the mark-and-don't-sweep algorithm. All
-    // the work has been done by the allocator, so now all we have to
-    // do is flip the mark bit so all memory is considered dead. Then
-    // we immediately mark live memory, and collection is done. No
-    // sweep required.
-    
-    // Flip mark bit so now all dead memory is known
-    mark_bit = !mark_bit;
-
-    // Mark all live memory
-    mark_heap();
-  }
-
-  // Allocation
-  Value* allocate(Type type, size_t size) {
-    if(collect_before_every_allocation) {
-      collect();
-    }
-  
-    // This function calls findfree and does some minor tweaks before
-    // and after
-
-    // Align along pointer-sized boundary to ensure that our immediate
-    // value scheme will work.
-    size = align(POINTER_ALIGNMENT, size);
-
-    if(size >= PIP_HEAP_ALIGNMENT) {
-      size = align(PIP_HEAP_ALIGNMENT, size);
-      Block* block = new Block(size, false, mark_bit);
-      blocks.push_back(block);
-      Value* x = (Value*) block->begin;
-      x->set_type_unsafe(type);
-      x->flip_mark_unsafe();
-      PIP_ASSERT(markedp(x));
-
-      heap_size += size;
-
-      PIP_GC_MSG("growing heap from " << FriendlySize(heap_size - size) << " to " << FriendlySize(heap_size)
-                 << " because of large object allocation");
-
-      return x;
-    }
-
-    // Try finding memory
-    char* address = findfree(size);
-
-    if(!address) {
-      collect(size);
-      address = findfree(size);
-      if(!address) {
-        collect(size, true);
-        address = findfree(size);
-        if(!address) {
-          std::cerr << "could not allocate " << size << " bytes " << std::endl;
-          // TODO: A graceful out
-          PIP_ASSERT(!"out of memory");
-        }
-      }
-    }
-
-    Value* x = (Value*) address;
-
-    x->set_type_unsafe(type);
-
-    PIP_ASSERT(x->get_size_unsafe() >= size);
-    PIP_ASSERT(markedp(x));
-    PIP_ASSERT(x->get_type_unsafe() == type);
-    PIP_ASSERT(x->pointerp());
-
-    return x;
-  }
-  
-  // The actual entry point of the garbage collector
-  template <class T> T* allocate(ptrdiff_t additional = 0) {
-    return static_cast<T*>(allocate(static_cast<Type>(T::CLASS_TYPE), sizeof(T) + additional));
-  }
-
-  ///// COMPACTION
-
-  // Determine the minimum size of an object; used to remove fragmentation
-  // while compacting
-  static size_t minimum_size(Value* x) {
-    // TYPENOTE
-    size_t size;
-    switch(x->get_type()) {
-      // Simple cases
-      case SYMBOL: size = sizeof(Symbol); break;
-      case VECTOR: size = sizeof(Vector); break;
-      case EXCEPTION: size = sizeof(Exception); break;
-      case CLOSURE: size = sizeof(Closure); break;
-      case PROTOTYPE: size = sizeof(Prototype); break; 
-      case UPVALUE: size = sizeof(Upvalue); break;
-      case NATIVE_FUNCTION: size =  sizeof(NativeFunction); break;
-      case TABLE: size = sizeof(Table); break;
-      case PAIR: size = sizeof(Pair) + src_size<Pair>(x->pair_has_source()); break;
-      case BOX: size = sizeof(Box) + src_size<Box>(x->box_has_source()); break;
-      case VECTOR_STORAGE:
-        size = sizeof(VectorStorage) + array_size<Value*>(static_cast<VectorStorage*>(x)->length);
-        break;
-      case STRING: {
-        size = sizeof(String) + array_size<unsigned char>(static_cast<String*>(x)->length);
-        break;
-      }
-      case BLOB:
-        size = sizeof(Blob) + array_size<unsigned char>(static_cast<Blob*>(x)->length);
-        break;
-        // Should not occur
-      case TRANSIENT: case FIXNUM: case CONSTANT: assert(!"bad");
-     }
-     return align(POINTER_ALIGNMENT, size);
-   }
-
-  void update_forward(Value** ref) {
-    Value* obj = *ref;
-    // If object is immedate or pointer has already been updated, no need to
-    // deal with it
-    if(obj->immediatep() || obj->header != TRANSIENT) return;
-    // Update pointer
-    (*ref) = ((Value*) obj->size);
-  }
-
-  void compact() {
-    // Quick collection
-    finish_mark();
-    reset_sweep_cursor();
-    mark_bit = !mark_bit;
-    mark_heap();
-
-    // Create a new block to copy the heap to
-    Block* heap = new Block(align(PIP_HEAP_ALIGNMENT, heap_size), false, mark_bit);
-
-    // Loop over live memory, allocating from the new block. The new allocation
-    // is called the "forwarded object" and the object's 'size" field is
-    // re-used to store a pointer to this forwarded object. (The newly
-    // allocated object contains the size information, for when it's needed)
-
-    char* bump = heap->begin;
-
-    PIP_GC_MSG("copying heap");
-    // TODO: Sweep code is duplicated 3-4 times. 
-    while(block_cursor != blocks.size()) {
-      Block* b = blocks[block_cursor];
-      while(sweep_cursor != b->end) {
-        Value* sweep_cursor_v = (Value*) sweep_cursor;
-
-        if(markedp(sweep_cursor_v)) {
-          // Bump allocate from the new heap
-          Value* copy = (Value*) bump;
-          size_t min_size = minimum_size(sweep_cursor_v);
-          bump += min_size;
- 
-          memcpy(copy, sweep_cursor_v, min_size);
-          copy->size = min_size;
-          // Increment before we delete the object's size
-          sweep_cursor += sweep_cursor_v->size;
-          // Install forwarding pointer
-          sweep_cursor_v->size = (size_t) copy;
-          sweep_cursor_v->header = TRANSIENT;
-        } else {
-          sweep_cursor += sweep_cursor_v->get_size_unsafe();
-        }
-      }
-      block_cursor++;
-      if(block_cursor != blocks.size())
-        sweep_cursor = blocks[block_cursor]->begin;
-    }
-
-    // Now that every object has been copied, we just need to update pointers.
-
-    // First we'll sweep through the program's roots, then we'll sweep over the
-    // heap (which can be easily iterated over at this point),  checking every
-    // object's field for a forwarded pointer.
-
-    PIP_GC_MSG("updating roots with new pointers");
-
-    for(symbol_table_t::iterator i = symbol_table.begin(); i != symbol_table.end(); i++)
-      update_forward((Value**) &i->second);
-
-    for(Frame* f = frame_list; f != NULL; f = f->previous)
-      for(size_t i = 0; i != f->root_count; i++)
-        update_forward(f->roots[i]);
-
-    for(Handle<Value>* i = handle_list; i != NULL; i = i->previous)
-      update_forward(&i->ref);
-    
-    for(size_t i = 0; i != vm_frames.size(); i++) {
-      VMFrame* f = vm_frames[i];
-      // Mark prototype
-      update_forward((Value**) &f->p);
-      // Mark closure
-      update_forward((Value**) &f->c);
-      // Mark function stack
-      for(size_t j = 0; j != f->si; j++) {
-        update_forward(&f->stack[j]);
-      }
-      // Mark local variables
-      for(size_t j = 0; j != f->p->locals; j++) {
-        update_forward(&f->locals[j]);
-      }
-      // Mark upvalues (if necessary)
-      for(size_t j = 0; j != f->p->local_free_variable_count; j++) {
-        update_forward((Value**)&f->upvalues[j]);
-      }
-    }
-
-    PIP_GC_MSG("updating heap with new pointers");
-    char* sweep = heap->begin;
-    while(sweep != bump) {
-      Value* x = (Value*) sweep;
-      sweep += x->size;
-#define PIP_FWD(type, field) update_forward((Value**) &(((type*) x)->field))
-      switch(x->get_type_unsafe()) {
-        // TYPENOTE
-        // Atomic
-        case NATIVE_FUNCTION: case STRING: case BLOB:
-          continue;
-        // One pointer
-        case VECTOR:
-        case BOX:
-          PIP_FWD(Box, value);
-          continue;
-        // Two pointers
-        case CLOSURE:
-        case PAIR:
-        case SYMBOL:
-          update_forward(&((Pair*) x)->car);
-          update_forward(&((Pair*) x)->cdr);
-          continue;
-        // Three pointers
-        case TABLE: case EXCEPTION:
-          PIP_FWD(Exception, tag);
-          PIP_FWD(Exception, message);
-          PIP_FWD(Exception, irritants);
-          continue;
-        // Five pointers
-        case PROTOTYPE:
-          PIP_FWD(Prototype, code);
-          PIP_FWD(Prototype, debuginfo);
-          PIP_FWD(Prototype, local_free_variables);
-          PIP_FWD(Prototype, upvalues);
-          PIP_FWD(Prototype, name);
-          continue;
-        case VECTOR_STORAGE: {
-          VectorStorage* s = static_cast<VectorStorage*>(x);
-          if(s->length) {
-            for(size_t i = 0; i != s->length; i++) {
-              update_forward(&s->data[i]);
-            }
-          }
-          continue;
-        }
-        case UPVALUE:
-          if(x->upvalue_closed()) {
-            update_forward(((Upvalue*) x)->local);
-          } else {
-            update_forward(&((Upvalue*) x)->converted);
-          }
-          continue;
-        default: case TRANSIENT: case FIXNUM: case CONSTANT: assert(!"Bad");
-#undef PIP_FWD
-      }
-    }
-
-    PIP_GC_MSG("forwarded all program roots");
-    
-    // Delete heap and replace with new heap
-    delete_blocks();
-    blocks.push_back(heap);
-    reset_sweep_cursor();
-
-    // Note the size of the hole at the end of the heap
-    // Ensure we have enough room at the end for a Value
-    PIP_ASSERT(heap->end - bump >= align(POINTER_ALIGNMENT, sizeof(Value*)));
-    // Determine the size
-    Value* hole = (Value*) bump;
-    hole->header = TRANSIENT;
-    hole->size = (heap->end - bump);
-  }
 
   ///// (READ) Expression reader and source code tracking 
 
@@ -1939,8 +2077,8 @@ struct State {
   // lists can be allocated with extra fields for their file and line. Symbols
   // on the other hand are placed in a special "Box" structure, which is
   // unwrapped by the compiler and then becomes garbage. Literal constants,
-  // such as #f and 12345, don't cause compilation or runtime errors and therefore
-  // don't need to be wrapped.
+  // such as #f and 12345, don't cause compilation or runtime errors and
+  // therefore don't need to be wrapped.
   // --> 
 
   // Source code tracking
@@ -1966,7 +2104,6 @@ struct State {
   // Load the source code of a file
   // Return 0 on failure
   unsigned register_file(const char* path) {
-    size_t length;
     std::fstream fs(path, std::fstream::in);
     std::string line;
     if(!fs.is_open()) return 0;
@@ -1978,7 +2115,8 @@ struct State {
 
   // Load the source code of a string
   // "name" is ideally something describing where the string came from
-  unsigned register_string(const std::string& name, const std::string& string) {
+  unsigned register_string(const std::string& name,
+                          const std::string& string) {
     source_names.push_back(name);
 
     std::stringstream ss;
@@ -2003,7 +2141,8 @@ struct State {
     // valid symbol character
     static bool delimiterp(char c) {
       return c == '(' || c == ')' || c == ';' || c == '@' ||
-        c == EOF || isspace(c) || c == '.' || c == '#' || c == '"' || quotep(c);
+        c == EOF || isspace(c) || c == '.' || c == '#' || c == '"'
+        || quotep(c);
     }
 
     // True if a character is a symbol starting character (all non-delimiters
@@ -2038,7 +2177,8 @@ struct State {
       TK_UNQUOTE_SPLICING
     };
 
-    Reader(State& state_, std::istream& input_, unsigned file_): state(state_), input(input_),
+    Reader(State& state_, std::istream& input_, unsigned file_): state(state_),
+    input(input_),
     file(file_), line(1), token_value(state), token_lookahead(TK_LOOKAHEAD) {
       
     }
@@ -2048,7 +2188,8 @@ struct State {
     std::istream& input;
     // File and current line
     unsigned file, line;
-    // Values read in by the tokenizer, or exceptions encountered while tokenizing
+    // Values read in by the tokenizer, or exceptions encountered while
+    // tokenizing
     Handle<Value> token_value;
     Token token_lookahead;
     std::string token_buffer;
@@ -2102,7 +2243,8 @@ struct State {
           ungetc(c);
 
           if(digits >= std::numeric_limits<ptrdiff_t>::digits10 - 1) {
-            std::cerr << "WARNING: integer overflow while reading fixnum" << std::endl;
+            std::cerr << "WARNING: integer overflow while reading fixnum" 
+            << std::endl;
           }
         
           token_value = Value::make_fixnum(n);
@@ -2128,7 +2270,8 @@ struct State {
           }
         }
 
-        // If it's not a number or a symbol, it will begin with a single character
+        // If it's not a number or a symbol, it will begin with a single
+        // character
         switch(c) {
           // Whitespace handling
           // Eat newlines
@@ -2183,6 +2326,7 @@ struct State {
           case EOF: return TK_EOF;
         }
       }
+      return lex_error("failed to use character");
     }
  
     Value* pop_token_value() {
@@ -2209,7 +2353,8 @@ struct State {
       // Save the line this list begins on
       size_t l = line; 
       PIP_FRAME(initial, head, tail, elt, swap);
-      // If we've been given an initial element (say quote in a quoted expression), attach it
+      // If we've been given an initial element (say quote in a quoted
+      // expression), attach it
       if(initial != NULL) {
         swap = state.cons(initial, PIP_NULL);
         head = tail = swap;
@@ -2265,11 +2410,14 @@ struct State {
         }
         token = peek_token();
         PIP_READ_CHECK_TK(token);
-        if(token != TK_RPAREN) return parse_error("more than one element at the end of a dotted list");
+        if(token != TK_RPAREN)
+          return parse_error("more than one element at the end of a dotted"\
+                             "list");
         discard_lookahead();
       }
 
-      // Attach source info by re-creating the head of the list with source information attached
+      // Attach source info by re-creating the head of the list with source
+      // information attached
       if(head->get_type() == PAIR) {
         swap = head->car();
         elt = head->cdr();
@@ -2321,13 +2469,21 @@ struct State {
             PIP_FRAME(cell, cell2, value, symbol);
             value = read();
             PIP_CHECK(value);
-            if(value == PIP_EOF) return parse_error("unexpected EOF after quote");
+            if(value == PIP_EOF)
+              return parse_error("unexpected EOF after quote");
             symbol = state.global_symbol(g);
             cell2 = state.cons(value, PIP_NULL);
             cell = state.cons(symbol, cell2, true, file, l);
             return cell;
           }
+          case TK_DOT:
+            return parse_error("standalone dot encountered in source code "\
+                "(dots should only be part of lists)");
           case TK_EOF: return PIP_EOF;
+          case TK_LOOKAHEAD: case TK_WHITESPACE:
+            return parse_error("parser could not handle token");
+          case TK_NEWLINE:
+            continue;
         }
       }
     }
@@ -2392,13 +2548,6 @@ struct State {
   // Environment format
   // #(<parent environment> <key> <value> ...)
 
-  Vector* make_env(Value* parent = PIP_FALSE) {
-    Vector* env = 0;
-    PIP_S_FRAME(env, parent);
-    env = make_vector();
-    vector_append(env, parent);
-  }
-
   // Set an environment variable
   unsigned env_def(Vector* env, Value* key, Value* value) {
     for(size_t i = 1; i != env->vector_length(); i += 2) {
@@ -2413,8 +2562,8 @@ struct State {
     return ((slot - 1) / 2) - 1;
   }
 
-  // Look up an environment variable (the result is rather complex, and returned in
-  // a structure)
+  // Look up an environment variable (the result is rather complex, and
+  // returned in a structure)
 
   enum RefScope { REF_GLOBAL, REF_UP, REF_LOCAL };
   struct Lookup {
@@ -2452,6 +2601,7 @@ struct State {
       env = static_cast<Vector*>(env->vector_ref(0));
     }
     // Lookup failed
+
     return PIP_FALSE;
   }
 
@@ -2470,7 +2620,8 @@ struct State {
 
   // An instance of the compiler, created for each function
   struct Compiler {
-    Compiler(State& state_, Compiler* parent_, Vector* env_ = NULL, size_t depth_ = 0): 
+    Compiler(State& state_, Compiler* parent_, Vector* env_ = NULL,
+             size_t depth_ = 0): 
       state(state_), parent(parent_),
       local_free_variable_count(0), upvalue_count(0),
       stack_max(0), stack_size(0), locals(0), constants(state), closure(false),
@@ -2487,7 +2638,8 @@ struct State {
     Compiler* parent;
     // The wordcode
     std::vector<size_t> code;
-    // A vector containing combinations of instruction offsets and source location info for debugging and tracebacks
+    // A vector containing combinations of instruction offsets and source
+    // location info for debugging and tracebacks
     std::vector<std::pair<unsigned, SourceInfo> > debuginfo;
     // A vector containing free variable locations
     std::vector<FreeVariableInfo> free_variables;
@@ -2537,7 +2689,8 @@ struct State {
           // Constant already exists, don't append it to vector
           emit(OP_PUSH_CONSTANT);
           emit_arg(i);
-          PIP_CC_VMSG("push-constant " << constant << " " << i << " (existing constant)");
+          PIP_CC_VMSG("push-constant " << constant << " " << i <<
+                      " (existing constant)");
           return;
         }
       }
@@ -2590,13 +2743,16 @@ struct State {
 
     Value* arity_error(Global name, Value* form, size_t expected, unsigned got) {
       std::ostringstream ss;
-      ss << "malformed " << state.global_symbol(name) << ": expected " << expected << " arguments, but got " << got;
+      ss << "malformed " << state.global_symbol(name) << ": expected "
+         << expected << " arguments, but got " << got;
       return syntax_error(form, ss.str());
     }
 
-    Value* arity_error_most(Global name, Value* form, size_t expected, unsigned got) {
+    Value* arity_error_most(Global name, Value* form, size_t expected,
+                            unsigned got) {
       std::ostringstream ss;
-      ss << "malformed " << state.global_symbol(name) << ": expected at most " << expected << " arguments, but got " << got;
+      ss << "malformed " << state.global_symbol(name) << ": expected at most "
+         << expected << " arguments, but got " << got;
       return syntax_error(form, ss.str());
     }
 
@@ -2623,15 +2779,17 @@ struct State {
         if(l.lexical_level == lookup.level && l.lexical_index == lookup.index)
           return i;
       }
-      // New free variable - register it with this and all preceding functions as
-      // necessary. 
+      // New free variable - register it with this and all preceding functions
+      // as necessary. 
       l.lexical_level = lookup.level;
       l.lexical_index = lookup.index;
-      PIP_CC_VMSG("register free variable <" << l.lexical_level << ", " << l.lexical_index << '>');
+      PIP_CC_VMSG("register free variable <" << l.lexical_level << ", "
+                  << l.lexical_index << '>');
       Lookup lookup_copy(lookup);
       lookup_copy.level--;
       if(lookup.level != 0) {
-        // Register with preceding function, and make this a closure if it isn't already
+        // Register with preceding function, and make this a closure if it
+        // isn't already
         closure = true;
         l.index = parent->register_free_variable(lookup_copy);
         upvalue_count++;
@@ -2678,6 +2836,7 @@ struct State {
         } 
       } else if(type->applicablep()) {
         // syntax
+        PIP_FAIL0("no syntax allowed!");
       } else {
         return undefined_variable(exp);
       }
@@ -2720,7 +2879,8 @@ restart:
           args = name->cdr();
           name = name->car();
           if(unbox(name)->get_type() != SYMBOL)
-            return syntax_error(S_DEFINE, exp, "first argument to define a function must be a symbol");
+            return syntax_error(S_DEFINE, exp, "first argument to define a "
+                                "function must be a symbol");
           Value* named_lambda = 0, *tmp = 0;
           PIP_FRAME(exp, name, args, named_lambda, tmp);
           // Get the argument list and body
@@ -2735,17 +2895,20 @@ restart:
           exp->cdr()->set_car(name);
           exp->cdr()->set_cdr(named_lambda);
           goto restart;
-        } else return syntax_error(S_DEFINE, exp, "first argument to define must be a symbol");
+        } else return syntax_error(S_DEFINE, exp,
+                                  "first argument to define must be a symbol");
       }
       // TODO: Handle (define name (lambda () #t))
-      unsigned slot = state.env_def(**env, name, state.global_symbol(S_VARIABLE));
+      unsigned slot = state.env_def(**env, name,
+                                    state.global_symbol(S_VARIABLE));
       // Compile body for set!
       PIP_FRAME(name);
       chk = compile(exp->cddr()->car());
       PIP_CHECK(chk);
       // Global variable
       Lookup lookup;
-      lookup.scope = (*env)->vector_ref(0) == PIP_FALSE ? REF_GLOBAL : REF_LOCAL;
+      lookup.scope =
+        (*env)->vector_ref(0) == PIP_FALSE ? REF_GLOBAL : REF_LOCAL;
       lookup.index = slot;
       generate_set(lookup, name);
       return PIP_FALSE;
@@ -2758,7 +2921,8 @@ restart:
       Value* name = unbox(exp->cadr());
       // Check that name is a symbol
       if(name->get_type() != SYMBOL)
-        return syntax_error(S_SET, exp, "first argument to set! must be a symbol");
+        return syntax_error(S_SET, exp,
+                            "first argument to set! must be a symbol");
 
       // Compile body 
       chk = compile(exp->cddr()->car());
@@ -2798,9 +2962,11 @@ restart:
           }
         }
       }
+      return PIP_FALSE; // should never be reached
     }
 
-    Value* compile_lambda(size_t form_argc, Value* exp, bool tail, Value* name) {
+    Value* compile_lambda(size_t form_argc, Value* exp, bool tail,
+                          Value* name) {
       // For checking subcompilation results
       Value* chk = 0;
       if(form_argc < 2) return arity_error(S_LAMBDA, exp, 2, form_argc);
@@ -2821,15 +2987,18 @@ restart:
       args = exp->cadr();
       if(args != PIP_NULL) {
         if(args->get_type() != PAIR) 
-          return syntax_error(S_LAMBDA, exp, "first argument to lambda must be either () or a list of arguments");
+          return syntax_error(S_LAMBDA, exp, "first argument to lambda must be"
+                              "either () or a list of arguments");
         while(args->get_type() == PAIR) {
           Value* arg = unbox(args->car());
           if(arg->get_type() != SYMBOL) {
-            return syntax_error(S_LAMBDA, exp, "lambda argument list must be symbols");
+            return syntax_error(S_LAMBDA, exp,
+                                "lambda argument list must be symbols");
           }
           // Finally, we can add them to the environment!
           state.vector_append(PIP_CAST(Vector, new_env), arg);
-          state.vector_append(PIP_CAST(Vector, new_env), state.global_symbol(S_VARIABLE));
+          state.vector_append(PIP_CAST(Vector, new_env),
+                              state.global_symbol(S_VARIABLE));
           argc++;
           args = args->cdr();
           if(args->get_type() != PAIR) {
@@ -2861,9 +3030,10 @@ restart:
     }
 
     Value* compile_if(size_t argc, Value* exp, bool tail) {
-      if(argc != 2 && argc != 3)
+      if(argc != 2 && argc != 3) {
         if(argc < 2) return arity_error(S_IF, exp, 2, argc);
         else return arity_error_most(S_IF, exp, 3, argc);
+      }
       Value* chk = 0, *condition = 0, *then_branch = 0, *else_branch = 0;
       PIP_FRAME(chk, condition, then_branch, else_branch);
 
@@ -2981,8 +3151,10 @@ restart:
           break;
         }
         case PAIR: {
-          // Compile applications, including special forms, macros, and normal function applications
-          if(!listp(exp)) return syntax_error(exp, "dotted lists not allowed in source");
+          // Compile applications, including special forms, macros, and normal
+          // function applications
+          if(!listp(exp))
+            return syntax_error(exp, "dotted lists not allowed in source");
           // Note the source location of this application
           annotate(exp);
           // Check for special forms
@@ -3008,9 +3180,11 @@ restart:
             // named-lambda
             } else if(op == state.global_symbol(S_NAMED_LAMBDA)) {  
               // This is a little hacky, but we're going to extract the name
-              // here and then make it look like a normal lambda for compile_lambda
+              // here and then make it look like a normal lambda for
+              // compile_lambda
               
-              // No need for parsing because named lambdas are generated by the parser
+              // No need for parsing because named lambdas are generated by the
+              // parser
               Value* name = exp->cadr();
               Value* rest = exp->cddr();
               exp->set_cdr(rest);
@@ -3057,11 +3231,13 @@ restart:
       size_t freevar_i = 0, upvalue_i = 0;
       for(size_t i = 0; i != free_variables.size(); i++) {
         if(free_variables[i].lexical_level == 0)
-          localfreevars->blob_set<unsigned>(freevar_i++, free_variables[i].index);
+          localfreevars->blob_set<unsigned>(freevar_i++,
+                                            free_variables[i].index);
         else {
           // Note whether the variable is local to the function that
           // will be creating the closure
-          UpvalLoc l(free_variables[i].lexical_level == 1, free_variables[i].index);
+          UpvalLoc l(free_variables[i].lexical_level == 1,
+                     free_variables[i].index);
           upvals->blob_set(upvalue_i++, l);
         }
       }
@@ -3114,12 +3290,14 @@ restart:
   std::vector<Value*> vm_trampoline_arguments;
   Value* vm_trampoline_function;
 
-  // A frame containing information that needs to be tracked by the garbage collector
+  // A frame containing information that needs to be tracked by the garbage
+  // collector
   struct VMFrame {
     VMFrame(Prototype* p_, Closure* c_, Value** stack_, Value** locals_):
       p(p_), c(c_), stack(stack_), locals(locals_), upvalues(0), si(0)
       {}
-    // Need to save pointers to the prototype and closure so they're considered roots
+    // Need to save pointers to the prototype and closure so they're considered
+    // roots
     Prototype* p;
     Closure* c;
     // Storage for stack and locals
@@ -3139,7 +3317,8 @@ restart:
     return make_exception(State::S_PIP_EVAL, "attempt to apply non-function");
   }
 
-  Value* type_error(const std::string& name, size_t arg_number, Value* argument, Type expected, Type got) {
+  Value* type_error(const std::string& name, size_t arg_number,
+                    Value* argument, Type expected, Type got) {
     std::ostringstream out;
     out << name << " expected argument " << arg_number+1 << " to be " << 
       expected << " but got " << got << " (" << argument << ')';
@@ -3147,7 +3326,8 @@ restart:
   }
 
   // Apply Scheme function
-  Value* vm_apply(Prototype* prototype, Closure* closure, size_t argc, Value* args[], bool& trampoline) {
+  Value* vm_apply(Prototype* prototype, Closure* closure, size_t argc,
+                  Value* args[], bool& trampoline) {
     // Track how many frames have been lost due to tail calls for debugging
     // purposes eg if we're in a loop and an error occurs on the 857th
     // iteration, we'll be able to print that information
@@ -3164,7 +3344,8 @@ restart:
     VMFrame f(prototype, closure, 
         static_cast<Value**>(alloca(prototype->stack_max * sizeof(Value*))),
         static_cast<Value**>(alloca(prototype->locals * sizeof(Value*))));
-    // Clear local storage (necessary because garbage collector might look at them even before they are set)
+    // Clear local storage (necessary because garbage collector might look at
+    // them even before they are set)
     memset(f.locals, 0, prototype->locals * sizeof(Value*));
     // Push call frame
     vm_frames.push_back(&f);
@@ -3196,7 +3377,8 @@ restart:
       f.locals[i] = args[i];
     }
 
-    // If we're not done yet, either we've received too many arguments or this is a variable arity function
+    // If we're not done yet, either we've received too many arguments or this
+    // is a variable arity function
     if(i != argc) {
       if(prototype->prototype_variable_arity()) {
         return make_exception(State::S_PIP_EVAL, "variable arity not supported yet");
@@ -3341,7 +3523,10 @@ restart:
         }
         case OP_JUMP_IF_FALSE: {
           size_t insn = wc[ip++];
-          PIP_VM_VMSG("jump-if-false " << (f.stack[f.si-1] == PIP_FALSE ? "jmping" : "not jmping") << " " << insn);
+          PIP_VM_VMSG("jump-if-false "
+                      << (f.stack[f.si-1] == PIP_FALSE ? "jmping" :
+                          "not jmping") 
+                      << " " << insn);
           Value* condition = f.stack[--f.si];
           if(condition == PIP_FALSE) {
             ip = insn;
@@ -3387,12 +3572,11 @@ tail:
           goto tail;
         } else return result;
       case NATIVE_FUNCTION: {
-        return static_cast<NativeFunction*>(function)->pointer(*this, argc, args);
+        return static_cast<NativeFunction*>(function)->pointer(*this, argc,
+                                                               args);
       }
       default:
-        std::cerr << "attempt to apply type " << function->get_type() << std::endl;
-        PIP_ASSERT(!"bad application");
-        break;
+        PIP_FAIL0("attempt to apply bad type" << function->get_type());
     }
     return PIP_UNSPECIFIED;
   } 
@@ -3402,6 +3586,25 @@ tail:
 }; // State
 
 ///// GARBAGE COLLECTOR TRACKING IMPLEMENTATION
+
+template <class T>
+void Handle<T>::initialize() {
+  previous = state.handle_list;
+  if(previous)
+    previous->next = (Handle<Value> *) this;
+  state.handle_list = (Handle<Value> *) this;
+  next = 0;
+}
+
+template <class T>
+Handle<T>::~Handle() {
+  if(previous) previous->next = next;
+  if(next) next->previous = previous;
+  if(state.handle_list == (Handle<Value> *) this) {
+    PIP_ASSERT(!next);
+    state.handle_list = previous;
+  }
+}
 
 inline Frame::Frame(State& state_, FrameHack* roots_, size_t root_count_):
   state(state_),
@@ -3423,6 +3626,7 @@ inline Frame::~Frame() {
 // TYPENOTE
 inline std::ostream& operator<<(std::ostream& os, Type& t) {
   switch(t) {
+    case UPVALUE: os << "an upvalue"; break;
     case TRANSIENT: os << "bad type"; break;
     case PAIR: os << "a pair"; break;
     case VECTOR: os << "a vector"; break;
@@ -3444,7 +3648,8 @@ inline std::ostream& operator<<(std::ostream& os, Type& t) {
 
 #define PIP_CHECK_TYPE(expect, number) \
   if(args[(number)]->get_type() != (expect)) { \
-    return state.type_error(fn_name, (number), args[(number)], (expect), args[(number)]->get_type()); \
+    return state.type_error(fn_name, (number), args[(number)], \
+                            (expect), args[(number)]->get_type()); \
   }
 
 inline Value* car(State& state, unsigned argc, Value* args[]) {
@@ -3510,12 +3715,16 @@ inline std::ostream& operator<<(std::ostream& os, Value* x) {
         return os << "#<box " << (ptrdiff_t)x << ">";
     }
     case EXCEPTION: {
-      return os << "#<exception " << x->exception_tag() << ' ' << x->exception_message() << '>';
+      return os << "#<exception " << x->exception_tag() << ' ' 
+                << x->exception_message() << '>';
     }
     case PROTOTYPE: return os << "#<prototype>";
-    case UPVALUE: return os << "#<upvalue " << (x->upvalue_closed() ? "(closed) " : "") << " " << x->upvalue() << ')' << std::endl;
+    case UPVALUE: return os << "#<upvalue "
+                            << (x->upvalue_closed() ? "(closed) " : "")
+                            << " " << x->upvalue() << ')' << std::endl;
     default:
-      return os << "#<unknown value " << (size_t) x << " type: " << x->get_type() << ">";
+      return os << "#<unknown value " << (size_t) x << " type: "
+                << x->get_type() << ">";
   }
   return os;
 }

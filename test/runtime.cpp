@@ -67,7 +67,7 @@ static void test_gc_1(State& state) {
 static void test_symbols(State& state) {
   std::cout << "!! test_symbols" << std::endl;
   Symbol *sym1 = 0, *sym2 = 0, *sym3 = 0;
-  State::Handle<Symbol> sym4(state);
+  Handle<Symbol> sym4(state);
   PIP_FRAME(sym1, sym2, sym3);
 
   sym1 = state.make_symbol("symble");
@@ -236,23 +236,13 @@ void test_compiler(State& state) {
 void run_test_suite(State& state) {
   std::cout << "!! sizeof(State) " << sizeof(State) << " [" << FriendlySize(sizeof(State)) << "]" << std::endl;
   state.collect_before_every_allocation = true;
+  test_invariants(state);
   test_gc_1(state);
   test_symbols(state);
   test_vectors(state);
   test_tables(state);
   test_reader(state);
   test_compiler(state);
-
-  { 
-    State::Compiler cc(state, NULL);
-    cc.compile(PIP_TRUE);
-    Prototype* p = 0;
-    {
-      PIP_E_FRAME(state, p);
-      p = cc.end();
-      std::cout << state.apply(p, 0, 0) << std::endl;
-    }
-  }
 
   std::cout << "!! collections: " << state.collections << " heap size: " << FriendlySize(state.heap_size) << std::endl;
 }
