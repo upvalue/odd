@@ -61,7 +61,7 @@
 // Try to give a graceful error message when internal errors occur
 #define PIP_FAIL0(desc) \
   std::cerr << desc << std::endl; \
-  PIP_ASSERT(!0);
+  PIP_ASSERT(!"failure");
 
 #define PIP_FAIL(desc, ret) \
   PIP_FAIL0(desc); \
@@ -304,8 +304,10 @@ struct Value {
 
   Value* car() const;
   Value* cdr() const;
+  Value* caar() const;
   Value* cadr() const;
   Value* cddr() const;
+  Value* cdar() const;
 
   void set_car(Value*);
   void set_cdr(Value*);
@@ -407,23 +409,37 @@ Value* Value::car() const {
   PIP_ASSERT(get_type() == PAIR);
   return static_cast<const Pair*>(this)->car;
 }
+
 Value* Value::cdr() const {
   PIP_ASSERT(get_type() == PAIR);
   return static_cast<const Pair*>(this)->cdr;
 }
+
+Value* Value::caar() const {
+  PIP_ASSERT(get_type() == PAIR);
+  return static_cast<const Pair*>(this)->car->car();
+}
+
 Value* Value::cadr() const {
   PIP_ASSERT(get_type() == PAIR);
   return static_cast<const Pair*>(this)->cdr->car();
 }
+
 Value* Value::cddr() const {
   PIP_ASSERT(get_type() == PAIR);
   return static_cast<const Pair*>(this)->cdr->cdr();
+}
+
+Value* Value::cdar() const {
+  PIP_ASSERT(get_type() == PAIR);
+  return static_cast<const Pair*>(this)->car->cdr();
 }
 
 void Value::set_car(Value* car_) { 
   PIP_ASSERT(get_type() == PAIR);
   static_cast<Pair*>(this)->car = car_;
 }
+
 void Value::set_cdr(Value* cdr_) {
   PIP_ASSERT(get_type() == PAIR);
   static_cast<Pair*>(this)->cdr = cdr_;
@@ -623,14 +639,15 @@ struct NativeFunction : Value {
   static const Type CLASS_TYPE = NATIVE_FUNCTION;
 };
 
-#define PIP_TABLE_UPPER_LIMIT 0.77
-
 struct Table : Value {
-  Blob *flags;
-  VectorStorage *keys;
-  VectorStorage *values;
-  unsigned buckets, size, occupied, upper_bound;
+  static const int LOAD_FACTOR = 70;
 
+  // Chain format: vector of lists, where lists are ((key . value) ...)
+  // With as many key/value pairs as necessary for collisions
+  VectorStorage* chains;
+  unsigned char size_log2;
+  unsigned entries, max_entries;
+  
   static const Type CLASS_TYPE = TABLE;
 };
 
@@ -707,13 +724,6 @@ struct Frame {
 // Assumes there is a variable State& state
 #define PIP_FRAME(...) PIP_E_FRAME((state), __VA_ARGS__)
 #define PIP_S_FRAME(...) PIP_E_FRAME((*this), __VA_ARGS__)
-
-///// (RT) Runtime
-
-// <--
-// Each instance of the Pip runtime is contained within the rather monolithic
-// State structure.  Pip is completely re-entrant. 
-// -->
 
 struct State {
   struct VMFrame;
@@ -808,6 +818,7 @@ struct State {
         case NATIVE_FUNCTION: case STRING: case BLOB:
           return;
         // One pointer
+        case TABLE:
         case VECTOR:
         case BOX:
           x = static_cast<Box*>(x)->value;
@@ -820,7 +831,7 @@ struct State {
           x = static_cast<Pair*>(x)->car;
           continue;
         // Three pointers
-        case TABLE: case EXCEPTION:
+        case EXCEPTION:
           recursive_mark(static_cast<Exception*>(x)->tag);
           recursive_mark(static_cast<Exception*>(x)->message);
           x = static_cast<Exception*>(x)->irritants;
@@ -1287,19 +1298,16 @@ struct State {
         case NATIVE_FUNCTION: case STRING: case BLOB:
           continue;
         // One pointer
-        case VECTOR:
-        case BOX:
+        case VECTOR: case BOX: case TABLE:
           PIP_FWD(Box, value);
           continue;
         // Two pointers
-        case CLOSURE:
-        case PAIR:
-        case SYMBOL:
+        case CLOSURE: case PAIR: case SYMBOL:
           update_forward(&((Pair*) x)->car);
           update_forward(&((Pair*) x)->cdr);
           continue;
         // Three pointers
-        case TABLE: case EXCEPTION:
+        case EXCEPTION:
           PIP_FWD(Exception, tag);
           PIP_FWD(Exception, message);
           PIP_FWD(Exception, irritants);
@@ -1351,7 +1359,13 @@ struct State {
     hole->size = (heap->end - bump);
   }
 
-  ///// RUNTIME
+  ///// (RT) Runtime
+
+  // <--
+  // Each instance of the Pip runtime is contained within the rather monolithic
+  // State structure.  Pip is completely re-entrant. 
+  // -->
+
   State(): 
     // Garbage collector
     handle_list(0),
@@ -1409,7 +1423,9 @@ struct State {
       "include"
     };
 
-    symbol_table = make_table();
+    // Allocate the symbol table, with a fair bit of space because we're going
+    // to stuff it full of those symbols up there
+    symbol_table = make_table(8);
 
     for(size_t i = 0; i != GLOBAL_SYMBOL_COUNT; i++) {
       Value* s = make_symbol(global_symbols[i]);
@@ -1573,16 +1589,16 @@ struct State {
     Symbol* sym = 0;
     bool found;
     Value* search = table_get(*symbol_table, string, found);
-    if(!found) {
+    if(found) {
+      sym = PIP_CAST(Symbol, search);
+    } else {
       // Symbol doesn't exist yet, intern it
       String* cpy = 0;
       PIP_S_FRAME(sym, string, cpy);
       sym = allocate<Symbol>();
       cpy = make_string(string);
       sym->name = cpy;
-      table_set(*symbol_table, cpy, sym);
-    } else {
-      sym = PIP_CAST(Symbol, search);
+      table_insert(*symbol_table, cpy, sym);
     }
     return sym;
   }
@@ -1619,8 +1635,33 @@ struct State {
     return make_exception(global_symbol(g), smsg, PIP_FALSE);
   }
 
-  Table* make_table() {
-    return allocate<Table>();
+  void table_setup(Table* table, unsigned size_log2) {
+    VectorStorage* chains = 0;
+    PIP_S_FRAME(table, chains);
+    // Clear entries 
+    table->entries = 0;
+    // Calculate size
+    table->size_log2 = size_log2;
+    unsigned size = 1 << size_log2;
+    chains = vector_storage_realloc(size, 0);
+    // Fill entries with #f
+    chains->length = size;
+    memset(chains->data, 0, array_size<Value*>(chains->length));
+    // Note chains
+    table->chains = chains;
+    // Pre-calculate max entries
+    table->max_entries = (Table::LOAD_FACTOR * size) / 100;
+  }
+
+  Table* make_table(unsigned size_log2 = 4) {
+    VectorStorage* chains = 0;
+    Table* table = 0;
+    PIP_S_FRAME(table, chains);
+
+    table = allocate<Table>();
+    table_setup(table, size_log2);
+    
+    return table;
   }
 
   ///// BASIC FUNCTIONS
@@ -1635,7 +1676,7 @@ struct State {
       case SYMBOL:
         return a == b;
       case STRING:
-        return strcmp(PIP_CAST(String, a)->data, PIP_CAST(String, b)->data) == 0;
+        return strcmp(PIP_CAST(String, a)->data, PIP_CAST(String, b)->data)==0;
       default: break;
     }
     std::cerr << "equals not implemented for type " << a->get_type();
@@ -1838,224 +1879,91 @@ struct State {
     }
   }
 
-  void table_resize(Table* table, unsigned new_buckets) {
-    PIP_ASSERT(table->get_type() == TABLE);
+  Value* unhashable_error(Value* value) {
+    std::ostringstream ss;
+    ss << "unhashable value " << value;
+    return make_exception(S_PIP_TABLE, ss.str());
+  }
 
-    Blob* new_flags = 0;
-    VectorStorage *new_keys = 0, *new_values = 0;
+  static ptrdiff_t hash_index(Table* table, Value* key, bool& unhashable) {
+    ptrdiff_t hash = hash_value(key, unhashable);
+    return hash & (table->chains->length - 1);
+  }
 
-    PIP_S_FRAME(new_flags, new_keys, new_values);
+  void table_grow(Table* table) {
+    // Create new storage
+    VectorStorage* old_chains = table->chains;
+    Value *chain = 0;
+    PIP_S_FRAME(table, old_chains, chain);
+    table_setup(table, table->size_log2 + 1);
+    // Insert all old values
+    for(size_t i = 0; i != old_chains->length; i++) {
+      chain = old_chains->data[i];
+      while(chain->get_type() == PAIR) {
+        table_insert(table, chain->caar(), chain->cdar());
+        chain = chain->cdr();
+      }
+    }
+  }
 
-    bool rehash = false;
+  Value* table_insert(Table* table, Value* key, Value* value) {
+    PIP_ASSERT(table->get_type() == TABLE);    
 
-    // Round new buckets to nearest power of 2
-    unsigned x = new_buckets;
-    --x;
-    (x)|=(x)>>1, (x)|=(x)>>2, (x)|=(x)>>4, (x)|=(x)>>8, (x)|=(x)>>16, ++(x);
-    new_buckets = x;
+    Value* chain = 0;
+    PIP_S_FRAME(table, key, value, chain);
 
-    if(new_buckets < 4)
-      new_buckets = 4;
+    // Should we grow the hash table?
+    if(table->entries >= table->max_entries) {
+      table_grow(table);
+    }
 
-    // If the requested size is too small
-    if(table->size >= (new_buckets * PIP_TABLE_UPPER_LIMIT + 0.5)) {
-      rehash = false;
+    bool unhashable;
+    ptrdiff_t index = hash_index(table, key, unhashable);
+    if(unhashable) return unhashable_error(key);
+    
+    // Build chain
+    chain = cons(key, value);
+
+    // Collision!
+    if(table->chains->data[index]) {
+      // Prepend this value
+      chain = cons(chain, table->chains->data[index]);
     } else {
-      // Allocate new flags for re-hashing
-
-      new_flags = make_blob(table_flag_blob_size(new_buckets));
-      memset(new_flags->data, 0xaa, table_flag_blob_size(new_buckets));
-      // If we are expanding the table
-      if(table->buckets < new_buckets) {
-        new_keys = vector_storage_realloc(new_buckets, table->keys);
-        new_keys->length = new_buckets;
-        table->keys = new_keys;
-        if(!table->table_act_as_set()) {
-          new_values = vector_storage_realloc(new_buckets, table->values);
-          new_values->length = new_buckets;
-          table->values = new_values;
-        }
-      }
+      // Create list
+      chain = cons(chain, PIP_NULL);
     }
 
-    // Rehashing is needed
-    if(rehash) {
-      for(unsigned j = 0; j != table->buckets; j++) {
-        // If this bucket is empty or deleted
-        if(table_flag_either(table->flags, j) == 0) {
-          Value* key = table->keys->data[j];
-          Value* value = NULL;
-          int new_mask = new_buckets - 1;
-          if(!table->table_act_as_set()) {
-            value = table->values->data[j];
-          }
+    // Insert chain
+    table->chains->data[index] = chain;
+    table->entries++;
+  }
 
-          table_flag_set_deleted_true(table->flags, j);
-
-          // Kick out process
-          while(1) {
-            ptrdiff_t step, k, i;
-            bool unhashable = false;
-
-            k = hash_value(key, unhashable);
-            // Nothing that's already in the table should be unhashable...
-            PIP_ASSERT(!unhashable);
-            i = k & new_mask;
-            step = table_step(k, new_mask);
-            while(!table_flag_empty(new_flags, i))
-              i = (i + step) & new_mask;
-            table_flag_set_empty_false(new_flags, i);
-            // If bucket is taken, kick it out
-            if(i < table->buckets && table_flag_either(table->flags, i) == 0) {
-              Value* swap = table->keys->data[i];
-              table->keys->data[i] = key;
-              key = swap;
-              if(!table->table_act_as_set()) {
-                swap = table->values->data[i];
-                table->values->data[i] = value;
-                value = swap;
-              }
-              // Mark as deleted in old hash table
-              table_flag_set_deleted_true(table->flags, i);
-            } else {
-              // Write element and jump out of loop
-              table->keys->data[i] = key;
-              if(!table->table_act_as_set())
-                table->values->data[i] = value;
-              break;
-            }
-          }
-        }
+  Value* table_get_cell(Table* table, Value* key) {
+    bool unhashable;
+    ptrdiff_t index = hash_index(table, key, unhashable);
+    if(unhashable) return unhashable_error(key);
+    Value* chain = 0;
+    chain = table->chains->data[index];
+    while(chain->get_type() == PAIR) {
+      if(equals(chain->caar(), key)) {
+        return chain->car();
       }
+      chain = chain->cdr();
     }
-
-    // Shrinking is needed
-    if(table->buckets > new_buckets) {
-      new_keys = vector_storage_realloc(new_buckets, table->keys);
-      new_keys->length = new_buckets;
-      table->keys = new_keys;
-      if(!table->table_act_as_set()) {
-        new_values = vector_storage_realloc(new_buckets, table->values);
-        new_values->length = new_buckets;
-        table->values = new_values;
-      }
-    }
-
-    table->flags = new_flags;
-    table->buckets = new_buckets;
-    table->occupied = table->size;
-    table->upper_bound = table->buckets * PIP_TABLE_UPPER_LIMIT + 0.5;
+    return PIP_FALSE;
   }
 
   Value* table_get(Table* table, Value* key, bool& found) {
     PIP_ASSERT(table->get_type() == TABLE);
-
-    found = false;
-    if(table->buckets) {
-      ptrdiff_t step, hashed, i, last, mask;
-      mask = table->buckets - 1;
-      bool unhashable = false;
-      hashed = hash_value(key, unhashable);
-      PIP_ASSERT(!unhashable);
-      i = hashed & mask;
-      step = table_step(hashed, mask);
-      last = i;
-      // Search table
-      while((!table_flag_empty(table->flags, i) && 
-            (table_flag_deleted(table->flags, i))) ||
-             !equals(table->keys->data[i], key)) {
-        i = (i + step) & mask;
-        if(i == last)
-          return PIP_FALSE;
-      }
-      // If this bucket is not empty or deleted, it's the right one
-      if(!table_flag_either(table->flags, i)) {
-        found = true;
-        if(table->table_act_as_set()) {
-          return PIP_FALSE;
-        } else {
-          return table->values->data[i];
-        }
-      }
-    }
-    return PIP_FALSE;
-  }  
-
-  Value* table_set(Table* table, Value* key, Value* value) {
-    PIP_ASSERT(table->get_type() == TABLE);
-
-    PIP_S_FRAME(table, key, value);
-    // Check to see if updating is necessary
-    if(table->occupied >= table->upper_bound) {
-      // Clear deleted elements
-      if(table->buckets > (table->size * 2))
-        table_resize(table, table->buckets - 1);
-      // Expand the hash table
-      else
-        table_resize(table, table->buckets + 1);
-    }
-
-    bool unhashable = false;
-    ptrdiff_t x, step, k, i, site, last, mask = table->buckets - 1;
-    x = site = table->buckets;
-    k = hash_value(key, unhashable);
-    if(unhashable) {
-      std::ostringstream ss;
-      ss << "unhashable value " << key;
-      return make_exception(S_PIP_TABLE, ss.str());
-    }
-    PIP_ASSERT(!unhashable);
-    i = k & mask;
-    if(table_flag_empty(table->flags, i)) {
-      x = i;
+    Value* cell = table_get_cell(table, key);
+    if(cell) {
+      found = true;
+      return cell->cdr();
     } else {
-      step = table_step(k, mask);
-      last = i;
-
-      // Search through deleted/colliding buckets for a place to put this
-      while(!table_flag_empty(table->flags, i) &&
-           ((table_flag_deleted(table->flags, i)) ||
-            !equals(table->keys->data[i], key))) {
-
-        if(table_flag_deleted(table->flags, i))
-          site = i;
-        i = (i + step) & mask;
-        if(i == last) {
-          x = site;
-          break;
-        }
-      }
-
-      if(x == table->buckets) {
-        if(table_flag_empty(table->flags, i) && site != table->buckets) {
-          x = site;
-        } else {
-          x = i;
-        }
-      }
+      found = false;
+      return PIP_FALSE;
     }
-
-    // Not present at all
-    if(table_flag_empty(table->flags, x)) {
-      table->keys->data[x] = key;
-      table_flag_set_isboth_false(table->flags, x);
-      ++table->size;
-      ++table->occupied;
-    } else if(table_flag_deleted(table->flags, x)) {
-      // Deleted
-      table->keys->data[x] = key;
-      table_flag_set_isboth_false(table->flags, x);
-      ++table->size;
-    }
-
-    if(!table->table_act_as_set()) {
-      table->values->data[x] = value;
-    }
-
-    return PIP_UNSPECIFIED;
-  }
-
-
+  }  
 
   ///// (READ) Expression reader and source code tracking 
 
@@ -3721,6 +3629,11 @@ inline std::ostream& operator<<(std::ostream& os, Value* x) {
     case UPVALUE: return os << "#<upvalue "
                             << (x->upvalue_closed() ? "(closed) " : "")
                             << " " << x->upvalue() << ')' << std::endl;
+    case TABLE: {
+      Table* t = static_cast<Table*>(x);
+      return os << "#<table entries: " << t->entries
+                << " max-entries: " << t->max_entries << ">";
+    }
     default:
       return os << "#<unknown value " << (size_t) x << " type: "
                 << x->get_type() << ">";

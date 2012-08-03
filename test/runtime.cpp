@@ -124,7 +124,7 @@ static void test_tables(State& state) {
 
   for(int i = 0; i != 100; i++) {
     bool found = false;
-    state.table_set(table, Value::make_fixnum(i), Value::make_fixnum(i));
+    state.table_insert(table, Value::make_fixnum(i), Value::make_fixnum(i));
 
     assert(state.table_get(table, Value::make_fixnum(i), found) == Value::make_fixnum(i));
     assert(found);
@@ -132,7 +132,7 @@ static void test_tables(State& state) {
 
   str = state.make_string("hello");
 
-  state.table_set(table, str, Value::make_fixnum(12345));
+  state.table_insert(table, str, Value::make_fixnum(12345));
   bool found = false;
   assert(state.table_get(table, str, found) == Value::make_fixnum(12345));
   assert(found);
