@@ -394,6 +394,7 @@ struct Value {
   bool table_act_as_set() const {
     return get_header_bit(TABLE, TABLE_ACT_AS_SET_BIT);
   }
+
   bool table_weak() const { return get_header_bit(TABLE, TABLE_WEAK_BIT); }
 };
 
@@ -1021,6 +1022,40 @@ struct State {
         recursive_mark(f->upvalues[j]);
       }
     }
+
+    // Handle the symbol table, which is sort of an ad hoc weak table
+    for(size_t i = 0; i != symbol_table->chains->length; i++) {
+      Value* cell = symbol_table->chains->data[i];
+      Value* previous = 0;
+      while(cell->get_type() == PAIR) {
+        // If the value has been collected
+        if(!markedp(cell->cdar())) {
+          // If this is the head of the linked list
+          if(cell == symbol_table->chains->data[i]) {
+            // remove from front
+            symbol_table->chains->data[i] = cell->cdr();
+            previous = 0;
+            cell = cell->cdr();
+            continue;
+          }
+          // Remove cell from previous list
+          else if(previous) {
+            previous->set_cdr(cell->cdr());
+            cell = cell->cdr();
+            continue;
+          }
+        }
+        // Cell is alive, keep going
+        previous = cell;
+        cell = cell->cdr();
+      } 
+      if(symbol_table->chains->data[i] == PIP_NULL)
+        symbol_table->chains->data[i] = PIP_FALSE;
+    }
+
+    // Now that all the collected entries have been removed, we can mark the
+    // table
+    recursive_mark(symbol_table);
   }
   
   void reset_sweep_cursor() {
@@ -1286,6 +1321,8 @@ struct State {
       }
     }
 
+    update_forward((Value**) &symbol_table);
+
     PIP_GC_MSG("updating heap with new pointers");
     char* sweep = heap->begin;
     while(sweep != bump) {
@@ -1375,7 +1412,6 @@ struct State {
     block_cursor(0),  live_at_last_collection(0), collections(0),
     sweep_cursor(0),
 
-    symbol_table(*this),
     // Reader
     source_counter(1),
    
@@ -1466,7 +1502,7 @@ struct State {
     blocks.clear();
   }
 
-  Handle<Table> symbol_table;
+  Table* symbol_table;
   std::vector<Handle<Value> *> globals;
 
   enum Global {
@@ -1588,7 +1624,7 @@ struct State {
   Symbol* make_symbol(String* string) {
     Symbol* sym = 0;
     bool found;
-    Value* search = table_get(*symbol_table, string, found);
+    Value* search = table_get(symbol_table, string, found);
     if(found) {
       sym = PIP_CAST(Symbol, search);
     } else {
@@ -1598,7 +1634,7 @@ struct State {
       sym = allocate<Symbol>();
       cpy = make_string(string);
       sym->name = cpy;
-      table_insert(*symbol_table, cpy, sym);
+      table_insert(symbol_table, cpy, sym);
     }
     return sym;
   }
@@ -1782,80 +1818,25 @@ struct State {
 
   ///// HASH TABLES
 
-  // Flag manipulation
-  static int table_flag_index(Blob* flags, int i) {
-    // i>>4 = find byte in int
-    // 0-15 => 0
-    // 16-31 => 1
-    // etc
-
-    // i & 15
-    // 0-15 => 0-15
-    // 16-31 => 0-15
-    // etc
-    return ((int*)flags->data)[i>>4] >> ((i & 15) << 1);
-  }
-
-  static int table_flag_empty(Blob* flags, int i)  {
-    return table_flag_index(flags, i) & 2; // 10
-  }
-
-  static int table_flag_deleted(Blob* flags, int i)  {
-    return table_flag_index(flags, i) & 1; // 01
-  }
-
-  static int table_flag_either(Blob* flags, int i)  {
-    return table_flag_index(flags, i) & 3; // 11
-  }
-
-  static void table_flag_set_empty_false(Blob* flags, int i) {
-    ((int*)flags->data)[i>>4] &= ~(2 << ((i & 15) << 1));
-  }
-
-  static void table_flag_set_isboth_false(Blob* flags, int i) {
-    ((int*)flags->data)[i>>4] &= ~(3 << ((i & 15) << 1));
-  }
-
-  static void table_flag_set_deleted_true(Blob* flags, int i) {
-    ((int*)flags->data)[i>>4] |= 1 << ((i & 15) << 1);
-  }
-
-  static size_t table_step(ptrdiff_t k, ptrdiff_t mask) {
-    return (((k)>>3 ^ (k) << 3) | 1) & mask;
-  }
-
-  // Return the size of a table flag blob, which can store 16 flags in
-  // 4 bytes.
-  static size_t table_flag_blob_size(size_t m) {
-    return (m < 16 ? 1 : m >> 4) * sizeof(int);
-  }
-
-#if ODD_64_BIT
-
   static ptrdiff_t wang_integer_hash(ptrdiff_t key) {
-    key = (~key) + (key << 21); // key = (key << 21) - key - 1;
+#if ODD_64_BIT
+    key = (~key) + (key << 21);
     key = key ^ (key >> 24);
-    key = (key + (key << 3)) + (key << 8); // key * 265
+    key = (key + (key << 3)) + (key << 8); 
     key = key ^ (key >> 14);
-    key = (key + (key << 2)) + (key << 4); // key * 21
+    key = (key + (key << 2)) + (key << 4); 
     key = key ^ (key >> 28);
     key = key + (key << 31);
-    return key;
-  }
-
 #else
-
-  static ptrdiff_t wang_integer_hash(int key) {
-    key = ~key + (key << 15); // key = (key << 15) - key - 1;
+    key = ~key + (key << 15); 
     key = key ^ (key >> 12);
     key = key + (key << 2);
     key = key ^ (key >> 4);
-    key = key * 2057; // key = (key + (key << 3)) + (key << 11);
+    key = key * 2057; 
     key = key ^ (key >> 16);
+#endif
     return key;
   }
-
-#endif
 
   static ptrdiff_t x31_string_hash(const char* s) {
     ptrdiff_t h = *s;
@@ -1936,6 +1917,7 @@ struct State {
     // Insert chain
     table->chains->data[index] = chain;
     table->entries++;
+    return PIP_FALSE;
   }
 
   Value* table_get_cell(Table* table, Value* key) {

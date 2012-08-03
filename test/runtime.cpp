@@ -256,5 +256,14 @@ void test() {
   state->compact();
   run_test_suite(*state);
 
+  // print symbol table
+  for(size_t i = 0; i != (state->symbol_table)->chains->length; i++) {
+    Value* cell = (state->symbol_table)->chains->data[i];
+    while(cell->get_type() == PAIR) {
+      std::cout << cell->cdar() << std::endl;
+      cell = cell->cdr();
+    }
+  }
+
   delete state;
 }
