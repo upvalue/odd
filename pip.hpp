@@ -38,12 +38,6 @@
 #include <iostream>
 #include <vector>
 
-#ifdef __APPLE__
-# include <boost/unordered_map.hpp>
-#else
-# include <unordered_map> // TODO: Alternatives to c++0x hash tables
-#endif
-
 #if defined(_LP64)
 # define ODD_64_BIT 1
 #else
@@ -66,7 +60,6 @@
 #define PIP_FAIL(desc, ret) \
   PIP_FAIL0(desc); \
   return (ret); 
-
 
 // Checking for exceptions
 #define PIP_CHECK(x) if((x)->active_exception()) return (x);
@@ -100,19 +93,15 @@
 
 namespace pip {
 
-#ifdef __APPLE__
-using boost::unordered_map;
-#else
-using std::unordered_map;
-#endif
-
 struct State;
 struct Value;
 struct String;
 struct Symbol;
 struct VectorStorage;
+struct Table;
 
 std::ostream& operator<<(std::ostream& os, pip::Value* x);
+std::ostream& print_table(std::ostream& os, Table* t);
 
 ///// UTILITIES
 
@@ -1416,7 +1405,7 @@ struct State {
     source_counter(1),
    
     // Compiler
-    global_env(*this),
+
     // An environment containing special forms, core functions, and all the
     // other building blocks necessary for Pip
     core_env(*this),
@@ -1479,22 +1468,11 @@ struct State {
     source_names.push_back("unknown");
     source_contents.push_back(NULL);
 
-    // Initialize global environment for compiler
-    global_env = make_vector();
-
-    vector_append(*global_env, PIP_FALSE);
-
-    for(size_t i = S_DEFINE; i != S_QUOTE+1; i++) {
-      vector_append(*global_env, global_symbol(static_cast<Global>(i)));
-      vector_append(*global_env, global_symbol(S_SPECIAL));
-    }
-    
+    // Initialize core environment for compiler
     core_env = make_env();
     for(size_t i = S_DEFINE; i != S_QUOTE+1; i++) {
       env_define(*core_env, global_symbol(static_cast<Global>(i)),
                  global_symbol(S_SPECIAL));
-//      table_insert(PIP_CAST(Table, core_env->cdr), global_symbol(static_cast<Global>(i)),
-//      global_symbol(S_SPECIAL));
     }
 
     initialize_builtin_functions();
@@ -1747,7 +1725,6 @@ struct State {
       fn->set_header_bit(NATIVE_FUNCTION,
                          Value::NATIVE_FUNCTION_VARIABLE_ARITY_BIT);
     name = make_symbol(cname);
-    env_def(*global_env, name, global_symbol(S_VARIABLE));
     env_define(*core_env, name, name);
     name->value = fn;
   }
@@ -1800,8 +1777,7 @@ struct State {
 
   // Lists
 
-  // Returns true if something is a true list (either () or a list with no dots
-  // in it)
+  // Returns true if something is a true list (either () or a list with no dots in it)
   static bool listp(Value* lst) {
     if(lst == PIP_NULL) return true;
     if(lst->get_type() != PAIR) return false;
@@ -1868,8 +1844,11 @@ struct State {
     unhashable = false;
     switch(x->get_type()) {
       case STRING: return x31_string_hash(x->string_data());
+      // Why do we hash symbol names instead of symbols directly? Because
+      // symbol pointers change during a compaction, and it's either this or 
+      // rebuild every hash table that uses symbols as keys after compaction
+      case SYMBOL: return x31_string_hash(x->symbol_name()->string_data());
       // For atomic values, identity is value
-      case SYMBOL:
       case FIXNUM:
       case CONSTANT:
         return wang_integer_hash((ptrdiff_t) x);
@@ -1955,15 +1934,12 @@ struct State {
     return PIP_FALSE;
   }
 
-  bool table_set(Table* table, Value* key, Value* value) {
+  Value* table_set(Table* table, Value* key, Value* value) {
     PIP_ASSERT(table->get_type() == TABLE);
     Value* cell = table_get_cell(table, key);
-    if(cell) {
+    if(cell && !cell->active_exception())
       cell->set_cdr(key);
-      return true;
-    } else {
-      return false;
-    }
+    return cell;
   }
 
   Value* table_get(Table* table, Value* key, bool& found) {
@@ -2484,7 +2460,7 @@ struct State {
   // (<parent env> . <table>)
 
   // Where entries in <table> are either syntax transformers or a fixnum
-  // indicating a local variable's index
+  // indicating a local variable's index in the virtual machine's locals array
 
   Pair* make_env(Value* parent = PIP_FALSE) {
     Table* table = 0;
@@ -2498,10 +2474,21 @@ struct State {
   }
 
   void env_define(Pair* env, Value* key, Value* value) {
-    PIP_ASSERT(!env_contains(env, key));
     Table* table = PIP_CAST(Table, env->cdr);
-    Value* chk = table_insert(table, key, value);
+    Value* chk ;
+    if(env_contains(env, key)) {
+      chk = table_set(table, key, value);
+      std::cerr << "WARNING: redefining " << key << std::endl;
+    } else {
+      chk = table_insert(table, key, value);
+    }
     PIP_ASSERT(!chk->active_exception());
+  }
+
+  // If an environment has no parent environment, or a list of delegate
+  // environment, its variables will be global variables
+  bool env_globalp(Pair* env) {
+    return env->car == PIP_FALSE || env->car->get_type_unsafe() == VECTOR;
   }
 
   // Look up an environment variable (the result is rather complex, and
@@ -2509,20 +2496,34 @@ struct State {
 
   enum RefScope { REF_GLOBAL, REF_UP, REF_LOCAL };
   struct Lookup {
-    Lookup(): scope(REF_LOCAL), index(0), level(0) {}
+    Lookup(): scope(REF_LOCAL), success(true) {
+      // Make sure everything is zero-initialized
+      nonglobal.index = nonglobal.level = 0;
+      global = nonglobal.value = 0;
+    }
 
     RefScope scope;
-    unsigned index;
-    unsigned level;
+    bool success;
+    union {
+      Value* global;
+      struct { unsigned index, level; Value* value; } nonglobal;
+    };
   };
 
-  // If an environment has no parent environment, or a list of delegate
-  // environment, its variables will be global variables
-  bool env_globalp(Pair* env) {
-    return env->car == PIP_FALSE || env->car->get_type_unsafe() == PAIR;
+  // Determines whether a lookup result refers to a special form or macro
+  bool lookup_syntaxp(Lookup& lookup) {
+    if(lookup.success) {
+      if(lookup.scope == REF_GLOBAL) {
+        return lookup.global == global_symbol(S_SPECIAL) ||
+               lookup.global->applicablep();
+      } else {
+        return lookup.nonglobal.value->applicablep();
+      }
+    }
+    return false;
   }
 
-  Value* env_ref(Pair* env, Value* key, Lookup& lookup) {
+  void env_lookup(Pair* env, Value* key, Lookup& lookup) {
     Pair* start_env = env;
     // Search through environments
     while(env->get_type() == PAIR) {
@@ -2531,73 +2532,40 @@ struct State {
       Value* cell = table_get_cell(table, key);
       if(cell != PIP_FALSE) {
         // Found a match -- determine scope
+        PIP_ASSERT(cell->get_type() == PAIR);
         if(env_globalp(env)) {
           lookup.scope = REF_GLOBAL;
-          return cell->cdr();
+          lookup.global = cell->cdr();
+          return;
         } else {
           // If we're still searching through the original environment, it's a
           // local variable, and if not, it's a free variable
           lookup.scope = env == start_env ? REF_LOCAL : REF_UP;
-          // Calculate index of a local variable
-          lookup.index = cell->cdr()->fixnum_value();
-          // This is definitely a variable
-          return global_symbol(S_VARIABLE);
+          lookup.nonglobal.value = cell->cdr();
+          // If this is a variable and not a macro, calculate its local index
+          if(cell->cdr()->get_type() == FIXNUM) {
+            lookup.nonglobal.index = cell->cdr()->fixnum_value();
+          }
+          return;
         }
       }
-      // No dice
-      lookup.level++;
+      // No dice (note that even though this is in a union with global, it's
+      // fine to increment because it'll be discarded if we go all the way to a
+      // global variable)
+      lookup.nonglobal.level++;
       // TODO: Delegates
       env = static_cast<Pair*>(env->car);
     }
+    lookup.success = false;
   }
 
-  // Environment format
-  // #(<parent environment> <key> <value> ...)
+  // Search for a variable. Note that the return is convoluted and should
+  // probably be re-written for clarity
 
-  unsigned env_def(Vector* env, Value* key, Value* value) {
-    for(size_t i = 1; i != env->vector_length(); i += 2) {
-      if(env->vector_ref(i) == key) {
-        env->vector_set(i+1, value);
-        return ((i - 1) / 2) - 1;
-      }
-    }
-    PIP_S_FRAME(env, key, value);
-    unsigned slot = vector_append(env, key);
-    vector_append(env, value);
-    return ((slot - 1) / 2) - 1;
-  }
-  Value* env_ref(Vector* env, Value* key, Lookup& lookup) {
-    Value *start_env = env;
-    // Search through environments
-    while(env->get_type() == VECTOR) {
-      // Search through an environment
-      for(size_t i = 1; i != env->vector_length(); i += 2) {
-        // We found a match
-        if(env->vector_ref(i) == key) {
-          // If this environment has no parent environment, it's global
-          if(env->vector_ref(0) == PIP_FALSE) {
-            lookup.scope = REF_GLOBAL;
-          } else {
-            // Otherwise, if we're still searching the original environment,
-            // it's a local variable, and if not, it's an upvalue
-            lookup.scope = env == start_env ? REF_LOCAL : REF_UP;
-          }
-          // Calculate index value from location (we have to compensate for the
-          // fact that both keys and values are stored, and start at 1)
-          lookup.index = (i - 1) / 2;
-          return env->vector_ref(i+1);
-        }
-      }
-      // Search parent environment, if it exists
-      lookup.level++;
-      env = static_cast<Vector*>(env->vector_ref(0));
-    }
-    // Lookup failed
+  // The direct return value will be either a variable name (in the case of a
+  // global variable), 'variable in the case of a local/free variable, or #f in
+  // the case of a failed lookup
 
-    return PIP_FALSE;
-  }
-
-  Handle<Vector> global_env;
   Handle<Pair> core_env;
 
   // A structure describing the location of a free variable relative to the
@@ -2613,17 +2581,18 @@ struct State {
 
   // An instance of the compiler, created for each function
   struct Compiler {
-    Compiler(State& state_, Compiler* parent_, Vector* env_ = NULL,
+    Compiler(State& state_, Compiler* parent_, Pair* env_ = NULL,
              size_t depth_ = 0): 
       state(state_), parent(parent_),
       local_free_variable_count(0), upvalue_count(0),
       stack_max(0), stack_size(0), locals(0), constants(state), closure(false),
       name(state_), env(0), depth(depth_), last_insn(0) {
-      if(!env_) env = &state.global_env;
-      else env = new Handle<Vector>(state, env_);
+      if(!env_) env = &state.core_env;
+      else env = new Handle<Pair>(state, env_);
+      env_globalp = state.env_globalp(**env);
     }
     ~Compiler() {
-      if(env != &state.global_env) delete env;    
+      if(env != &state.core_env) delete env;    
     }
 
     State& state;
@@ -2644,11 +2613,16 @@ struct State {
     // The name of the function (if any)
     Handle<String> name;
     // The environment of the function
-    Handle<Vector>* env;
+    bool env_globalp;
+    Handle<Pair>* env;
     // The depth of the function (for debug message purposes)
     size_t depth;
     // Location of last instruction emitted (for debug message purposes)
     size_t last_insn;
+
+    // Location of last applications emitted, which will be replaced with tail
+    // calls 
+    size_t last_apply1, last_apply2;
 
     // Code generation
     void emit(size_t word) {
@@ -2765,18 +2739,19 @@ struct State {
       // Check for existing free variable
       for(unsigned i = 0; i != free_variables.size(); i++) {
         l = free_variables[i];
-        if(l.lexical_level == lookup.level && l.lexical_index == lookup.index)
+        if(l.lexical_level == lookup.nonglobal.level &&
+           l.lexical_index == lookup.nonglobal.index)
           return i;
       }
       // New free variable - register it with this and all preceding functions
       // as necessary. 
-      l.lexical_level = lookup.level;
-      l.lexical_index = lookup.index;
+      l.lexical_level = lookup.nonglobal.level;
+      l.lexical_index = lookup.nonglobal.index;
       PIP_CC_VMSG("register free variable <" << l.lexical_level << ", "
                   << l.lexical_index << '>');
       Lookup lookup_copy(lookup);
-      lookup_copy.level--;
-      if(lookup.level != 0) {
+      lookup_copy.nonglobal.level--;
+      if(lookup.nonglobal.level != 0) {
         // Register with preceding function, and make this a closure if it
         // isn't already
         closure = true;
@@ -2797,37 +2772,44 @@ struct State {
       annotate(exp);
       Value* name = unbox(exp);
       Lookup lookup;
-      Value* type = state.env_ref(**env, name, lookup);
-      if(type == state.global_symbol(S_SPECIAL))
-        return syntax_error(exp, "special forms cannot be used as values");
-      else if(type == state.global_symbol(S_VARIABLE)) {
-        switch(lookup.scope) {
-          case REF_GLOBAL:
-            push_constant(name);
-            emit(OP_GLOBAL_GET);
-            PIP_CC_EMIT("global-get " << name);
-            // No stack change - the name will be popped, but the value
-            // will be pushed
-            break;
-          case REF_LOCAL:
+      state.env_lookup(**env, name, lookup);
+      if(!lookup.success) return undefined_variable(exp);
+      switch(lookup.scope) {
+        case REF_GLOBAL:
+          if(lookup.global == state.global_symbol(S_SPECIAL))
+            return syntax_error(exp, "special forms cannot be used as values");
+          if(lookup.global->applicablep())
+            return syntax_error(exp, "macros cannot be used as values");
+          // Why do we need lookup.global when we already have the name?
+          // Because it could be a reference to a module variable, 
+          // eg car => #core.car
+          push_constant(lookup.global);
+          emit(OP_GLOBAL_GET);
+          PIP_CC_EMIT("global-get " << name);
+          // No stack change -- the name will be popped, but the value will be
+          // pushed       
+          break;
+        case REF_UP:
+        case REF_LOCAL: {
+          // Make sure we haven't been passed a macro (there can be local
+          // macros in the case of let-syntax)
+          if(lookup.nonglobal.value->applicablep()) 
+            return syntax_error(exp, "macros cannot be used as values");
+          if(lookup.scope == REF_LOCAL) {
             emit(OP_LOCAL_GET);
-            emit_arg(lookup.index);
-            PIP_CC_EMIT("local-get " << name << ' ' << lookup.index);
+            emit_arg(lookup.nonglobal.index);
+            PIP_CC_EMIT("local-get " << name << ' ' << lookup.nonglobal.index);
             push();
-            break;
-          case REF_UP:
+          } else {
+            PIP_ASSERT(lookup.scope == REF_UP);
             unsigned index = register_free_variable(lookup);
             emit(OP_UPVALUE_GET);
             emit_arg(index);
             PIP_CC_EMIT("upvalue-get " << name << ' ' << index);
             push();
-            break;
-        } 
-      } else if(type->applicablep()) {
-        // syntax
-        PIP_FAIL0("no syntax allowed!");
-      } else {
-        return undefined_variable(exp);
+          }
+          break;
+        }
       }
       return PIP_FALSE;
     }
@@ -2844,8 +2826,8 @@ struct State {
           break;
         case REF_LOCAL:
           emit(OP_LOCAL_SET);
-          emit_arg(lookup.index);
-          PIP_CC_EMIT("local-set " << (unsigned) lookup.index);
+          emit_arg(lookup.nonglobal.index);
+          PIP_CC_EMIT("local-set " << (unsigned) lookup.nonglobal.index);
           pop();
           break;
         case REF_UP: assert(0);
@@ -2863,7 +2845,7 @@ restart:
       Value* args = 0;
       if(name->get_type() != SYMBOL) {
         // Parse a lambda shortcut, e.g. (define (x) #t) becomes 
-        // (define x (named-lambda x () #t))
+        // (define x (#named-lambda x () #t))
         if(name->get_type() == PAIR) {
           args = name->cdr();
           name = name->car();
@@ -2887,18 +2869,36 @@ restart:
         } else return syntax_error(S_DEFINE, exp,
                                   "first argument to define must be a symbol");
       }
+      // Parse a define lambda expression, e.g.: 
+      // (define name (lambda () #t))
+      // becomes
+      // (define name (#named-lambda name () #t)
       // TODO: Handle (define name (lambda () #t))
-      unsigned slot = state.env_def(**env, name,
-                                    state.global_symbol(S_VARIABLE));
+
+      // We'll create a fake lookup structure for generate_set here
+      Lookup lookup;
+      Value* value = 0;
+      if(env_globalp) {
+        // If this is a global variable, the compile-time value of the variable
+        // will be the actual global symbol
+        lookup.scope = REF_GLOBAL;
+        value = name;
+      } else {
+        // If this is not a global variable, we need to register it as a local
+        // The compile-time value of the variable will be a fixnum index
+        lookup.scope = REF_LOCAL;
+        lookup.nonglobal.index = locals;
+        value = Value::make_fixnum(locals++);
+      }
+
+      // TODO: Allow re-definitions, but warn about them
+      state.env_define(**env, name, value);
+
       // Compile body for set!
       PIP_FRAME(name);
       chk = compile(exp->cddr()->car());
       PIP_CHECK(chk);
-      // Global variable
-      Lookup lookup;
-      lookup.scope =
-        (*env)->vector_ref(0) == PIP_FALSE ? REF_GLOBAL : REF_LOCAL;
-      lookup.index = slot;
+      // Set variable
       generate_set(lookup, name);
       return PIP_FALSE;
     }
@@ -2919,14 +2919,14 @@ restart:
 
       // Look up variable
       Lookup lookup;
-      Value* type = state.env_ref(**env, name, lookup);
-      // Don't allow special forms
-      if(type == state.global_symbol(S_SPECIAL))
-        return syntax_error(exp, "special forms cannot be used as variables");
-      // Lookup was successful
-      else if(type == state.global_symbol(S_VARIABLE)) {
-        generate_set(lookup, name);
-      } else assert(0);
+      state.env_lookup(**env, name, lookup);
+      // Don't allow special forms or syntax
+      if(!lookup.success)
+        return undefined_variable(exp->cadr());
+      if(state.lookup_syntaxp(lookup))
+        return syntax_error(exp, "syntax cannot be set! like a variable");
+
+      generate_set(lookup, name);
       return PIP_FALSE;
     }
 
@@ -2964,13 +2964,15 @@ restart:
       // Will be set to true if the function is variable arity
       // (i.e. takes unlimited arguments)
       bool variable_arity = false;
-      Value *new_env = 0, *args = 0, *body = 0;
+      Pair *new_env = 0;
+      Value *args = 0, *body = 0;
       Prototype* proto = 0;
       PIP_FRAME(exp, new_env, args, body, proto);
-      // Create a new environment for the function
-      new_env = state.make_vector();
+      // Create a new environment for the function with the current environment
+      // as its parent
+      new_env = state.make_env(**env);
       // Make the current environment its parent environment
-      state.vector_append(PIP_CAST(Vector, new_env), **env);
+      // state.vector_append(PIP_CAST(Vector, new_env), **env);
       // Now parse the function's arguments and define them within the
       // new environment
       args = exp->cadr();
@@ -2985,9 +2987,8 @@ restart:
                                 "lambda argument list must be symbols");
           }
           // Finally, we can add them to the environment!
-          state.vector_append(PIP_CAST(Vector, new_env), arg);
-          state.vector_append(PIP_CAST(Vector, new_env),
-                              state.global_symbol(S_VARIABLE));
+          // Add it as a local variable
+          state.env_define(new_env, arg, Value::make_fixnum(argc));
           argc++;
           args = args->cdr();
           if(args->get_type() != PAIR) {
@@ -2998,7 +2999,8 @@ restart:
       }
       // Compile the function's body
       PIP_CC_MSG("compiling subfunction");
-      Compiler cc(state, this, PIP_CAST(Vector, new_env), depth+1);
+      Compiler cc(state, this, new_env, depth+1);
+      cc.locals = argc;
       cc.name = static_cast<String*>(name);
       body = exp->cddr();
       while(body != PIP_NULL) {
@@ -3130,8 +3132,8 @@ restart:
         case CONSTANT:
           emit(OP_PUSH_IMMEDIATE);
           emit_arg((ptrdiff_t) exp);
-          PIP_CC_EMIT("push-immediate " << exp);
           push();
+          PIP_CC_EMIT("push-immediate " << exp);
           break;
         // Variable references
         case SYMBOL:
@@ -3146,46 +3148,55 @@ restart:
             return syntax_error(exp, "dotted lists not allowed in source");
           // Note the source location of this application
           annotate(exp);
-          // Check for special forms
+          // Check for special forms and macros
           Lookup lookup;
-          Value* type = state.env_ref(**env, unbox(exp->car()), lookup);
-          // If this is a special form
-          if(type == state.global_symbol(S_SPECIAL)) {
-            // Dispatch on the special form
-            Symbol* op = PIP_CAST(Symbol, unbox(exp->car()));
-            size_t argc = length(exp->cdr());
-            // define
-            if(op == state.global_symbol(S_DEFINE)) {
-              return compile_define(argc, exp, tail);
-            // set!
-            } else if(op == state.global_symbol(S_SET)) {
-              return compile_set(argc, exp, tail);
-            // begin
-            } else if(op == state.global_symbol(S_BEGIN)) {
-              return compile_begin(argc, exp, tail);
-            // lambda
-            } else if(op == state.global_symbol(S_LAMBDA)) {
-              return compile_lambda(argc, exp, tail, PIP_FALSE);
-            // named-lambda
-            } else if(op == state.global_symbol(S_NAMED_LAMBDA)) {  
-              // This is a little hacky, but we're going to extract the name
-              // here and then make it look like a normal lambda for
-              // compile_lambda
-              
-              // No need for parsing because named lambdas are generated by the
-              // parser
-              Value* name = exp->cadr();
-              Value* rest = exp->cddr();
-              exp->set_cdr(rest);
+          Value* function = unbox(exp->car());
+          bool syntax = false;
+          if(function->get_type() == SYMBOL) {
+            state.env_lookup(**env, function, lookup);
+            syntax = state.lookup_syntaxp(lookup);
+          }
+          if(syntax) {
+            if(lookup.global == state.global_symbol(S_SPECIAL)) {
+              // Dispatch on the special form
+              Symbol* op = PIP_CAST(Symbol, function);
+              size_t argc = length(exp->cdr());
+              // define
+              if(op == state.global_symbol(S_DEFINE)) {
+                return compile_define(argc, exp, tail);
+              // set!
+              } else if(op == state.global_symbol(S_SET)) {
+                return compile_set(argc, exp, tail);
+              // begin
+              } else if(op == state.global_symbol(S_BEGIN)) {
+                return compile_begin(argc, exp, tail);
+              // lambda
+              } else if(op == state.global_symbol(S_LAMBDA)) {
+                return compile_lambda(argc, exp, tail, PIP_FALSE);
+              // named-lambda
+              } else if(op == state.global_symbol(S_NAMED_LAMBDA)) {  
+                // This is a little hacky, but we're going to extract the name
+                // here and then make it look like a normal lambda for
+                // compile_lambda
+                
+                // No need for parsing because named lambdas are generated by the
+                // parser
+                Value* name = exp->cadr();
+                Value* rest = exp->cddr();
+                exp->set_cdr(rest);
 
-              return compile_lambda(argc-1, exp, tail, name);
-            } else if(op == state.global_symbol(S_IF)) {
-              return compile_if(argc, exp, tail);
-            } else if(op == state.global_symbol(S_QUOTE)) {
-              return compile_quote(argc, exp);
-            } else if(op == state.global_symbol(S_DEFINE_SYNTAX)) {
-              return compile_define_syntax(argc, exp, tail);
-            } else assert(0);
+                return compile_lambda(argc-1, exp, tail, name);
+              } else if(op == state.global_symbol(S_IF)) {
+                return compile_if(argc, exp, tail);
+              } else if(op == state.global_symbol(S_QUOTE)) {
+                return compile_quote(argc, exp);
+              } else if(op == state.global_symbol(S_DEFINE_SYNTAX)) {
+                return compile_define_syntax(argc, exp, tail);
+              } else assert(0);
+            } else {
+              // Syntax
+              PIP_FAIL0("syntax not supported");
+            }
           } else {
             // function application
             return compile_apply(exp, tail);
@@ -3613,6 +3624,22 @@ inline Frame::~Frame() {
 ///// (STD) Standard Scheme functions implemented in C++
 
 // TYPENOTE
+inline std::ostream& print_table(std::ostream& os, Table* t) {
+  PIP_ASSERT(t->get_type() == TABLE);
+  os << "#<table " << std::endl;
+  for(size_t i = 0; i != t->chains->length; i++) {
+    Value* chain = t->chains->data[i];
+    if(chain)
+      std::cout << " chain " << i << ":" << std::endl; 
+    while(chain->get_type() == PAIR) {
+      std::cout << "  " << chain->caar() << " => " << chain->cdar()
+                << std::endl;
+      chain = chain->cdr();
+    }
+  }
+  return os << '>';
+}
+
 inline std::ostream& operator<<(std::ostream& os, Type& t) {
   switch(t) {
     case UPVALUE: os << "an upvalue"; break;

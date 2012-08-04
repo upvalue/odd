@@ -120,7 +120,7 @@ static void test_tables(State& state) {
   PIP_FRAME(table, str);
   std::cout << "!! test_tables" << std::endl;
 
-  table = state.make_table(); 
+  table = state.make_table(6); 
 
   for(int i = 0; i != 100; i++) {
     bool found = false;
@@ -192,6 +192,13 @@ void test_eval(State& state, const std::string& string, Type type) {
   assert(x->get_type() == type);
 }
 
+// test_eval for weird, one-off assertions
+template <class success_functor_t> void test_eval(State& state, const std::string& string, Type type, success_functor_t& success_functor) {
+  Value* x = eval_string(state, string);
+  std::cout << "!! test compiler: " << string << " => " << success_functor_t::description << std::endl;
+  assert(success_functor(x));
+}
+
 void test_compiler(State& state) {
   std::cout << "!! test_compiler" << std::endl;
   test_eval(state, "#t", PIP_TRUE);
@@ -199,12 +206,11 @@ void test_compiler(State& state) {
   // Global variable access
   test_eval(state, "(define x #t) x", PIP_TRUE);
 
-#if 0
-
   // Function compilation
   test_eval(state, "(lambda () #t) ", PROTOTYPE);
   // Simple application
   test_eval(state, "((lambda () #t))", PIP_TRUE);
+
   // Argument function and application
   test_eval(state, "((lambda (x) x) #t)", PIP_TRUE);
   // Set!
@@ -234,7 +240,6 @@ void test_compiler(State& state) {
   test_eval(state, "(car (quote (#t)))", PIP_TRUE);
   // define-syntax
   //test_eval(state, "(define-syntax hello (er-macro-transformer (lambda (x r c) #t))) (hello)", PIP_TRUE);
-#endif
 }
 
 void run_test_suite(State& state) {
