@@ -1417,13 +1417,16 @@ struct State {
    
     // Compiler
     global_env(*this),
+    // An environment containing special forms, core functions, and all the
+    // other building blocks necessary for Pip
+    core_env(*this),
     
     // Virtual machine
     vm_depth(0),
     vm_trampoline_function(0) {
 
     // Initialize garbage collector
-    Block* first = new Block(PIP_HEAP_ALIGNMENT, false, mark_bit);
+    Block* first = new Block(PIP_HEAP_ALIGNMENT * 2, false, mark_bit);
     blocks.push_back(first);
     sweep_cursor = first->begin;
 
@@ -1445,18 +1448,21 @@ struct State {
       "lambda",
       "#named-lambda",
       "if",
-      "quote",
-      "quasiquote",
-      "unquote",
-      "unquote-splicing",
       "define-syntax",
       "let-syntax",
       "letrec-syntax",
       "define-library",
+      "quote",
+      // Other
+      "quasiquote",
+      "unquote",
+      "unquote-splicing",
       "import",
       "export",
       "rename",
-      "include"
+      "include",
+      "#delegates",
+
     };
 
     // Allocate the symbol table, with a fair bit of space because we're going
@@ -1478,11 +1484,19 @@ struct State {
 
     vector_append(*global_env, PIP_FALSE);
 
-    for(size_t i = S_DEFINE; i != S_DEFINE_LIBRARY+1; i++) {
+    for(size_t i = S_DEFINE; i != S_QUOTE+1; i++) {
       vector_append(*global_env, global_symbol(static_cast<Global>(i)));
       vector_append(*global_env, global_symbol(S_SPECIAL));
     }
     
+    core_env = make_env();
+    for(size_t i = S_DEFINE; i != S_QUOTE+1; i++) {
+      env_define(*core_env, global_symbol(static_cast<Global>(i)),
+                 global_symbol(S_SPECIAL));
+//      table_insert(PIP_CAST(Table, core_env->cdr), global_symbol(static_cast<Global>(i)),
+//      global_symbol(S_SPECIAL));
+    }
+
     initialize_builtin_functions();
   }
 
@@ -1519,18 +1533,19 @@ struct State {
     S_LAMBDA,
     S_NAMED_LAMBDA,
     S_IF,
-    S_QUOTE,
-    S_QUASIQUOTE,
-    S_UNQUOTE,
-    S_UNQUOTE_SPLICING,
     S_DEFINE_SYNTAX,
     S_LET_SYNTAX,
     S_LETREC_SYNTAX,
     S_DEFINE_LIBRARY,
+    S_QUOTE,
+    S_QUASIQUOTE,
+    S_UNQUOTE,
+    S_UNQUOTE_SPLICING,
     S_IMPORT,
     S_EXPORT,
     S_RENAME,
     S_INCLUDE,
+    S_DELEGATES,
     GLOBAL_SYMBOL_COUNT
   };
 
@@ -1733,6 +1748,7 @@ struct State {
                          Value::NATIVE_FUNCTION_VARIABLE_ARITY_BIT);
     name = make_symbol(cname);
     env_def(*global_env, name, global_symbol(S_VARIABLE));
+    env_define(*core_env, name, name);
     name->value = fn;
   }
 
@@ -1782,6 +1798,10 @@ struct State {
     }
   }
 
+  // Lists
+
+  // Returns true if something is a true list (either () or a list with no dots
+  // in it)
   static bool listp(Value* lst) {
     if(lst == PIP_NULL) return true;
     if(lst->get_type() != PAIR) return false;
@@ -1935,6 +1955,17 @@ struct State {
     return PIP_FALSE;
   }
 
+  bool table_set(Table* table, Value* key, Value* value) {
+    PIP_ASSERT(table->get_type() == TABLE);
+    Value* cell = table_get_cell(table, key);
+    if(cell) {
+      cell->set_cdr(key);
+      return true;
+    } else {
+      return false;
+    }
+  }
+
   Value* table_get(Table* table, Value* key, bool& found) {
     PIP_ASSERT(table->get_type() == TABLE);
     Value* cell = table_get_cell(table, key);
@@ -1946,6 +1977,11 @@ struct State {
       return PIP_FALSE;
     }
   }  
+
+  bool table_contains(Table* table, Value* key) {
+    PIP_ASSERT(table->get_type() == TABLE);
+    return table_get_cell(table, key) != PIP_FALSE;
+  }
 
   ///// (READ) Expression reader and source code tracking 
 
@@ -2432,23 +2468,40 @@ struct State {
     unsigned index;
   };
 
-  // Environments
+  // Compilation environment format
 
-  // Environment format
-  // #(<parent environment> <key> <value> ...)
+  // An environment is a pair containing a "parent" environment or a vector of
+  // "imported" environments as the car, and a symbol table as the cdr
 
-  // Set an environment variable
-  unsigned env_def(Vector* env, Value* key, Value* value) {
-    for(size_t i = 1; i != env->vector_length(); i += 2) {
-      if(env->vector_ref(i) == key) {
-        env->vector_set(i+1, value);
-        return ((i - 1) / 2) - 1;
-      }
-    }
-    PIP_S_FRAME(env, key, value);
-    unsigned slot = vector_append(env, key);
-    vector_append(env, value);
-    return ((slot - 1) / 2) - 1;
+  // Top-level environment:
+  // Either (#f . <table>) 
+  // Or (#(<imported env> ...) . <table>)
+
+  // Where entries in <table> are either 'special', a syntax transformer, or a
+  // symbol name indicating a global variable
+
+  // Local environment:
+  // (<parent env> . <table>)
+
+  // Where entries in <table> are either syntax transformers or a fixnum
+  // indicating a local variable's index
+
+  Pair* make_env(Value* parent = PIP_FALSE) {
+    Table* table = 0;
+    PIP_S_FRAME(parent, table);
+    table = make_table();
+    return cons(parent, table);
+  }
+
+  bool env_contains(Pair* env, Value* key) {
+    return table_contains(PIP_CAST(Table, env->cdr), key);
+  }
+
+  void env_define(Pair* env, Value* key, Value* value) {
+    PIP_ASSERT(!env_contains(env, key));
+    Table* table = PIP_CAST(Table, env->cdr);
+    Value* chk = table_insert(table, key, value);
+    PIP_ASSERT(!chk->active_exception());
   }
 
   // Look up an environment variable (the result is rather complex, and
@@ -2463,6 +2516,56 @@ struct State {
     unsigned level;
   };
 
+  // If an environment has no parent environment, or a list of delegate
+  // environment, its variables will be global variables
+  bool env_globalp(Pair* env) {
+    return env->car == PIP_FALSE || env->car->get_type_unsafe() == PAIR;
+  }
+
+  Value* env_ref(Pair* env, Value* key, Lookup& lookup) {
+    Pair* start_env = env;
+    // Search through environments
+    while(env->get_type() == PAIR) {
+      Table* table = PIP_CAST(Table, env->cdr);
+      // Search through an environment
+      Value* cell = table_get_cell(table, key);
+      if(cell != PIP_FALSE) {
+        // Found a match -- determine scope
+        if(env_globalp(env)) {
+          lookup.scope = REF_GLOBAL;
+          return cell->cdr();
+        } else {
+          // If we're still searching through the original environment, it's a
+          // local variable, and if not, it's a free variable
+          lookup.scope = env == start_env ? REF_LOCAL : REF_UP;
+          // Calculate index of a local variable
+          lookup.index = cell->cdr()->fixnum_value();
+          // This is definitely a variable
+          return global_symbol(S_VARIABLE);
+        }
+      }
+      // No dice
+      lookup.level++;
+      // TODO: Delegates
+      env = static_cast<Pair*>(env->car);
+    }
+  }
+
+  // Environment format
+  // #(<parent environment> <key> <value> ...)
+
+  unsigned env_def(Vector* env, Value* key, Value* value) {
+    for(size_t i = 1; i != env->vector_length(); i += 2) {
+      if(env->vector_ref(i) == key) {
+        env->vector_set(i+1, value);
+        return ((i - 1) / 2) - 1;
+      }
+    }
+    PIP_S_FRAME(env, key, value);
+    unsigned slot = vector_append(env, key);
+    vector_append(env, value);
+    return ((slot - 1) / 2) - 1;
+  }
   Value* env_ref(Vector* env, Value* key, Lookup& lookup) {
     Value *start_env = env;
     // Search through environments
@@ -2495,6 +2598,7 @@ struct State {
   }
 
   Handle<Vector> global_env;
+  Handle<Pair> core_env;
 
   // A structure describing the location of a free variable relative to the
   // function it's being used in
@@ -2545,10 +2649,6 @@ struct State {
     size_t depth;
     // Location of last instruction emitted (for debug message purposes)
     size_t last_insn;
-
-    // Location of last applications emitted, which will be replaced with tail
-    // calls 
-    size_t last_apply1, last_apply2;
 
     // Code generation
     void emit(size_t word) {

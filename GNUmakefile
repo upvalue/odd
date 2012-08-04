@@ -1,4 +1,4 @@
-CXXFLAGS := -Wall -g3 -fno-rtti -fno-exceptions -DPIP_DEBUG -pipe 
+CXXFLAGS := -O2 -Wall -g3 -fno-rtti -fno-exceptions -DPIP_DEBUG -pipe 
 LDFLAGS := 
 
 ifneq ($(shell uname -s),Darwin)
