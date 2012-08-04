@@ -7,8 +7,6 @@
 
 // Welcome to Pip Scheme!
 
-// Pip is an implementation of the Scheme programming language. In addition to
-// that, it's also something of a guided tour through language implementation.
 // You can use the following "table of contents" to navigate the source code.
 
 // 1. (PRELUDE) Preprocessor definitions and miscellaneous utilities
@@ -359,6 +357,8 @@ struct Value {
     return get_header_bit(PROTOTYPE, PROTOTYPE_VARIABLE_ARITY_BIT);
   }
 
+  const char* prototype_name() const;
+
   // Upvalues
   static const int UPVALUE_CLOSED_BIT = 1 << 15;
 
@@ -376,16 +376,6 @@ struct Value {
   bool native_function_variable_arity() const { 
     return get_header_bit(NATIVE_FUNCTION, NATIVE_FUNCTION_VARIABLE_ARITY_BIT);
   }
-
-  // Tables
-  static const int TABLE_ACT_AS_SET_BIT = 1 << 15;
-  static const int TABLE_WEAK_BIT = 1 << 14;
-
-  bool table_act_as_set() const {
-    return get_header_bit(TABLE, TABLE_ACT_AS_SET_BIT);
-  }
-
-  bool table_weak() const { return get_header_bit(TABLE, TABLE_WEAK_BIT); }
 };
 
 struct Pair : Value {
@@ -589,6 +579,12 @@ struct Prototype : Value {
   static const Type CLASS_TYPE = PROTOTYPE;
 };
 
+const char* Value::prototype_name() const {
+  PIP_ASSERT(get_type() == PROTOTYPE);
+  return static_cast<const Prototype*>(this)->name
+    ? static_cast<const Prototype*>(this)->name->string_data() : "anonymous";
+}
+
 // A closure, aka a function which references free variables
 struct Closure : Value {
   Prototype* prototype;
@@ -628,8 +624,9 @@ void Value::upvalue_close() {
 }
 
 struct NativeFunction : Value {
-  typedef Value* (*ptr_t)(State&, unsigned, Value* args[]);
+  typedef Value* (*ptr_t)(State&, unsigned, Value* args[], VectorStorage*);
 
+  VectorStorage* closure;
   unsigned arguments;
   ptr_t pointer;
 
@@ -727,9 +724,6 @@ struct State {
 
   ///// (GC) Garbage collector
 
-  // NOTE: Garbage collector tracking macros are declared above the State
-  // structure
-
   // <--
   // Pip's garbage collector is a mark-and-don't-sweep collector. The allocator
   // is a first-fit allocator: it allocates memory from the first appropriately
@@ -812,18 +806,14 @@ struct State {
         // marked as though they were pairs)
 
         // Atomic
-        case NATIVE_FUNCTION: case STRING: case BLOB:
+        case STRING: case BLOB:
           return;
         // One pointer
-        case TABLE:
-        case VECTOR:
-        case BOX:
+        case NATIVE_FUNCTION: case TABLE: case VECTOR: case BOX:
           x = static_cast<Box*>(x)->value;
           continue;
         // Two pointers 
-        case CLOSURE:
-        case PAIR:
-        case SYMBOL:
+        case CLOSURE: case PAIR: case SYMBOL:
           recursive_mark(static_cast<Pair*>(x)->cdr);
           x = static_cast<Pair*>(x)->car;
           continue;
@@ -1328,10 +1318,10 @@ struct State {
       switch(x->get_type_unsafe()) {
         // TYPENOTE
         // Atomic
-        case NATIVE_FUNCTION: case STRING: case BLOB:
+        case STRING: case BLOB:
           continue;
         // One pointer
-        case VECTOR: case BOX: case TABLE:
+        case NATIVE_FUNCTION: case VECTOR: case BOX: case TABLE:
           PIP_FWD(Box, value);
           continue;
         // Two pointers
@@ -1447,7 +1437,9 @@ struct State {
       "define-syntax",
       "let-syntax",
       "letrec-syntax",
+      "er-macro-transformer",
       "define-library",
+      "#quote",
       "quote",
       // Other
       "quasiquote",
@@ -1458,7 +1450,7 @@ struct State {
       "rename",
       "include",
       "#delegates",
-
+      "#er-macro-transformer"
     };
 
     // Allocate the symbol table, with a fair bit of space because we're going
@@ -1521,7 +1513,9 @@ struct State {
     S_DEFINE_SYNTAX,
     S_LET_SYNTAX,
     S_LETREC_SYNTAX,
+    S_ER_MACRO_TRANSFORMER,
     S_DEFINE_LIBRARY,
+    S_GENERATED_QUOTE,
     S_QUOTE,
     S_QUASIQUOTE,
     S_UNQUOTE,
@@ -1531,6 +1525,7 @@ struct State {
     S_RENAME,
     S_INCLUDE,
     S_DELEGATES,
+    S_REAL_ER_MACRO_TRANSFORMER,
     GLOBAL_SYMBOL_COUNT
   };
 
@@ -1700,6 +1695,22 @@ struct State {
     return table;
   }
 
+  NativeFunction* make_native_function(NativeFunction::ptr_t ptr,
+                                       unsigned arguments,
+                                       bool variable_arity,
+                                       VectorStorage* closure = 0) {
+    NativeFunction* fn = 0;
+    PIP_S_FRAME(fn, closure);
+    fn = allocate<NativeFunction>();
+    fn->pointer = ptr;
+    fn->arguments = arguments;
+    fn->closure = closure;
+    if(variable_arity)
+      fn->set_header_bit(NATIVE_FUNCTION,
+                         Value::NATIVE_FUNCTION_VARIABLE_ARITY_BIT);
+    return fn;
+  }
+
   ///// BASIC FUNCTIONS
 
   static bool equals(Value* a, Value* b) {
@@ -1725,12 +1736,7 @@ struct State {
     NativeFunction* fn = 0;
     Symbol* name = 0;
     PIP_S_FRAME(fn, name);
-    fn = allocate<NativeFunction>();
-    fn->arguments = arguments;
-    fn->pointer = ptr;
-    if(variable_arity) 
-      fn->set_header_bit(NATIVE_FUNCTION,
-                         Value::NATIVE_FUNCTION_VARIABLE_ARITY_BIT);
+    fn = make_native_function(ptr, arguments, variable_arity);
     name = make_symbol(cname);
     env_define(*core_env, name, name);
     name->value = fn;
@@ -1783,6 +1789,13 @@ struct State {
   }
 
   // Lists
+
+  // Dealing with symbols which are boxed and contain source code location
+  // info    
+  static Value* unbox(Value* x) {
+    if(x->get_type() == BOX) return x->box_value();
+    return x;
+  }
 
   // Returns true if something is a true list (either () or a list with no dots in it)
   static bool listp(Value* lst) {
@@ -1945,7 +1958,7 @@ struct State {
     PIP_ASSERT(table->get_type() == TABLE);
     Value* cell = table_get_cell(table, key);
     if(cell && !cell->active_exception())
-      cell->set_cdr(key);
+      cell->set_cdr(value);
     return cell;
   }
 
@@ -2424,6 +2437,9 @@ struct State {
   // allocated (and left) on the heap to support function calls.
   // -->
   
+  // The core environment which contains special forms and builtins
+  Handle<Pair> core_env;
+
   // Some structures that are shared by the virtual machine and compiler
   // Virtual machine instructions
   enum {
@@ -2485,7 +2501,6 @@ struct State {
     Value* chk ;
     if(env_contains(env, key)) {
       chk = table_set(table, key, value);
-      std::cerr << "WARNING: redefining " << key << std::endl;
     } else {
       chk = table_insert(table, key, value);
     }
@@ -2566,15 +2581,6 @@ struct State {
     lookup.success = false;
   }
 
-  // Search for a variable. Note that the return is convoluted and should
-  // probably be re-written for clarity
-
-  // The direct return value will be either a variable name (in the case of a
-  // global variable), 'variable in the case of a local/free variable, or #f in
-  // the case of a failed lookup
-
-  Handle<Pair> core_env;
-
   // A structure describing the location of a free variable relative to the
   // function it's being used in
   struct FreeVariableInfo {
@@ -2598,6 +2604,7 @@ struct State {
       else env = new Handle<Pair>(state, env_);
       env_globalp = state.env_globalp(**env);
     }
+
     ~Compiler() {
       if(env != &state.core_env) delete env;    
     }
@@ -2627,11 +2634,7 @@ struct State {
     // Location of last instruction emitted (for debug message purposes)
     size_t last_insn;
 
-    // Location of last applications emitted, which will be replaced with tail
-    // calls 
-    size_t last_apply1, last_apply2;
-
-    // Code generation
+    // Basic code generation
     void emit(size_t word) {
       last_insn = code.size();
       code.push_back(word);
@@ -2685,13 +2688,6 @@ struct State {
       PIP_CC_VMSG("POP: stack_size = " << stack_size);
     }
 
-    // Dealing with symbols which are boxed and contain source code location
-    // info    
-    Value* unbox(Value* x) {
-      if(x->get_type() == BOX) return x->box_value();
-      return x;
-    }
-
     // Annotating virtual machine instructions with their source location for
     // debug purposes
     void annotate(Value* exp) {
@@ -2704,7 +2700,7 @@ struct State {
       }
     }
 
-    // error handling
+    // Error handling
     Value* syntax_error(Value* form, const std::string& str) {
       std::string out;
       state.format_source_error(form, str, out);
@@ -2738,6 +2734,23 @@ struct State {
       std::string out;
       state.format_source_error(form, ss.str(), out);
       return state.make_exception(State::S_PIP_COMPILE, out);
+    }
+
+    // Checks a function to see whether it is a call to a particular special
+    // form
+    bool check_special_form(Value* form, Global g) {
+      // Quick check to make sure it has the right format and name
+      if(form->get_type() != PAIR) return false;
+      Value* check = unbox(form->car());
+      if(check->get_type() != SYMBOL || check != state.global_symbol(g))
+        return false;
+
+      // But we still need to do a real lookup because form names could be
+      // shadowed by other definitions
+      Lookup lookup;
+      state.env_lookup(**env, check, lookup);
+      return lookup.success && lookup.scope == REF_GLOBAL &&
+        lookup.global == state.global_symbol(S_SPECIAL);
     }
 
     // free variable handling
@@ -2880,27 +2893,19 @@ restart:
       // (define name (lambda () #t))
       // becomes
       // (define name (#named-lambda name () #t)
-      Value* test = unbox(exp->caddr()), *chk_lambda = 0;
+      Value* test = unbox(exp->caddr());
       if(test->get_type() == PAIR) {
-        chk_lambda = unbox(test->car());
-        // Quick check to make sure this is lambda
-        if(chk_lambda == state.global_symbol(S_LAMBDA)) {
-          // Do a real lookup to ensure it's the special form
-          Lookup lookup;
-          state.env_lookup(**env, chk_lambda, lookup);
-          if(lookup.success && lookup.scope == REF_GLOBAL &&
-             lookup.global == state.global_symbol(S_SPECIAL)) {
-            // Yep, start all over again
-            Value *named_lambda = 0;
-            PIP_FRAME(exp, name, args, named_lambda, test);
-            // Get the rest of the expression
-            named_lambda = state.cons(name, test->cdr());
-            named_lambda = state.cons(
-              state.global_symbol(S_NAMED_LAMBDA), named_lambda);
-            named_lambda = state.cons_source(named_lambda, PIP_NULL, exp);
-            exp->cdr()->set_cdr(named_lambda);
-            goto restart;
-          }
+        if(check_special_form(test, S_LAMBDA)) {
+          // Yep, start all over again
+          Value *named_lambda = 0;
+          PIP_FRAME(exp, name, args, named_lambda, test);
+          // Get the rest of the expression
+          named_lambda = state.cons(name, test->cdr());
+          named_lambda = state.cons(
+            state.global_symbol(S_NAMED_LAMBDA), named_lambda);
+          named_lambda = state.cons_source(named_lambda, PIP_NULL, exp);
+          exp->cdr()->set_cdr(named_lambda);
+          goto restart;
         }
       }
       // TODO: Handle (define name (lambda () #t))
@@ -3009,7 +3014,7 @@ restart:
       if(args != PIP_NULL) {
         if(args->get_type() != PAIR) 
           return syntax_error(S_LAMBDA, exp, "first argument to lambda must be"
-                              "either () or a list of arguments");
+                              " either () or a list of arguments");
         while(args->get_type() == PAIR) {
           Value* arg = unbox(args->car());
           if(arg->get_type() != SYMBOL) {
@@ -3154,7 +3159,55 @@ restart:
     }
 
     Value* compile_define_syntax(size_t argc, Value* exp, bool tail) {
+      if(argc != 2) return arity_error(S_DEFINE_SYNTAX, exp, 2, argc);
+      Value* name = unbox(exp->cadr());
+      if(name->get_type() != SYMBOL)
+        return syntax_error(exp,"first define-syntax argument must be symbol");
+      Value* body = exp->caddr();
+      Value* transformer = 0, *swap = 0;
+      PIP_FRAME(exp, name, body, transformer, swap);
+      // Check for (er-macro-transformer ...)
+      // And replace it with (#er-macro-transformer <compiler-env> ...)
+      std::cout << body << std::endl;
+      if(check_special_form(body, S_ER_MACRO_TRANSFORMER)) {
+        body->set_car(state.global_symbol(S_REAL_ER_MACRO_TRANSFORMER));
+        // FIXME: If quote is bound somewhere else, this won't work
+        swap = state.cons(**env, PIP_NULL);
+        swap = state.cons(state.global_symbol(S_GENERATED_QUOTE), swap); 
+        swap = state.cons(swap, body->cdr());
+        body->set_cdr(swap);
+        std::cout << listp(body) << std::endl;
+        std::cout << body << std::endl;
+      }
+      transformer = state.eval(body, **env);
+      PIP_CHECK(transformer);
+      if(!transformer->applicablep())
+        return syntax_error(exp,"define-syntax body did not evaluate to "
+                                "a function");
+      PIP_CC_MSG("define-syntax " << name << ' ' << transformer);
+      state.env_define(**env, name, transformer);
       return PIP_FALSE;
+    }
+
+    Value* compile_macro_application(size_t argc, Value* exp, bool tail,
+                                     Lookup& lookup) {
+      // Syntax
+      state.vm_trampoline_arguments.clear();
+      state.vm_trampoline_arguments.push_back(exp->cdr());
+      state.vm_trampoline_arguments.push_back(PIP_FALSE);
+      state.vm_trampoline_arguments.push_back(PIP_FALSE);
+
+      Value* function = lookup.scope == REF_GLOBAL ? lookup.global :
+        lookup.nonglobal.value;
+
+      // No need to protect anything as it will all be discared
+      Value* result = state.apply(function,
+          state.vm_trampoline_arguments.size(),
+          &state.vm_trampoline_arguments[0]);
+
+      PIP_CHECK(result);
+
+      return compile(result, tail);
     }
 
     // Compile a single expression, returns #f or an error if one occurred
@@ -3193,10 +3246,10 @@ restart:
             syntax = state.lookup_syntaxp(lookup);
           }
           if(syntax) {
+            size_t argc = length(exp->cdr());
             if(lookup.global == state.global_symbol(S_SPECIAL)) {
               // Dispatch on the special form
               Symbol* op = PIP_CAST(Symbol, function);
-              size_t argc = length(exp->cdr());
               // define
               if(op == state.global_symbol(S_DEFINE)) {
                 return compile_define(argc, exp, tail);
@@ -3215,8 +3268,8 @@ restart:
                 // here and then make it look like a normal lambda for
                 // compile_lambda
                 
-                // No need for parsing because named lambdas are generated by the
-                // parser
+                // No need for parsing because named lambdas are generated by
+                // the parser
                 Value* name = unbox(exp->cadr());
                 Value* rest = exp->cddr();
                 exp->set_cdr(rest);
@@ -3224,14 +3277,18 @@ restart:
                 return compile_lambda(argc-1, exp, tail, name);
               } else if(op == state.global_symbol(S_IF)) {
                 return compile_if(argc, exp, tail);
-              } else if(op == state.global_symbol(S_QUOTE)) {
+              } else if(op == state.global_symbol(S_QUOTE) ||
+                        op == state.global_symbol(S_GENERATED_QUOTE)) {
                 return compile_quote(argc, exp);
               } else if(op == state.global_symbol(S_DEFINE_SYNTAX)) {
                 return compile_define_syntax(argc, exp, tail);
+              } else if(op == state.global_symbol(S_ER_MACRO_TRANSFORMER)) {
+                  return syntax_error(exp, "er-macro-transformer can only be"
+                                      " used within a macro definition");
               } else assert(0);
             } else {
-              // Syntax
-              PIP_FAIL0("syntax not supported");
+              PIP_CC_MSG("applying macro " << function);
+              return compile_macro_application(argc, exp, tail, lookup);
             }
           } else {
             // function application
@@ -3354,6 +3411,14 @@ restart:
     return make_exception(State::S_PIP_EVAL, "attempt to apply non-function");
   }
 
+  Value* expected_applicable(const std::string& name, size_t arg_number,
+                             Type got) {
+    std::stringstream out;
+    out << name << " expected argument " << arg_number+1
+        << " to be applicable, but got " << got;
+    return make_exception(State::S_PIP_EVAL, out.str());
+  }
+
   Value* type_error(const std::string& name, size_t arg_number,
                     Value* argument, Type expected, Type got) {
     std::ostringstream out;
@@ -3368,7 +3433,7 @@ restart:
     // Track how many frames have been lost due to tail calls for debugging
     // purposes eg if we're in a loop and an error occurs on the 857th
     // iteration, we'll be able to print that information
-    size_t frames_lost = 0;
+
     // Track virtual machine depth
     vm_depth++;
 
@@ -3524,7 +3589,6 @@ restart:
           VM_RETURN(ret);
         }
         case OP_TAIL_APPLY: {
-          frames_lost++;
           // Retrieve argument count
           size_t argc = wc[ip++];
           PIP_VM_VMSG("tail-apply " << argc);
@@ -3608,8 +3672,10 @@ tail:
           goto tail;
         } else return result;
       case NATIVE_FUNCTION: {
-        return static_cast<NativeFunction*>(function)->pointer(*this, argc,
-                                                               args);
+        NativeFunction::ptr_t ptr =
+          static_cast<NativeFunction*>(function)->pointer;
+        return ptr(*this, argc, args,
+                   static_cast<NativeFunction*>(function)->closure);
       }
       default:
         PIP_FAIL0("attempt to apply bad type" << function->get_type());
@@ -3619,6 +3685,19 @@ tail:
 
 #undef VM_RETURN
 #undef VM_CHECK
+
+  // Evaluation functions
+  Value* eval(Value* exp, Value* env) {
+    Pair* new_env = 0;
+    Value *chk = 0, *proto = 0, *result = 0;
+    PIP_S_FRAME(exp, env, new_env, chk, proto, result);
+    new_env = make_env(env);
+    Compiler cc(*this, NULL, new_env);
+    chk = cc.compile(exp, true);
+    PIP_CHECK(chk);
+    proto = cc.end();
+    return apply(proto, 0, 0);
+  }
 }; // State
 
 ///// GARBAGE COLLECTOR TRACKING IMPLEMENTATION
@@ -3704,21 +3783,75 @@ inline std::ostream& operator<<(std::ostream& os, Type& t) {
                             (expect), args[(number)]->get_type()); \
   }
 
-inline Value* car(State& state, unsigned argc, Value* args[]) {
+#define PIP_CHECK_APPLICABLE(number) \
+  if(!((args[(number)])->applicablep())) { \
+    return state.expected_applicable(fn_name, (number), \
+                                     args[(number)]->get_type()); \
+  }
+
+inline Value* car(State& state, unsigned argc, Value* args[],
+                 VectorStorage* closure) {
   static const char* fn_name = "car";
   PIP_CHECK_TYPE(PAIR, 0);
   return args[0]->car();
 }
 
-inline Value* cdr(State& state, unsigned argc, Value* args[]) {
+inline Value* cdr(State& state, unsigned argc, Value* args[],
+                 VectorStorage* closure) {
   static const char* fn_name = "car";
   PIP_CHECK_TYPE(PAIR, 0);
   return args[0]->cdr();
 }
 
+inline Value* apply_macro(State& state, unsigned argc, Value* args[],
+                          VectorStorage* closure) {
+  PIP_ASSERT(closure);
+  PIP_ASSERT(closure->length == 2);
+  Value *cc_env = closure->data[0], *transformer = closure->data[1];
+  Value* result = 0;
+  
+  PIP_FRAME(cc_env, transformer, result);
+
+  std::cout << "CC_ENV: " << cc_env << std::endl;
+  std::cout << "TRANSFORMER: " << transformer << std::endl;
+  // Build rename closure
+
+  // Build comparison closure
+
+  // Apply transformer
+  result = state.apply(transformer, argc, args);
+
+
+  return result;
+}
+
+inline Value* er_macro_transformer(State& state, unsigned argc, Value* args[],
+                                   VectorStorage* closure) {
+  static const char* fn_name = "#er-macro-transformer";
+  PIP_CHECK_TYPE(PAIR, 0);
+  PIP_CHECK_APPLICABLE(1);
+  std::cout << args[0] << std::endl << args[1] << std::endl;
+  // build apply-macro closure
+  Value* cc_env = args[0], *transformer = args[1];
+  NativeFunction* apply_macro_fn = 0;
+  VectorStorage* apply_macro_closure = 0;
+  PIP_FRAME(cc_env, transformer, apply_macro_fn, apply_macro_closure);
+
+  apply_macro_closure = state.vector_storage_realloc(2, 0);
+  apply_macro_closure->data[0] = cc_env;
+  apply_macro_closure->data[1] = transformer;
+  apply_macro_closure->length = 2;
+
+  apply_macro_fn = state.make_native_function(&apply_macro, 0, true,
+                                              apply_macro_closure);
+  
+  return apply_macro_fn;
+}
+
 inline void State::initialize_builtin_functions() {
   defun("car", &car, 1, false);
   defun("cdr", &cdr, 1, false);
+  defun("#er-macro-transformer", &er_macro_transformer, 1, false);
 }
 
 // Output
@@ -3770,7 +3903,17 @@ inline std::ostream& operator<<(std::ostream& os, Value* x) {
       return os << "#<exception " << x->exception_tag() << ' ' 
                 << x->exception_message() << '>';
     }
-    case PROTOTYPE: return os << "#<prototype>";
+    case PROTOTYPE:
+      return os << "#<function name: " << x->prototype_name() << '>';
+    case CLOSURE:
+      return os << "#<function name: "
+                << static_cast<Closure*>(x)->prototype->prototype_name()
+                << " closure>";
+    case NATIVE_FUNCTION:
+      return os << "#<function"
+                << (static_cast<NativeFunction*>(x)->closure
+                    ? " closure" : "")
+                << " native>";
     case UPVALUE: return os << "#<upvalue "
                             << (x->upvalue_closed() ? "(closed) " : "")
                             << " " << x->upvalue() << ')' << std::endl;

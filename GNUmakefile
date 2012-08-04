@@ -13,7 +13,11 @@ pip: cli.cpp pip.hpp test/runtime.cpp
 	@echo -n ' LD  ';
 	$(strip $(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $< $(LDFLAGS))
 
-.PHONY: clean cloc update-s7 microgue.c
+.PHONY: clean cloc
 
 clean:
 	rm -f $(wildcard pip *.o)
+
+cloc:
+	cloc pip.hpp
+	wc -l pip.hpp

@@ -263,7 +263,10 @@ void test_compiler(State& state) {
   test_eval(state, "((lambda () #t #t #t))", PIP_TRUE);
 
   // define-syntax
-  //test_eval(state, "(define-syntax hello (er-macro-transformer (lambda (x r c) #t))) (hello)", PIP_TRUE);
+  test_eval(state, "(define-syntax hello (er-macro-transformer (lambda (x r c) #t))) (hello)", PIP_TRUE);
+
+  // test runtime provided eval function
+  assert(state.eval(PIP_TRUE, (*state.core_env)) == PIP_TRUE);
 }
 
 void run_test_suite(State& state) {
