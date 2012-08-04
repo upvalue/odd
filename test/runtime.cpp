@@ -253,14 +253,17 @@ void test_compiler(State& state) {
 
   // Built-in functions
   test_eval(state, "(car (quote (#t)))", PIP_TRUE);
-  // define-syntax
-  //test_eval(state, "(define-syntax hello (er-macro-transformer (lambda (x r c) #t))) (hello)", PIP_TRUE);
 
   // Test that defining lambdas properly detects their names
   named_lambda named_lambda_functor;
   test_eval<named_lambda>(state, "(define (something) #t) something", named_lambda_functor);
   test_eval<named_lambda>(state, "(define something (lambda () #t)) something", named_lambda_functor);
 
+  // Stack management
+  test_eval(state, "((lambda () #t #t #t))", PIP_TRUE);
+
+  // define-syntax
+  //test_eval(state, "(define-syntax hello (er-macro-transformer (lambda (x r c) #t))) (hello)", PIP_TRUE);
 }
 
 void run_test_suite(State& state) {

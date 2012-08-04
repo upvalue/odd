@@ -2480,7 +2480,7 @@ struct State {
     return table_contains(PIP_CAST(Table, env->cdr), key);
   }
 
-  void env_define(Pair* env, Value* key, Value* value) {
+  void env_define(Pair* env, Value* key, Value* value, Value* src = 0) {
     Table* table = PIP_CAST(Table, env->cdr);
     Value* chk ;
     if(env_contains(env, key)) {
@@ -3041,6 +3041,10 @@ restart:
         chk = cc.compile(body->car(), body->cdr() == PIP_NULL);
         PIP_CHECK(chk);
         body = body->cdr();
+        // Pop result off stack
+        if(body != PIP_NULL) {
+          cc.pop();
+        }
       }
       proto = cc.end(argc, variable_arity);
       push_constant(proto);
@@ -3387,8 +3391,10 @@ restart:
     if(prototype->local_free_variable_count) {
       unsigned* data = (unsigned*) prototype->local_free_variables->data;
       
-      f.upvalues = (Upvalue**) alloca(prototype->local_free_variable_count * sizeof(Upvalue*));
-      memset(f.upvalues, 0, prototype->local_free_variable_count * sizeof(Upvalue*));
+      f.upvalues = (Upvalue**) alloca(prototype->local_free_variable_count
+                                      * sizeof(Upvalue*));
+      memset(f.upvalues, 0, prototype->local_free_variable_count
+                            * sizeof(Upvalue*));
 
       for(size_t i = 0; i != prototype->local_free_variable_count; i++) {
         unsigned index = data[i];
@@ -3400,21 +3406,18 @@ restart:
     // Load arguments
 
     // Check argument count
-    if(argc < prototype->arguments) {
-      VM_RETURN(arity_error());
-    }
+    if(argc < prototype->arguments) { VM_RETURN(arity_error()); }
 
     // Load normal arguments
     size_t i;
-    for(i = 0; i != prototype->arguments; i++) {
-      f.locals[i] = args[i];
-    }
+    for(i = 0; i != prototype->arguments; i++) f.locals[i] = args[i];
 
     // If we're not done yet, either we've received too many arguments or this
     // is a variable arity function
     if(i != argc) {
       if(prototype->prototype_variable_arity()) {
-        return make_exception(State::S_PIP_EVAL, "variable arity not supported yet");
+        return make_exception(State::S_PIP_EVAL,
+                              "variable arity not supported yet");
       } else {
         VM_RETURN(arity_error());
       }
