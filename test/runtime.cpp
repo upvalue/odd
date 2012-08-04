@@ -193,11 +193,26 @@ void test_eval(State& state, const std::string& string, Type type) {
 }
 
 // test_eval for weird, one-off assertions
-template <class success_functor_t> void test_eval(State& state, const std::string& string, Type type, success_functor_t& success_functor) {
+template <class success_functor_t> void test_eval(State& state, const std::string& string, success_functor_t& success_functor) {
   Value* x = eval_string(state, string);
-  std::cout << "!! test compiler: " << string << " => " << success_functor_t::description << std::endl;
+  std::cout << "!! test compiler: " << string << " => " << success_functor.description << std::endl;
   assert(success_functor(x));
 }
+
+struct named_lambda {
+  named_lambda() {
+    description = "#<prototype> has name 'something'";
+  }
+  
+  bool operator()(Value* x) {
+    if(x->get_type() != PROTOTYPE) return false;
+    Prototype* p = static_cast<Prototype*>(x);
+    if(!p->name) return false;
+    return strcmp(p->name->string_data(), "something") == 0;
+  }
+
+  const char* description;
+};
 
 void test_compiler(State& state) {
   std::cout << "!! test_compiler" << std::endl;
@@ -240,6 +255,12 @@ void test_compiler(State& state) {
   test_eval(state, "(car (quote (#t)))", PIP_TRUE);
   // define-syntax
   //test_eval(state, "(define-syntax hello (er-macro-transformer (lambda (x r c) #t))) (hello)", PIP_TRUE);
+
+  // Test that defining lambdas properly detects their names
+  named_lambda named_lambda_functor;
+  test_eval<named_lambda>(state, "(define (something) #t) something", named_lambda_functor);
+  test_eval<named_lambda>(state, "(define something (lambda () #t)) something", named_lambda_functor);
+
 }
 
 void run_test_suite(State& state) {
