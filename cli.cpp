@@ -1,9 +1,9 @@
-// cli.cpp - pip command line interface
+// cli.cpp - odd command line interface
 #include <stdlib.h>
 
-#include "pip.hpp"
+#include "odd.hpp"
 
-using namespace pip;
+using namespace odd;
 
 #include "test/runtime.cpp"
 
@@ -18,9 +18,9 @@ static const char help[] = \
   "  -R                  open a REPL\n" \
   "  -V                  give version information\n" \
   "behavior:\n" \
-  "  if no arguments are given, pip will open a REPL\n"\
-  "  if filenames are given, pip will evalute the files and exit\n"\
-  "  if other commands are given, pip will execute all commands and exit\n";
+  "  if no arguments are given, odd will open a REPL\n"\
+  "  if filenames are given, odd will evalute the files and exit\n"\
+  "  if other commands are given, odd will execute all commands and exit\n";
 
 static void print_help(char** argv) {
       std::cout << "usage: " << argv[0] << " [options] [files]" << std::endl

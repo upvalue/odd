@@ -2,7 +2,7 @@
 // included in cli.cpp
 
 static void test_invariants(State& state) {
-  Value* consts[] = { PIP_FALSE, PIP_TRUE, PIP_NULL, PIP_EOF };
+  Value* consts[] = { ODD_FALSE, ODD_TRUE, ODD_NULL, ODD_EOF };
   for(size_t i = 0; i != sizeof(consts) / sizeof(Value*); i++) {
     assert(consts[i]->constantp());
     assert(!consts[i]->fixnump());
@@ -28,7 +28,7 @@ static void test_gc_1(State& state) {
   String *string1 = 0, *string2 = 0;
   Blob* blob = NULL, *blob2 = NULL;
   Pair* pair = NULL;
-  PIP_FRAME(pair, blob, blob2, string1, string2);
+  ODD_FRAME(pair, blob, blob2, string1, string2);
 
   size_t len = sizeof(str) / sizeof(char);
   size_t len2 = len + 1;
@@ -57,7 +57,7 @@ static void test_gc_1(State& state) {
   blob2 = state.make_blob(25);
 
   assert(strcmp(str, blob->data) == 0);
-  blob2 = PIP_CAST(Blob, pair->cdr);
+  blob2 = ODD_CAST(Blob, pair->cdr);
   assert(blob2->get_type() == BLOB);
   assert(strcmp(str2, blob2->data) == 0);
   assert(strcmp(str, string1->string_data()) == 0);
@@ -68,7 +68,7 @@ static void test_symbols(State& state) {
   std::cout << "!! test_symbols" << std::endl;
   Symbol *sym1 = 0, *sym2 = 0, *sym3 = 0;
   Handle<Symbol> sym4(state);
-  PIP_FRAME(sym1, sym2, sym3);
+  ODD_FRAME(sym1, sym2, sym3);
 
   sym1 = state.make_symbol("symble");
   sym2 = state.make_symbol("symble");
@@ -96,7 +96,7 @@ static void test_symbols(State& state) {
 static void test_vectors(State& state) {
   std::cout << "!! test_vectors" << std::endl;
   Vector* v = 0;
-  PIP_FRAME(v);
+  ODD_FRAME(v);
   v = state.make_vector();
 
   //state.collect();
@@ -117,7 +117,7 @@ static void test_vectors(State& state) {
 static void test_tables(State& state) {
   Table* table = NULL;
   String* str = NULL;
-  PIP_FRAME(table, str);
+  ODD_FRAME(table, str);
   std::cout << "!! test_tables" << std::endl;
 
   table = state.make_table(6); 
@@ -142,14 +142,14 @@ static void test_tables(State& state) {
 
 static void test_reader(State& state) {
   std::cout << "!! test_reader" << std::endl;
-  unsigned file = state.register_file("test/read.ss");
-  std::fstream fs("test/read.ss");
+  unsigned file = state.register_file("test/read.odd");
+  std::fstream fs("test/read.odd");
   State::Reader reader(state, fs, file);
   Value* x = 0;
-  PIP_FRAME(x);
+  ODD_FRAME(x);
   while(true) {
     x = reader.read();
-    if(x == PIP_EOF) break;
+    if(x == ODD_EOF) break;
     std::cout << x << std::endl;
   }
 }
@@ -164,13 +164,13 @@ Value* eval_string(State& state, const std::string& string) {
   Value* x = 0;
   Value* check = 0;
   Prototype* p = 0;
-  PIP_FRAME(x, p, check);
+  ODD_FRAME(x, p, check);
   std::cout << "!! compile_string: " << string << std::endl;
   while(true) {
     x = reader.read();
-    if(x == PIP_EOF) break;
+    if(x == ODD_EOF) break;
     check = cc.compile(x);
-    if(check != PIP_FALSE) {
+    if(check != ODD_FALSE) {
       std::cerr << check << std::endl;
       assert(0);
     }
@@ -216,43 +216,44 @@ struct named_lambda {
 
 void test_compiler(State& state) {
   std::cout << "!! test_compiler" << std::endl;
-  test_eval(state, "#t", PIP_TRUE);
-  test_eval(state, "#f", PIP_FALSE);
+  test_eval(state, "#t", ODD_TRUE);
+  test_eval(state, "#f", ODD_FALSE);
   // Global variable access
-  test_eval(state, "(define x #t) x", PIP_TRUE);
+  test_eval(state, "(define x #t) x", ODD_TRUE);
 
   // Function compilation
   test_eval(state, "(lambda () #t) ", PROTOTYPE);
   // Simple application
-  test_eval(state, "((lambda () #t))", PIP_TRUE);
+  test_eval(state, "((lambda () #t))", ODD_TRUE);
 
   // Argument function and application
-  test_eval(state, "((lambda (x) x) #t)", PIP_TRUE);
+  test_eval(state, "((lambda (x) x) #t)", ODD_TRUE);
   // Set!
-  test_eval(state, "(define z #f) (set! z #t) z", PIP_TRUE);
-  test_eval(state, "((lambda (x) (set! x #t) x) #f)", PIP_TRUE);
+  test_eval(state, "(define z #f) (set! z #t) z", ODD_TRUE);
+  test_eval(state, "((lambda (x) (set! x #t) x) #f)", ODD_TRUE);
   // Closures
-  test_eval(state, "((lambda (x) ((lambda () x))) #t)", PIP_TRUE);
+  test_eval(state, "((lambda (x) ((lambda () x))) #t)", ODD_TRUE);
   // 2-level Closure
-  test_eval(state, "((lambda (x) ((lambda () ((lambda () x))))) #t)", PIP_TRUE);
-  //test_eval(state, "((lambda (x) ((lambda () ((lambda () x)))) #t))", PIP_TRUE);
+  test_eval(state, "((lambda (x) ((lambda () ((lambda () x))))) #t)", ODD_TRUE);
+  //test_eval(state, "((lambda (x) ((lambda () ((lambda () x)))) #t))", ODD_TRUE);
   // Define lambda shortcut
-  test_eval(state, "(define (name) #t) (name)", PIP_TRUE);
+  test_eval(state, "(define (name) #t) (name)", ODD_TRUE);
   // If
-  test_eval(state, "(if #t #t #f)", PIP_TRUE);
+  test_eval(state, "(if #t #t #f)", ODD_TRUE);
   // One-arm if
-  test_eval(state, "(if #t #t)", PIP_TRUE);
-  test_eval(state, "(if #f #f)", PIP_UNSPECIFIED);
+  test_eval(state, "(if #t #t)", ODD_TRUE);
+  test_eval(state, "(if #f #f)", ODD_UNSPECIFIED);
   // Begin
-  test_eval(state, "(begin)", PIP_UNSPECIFIED);
-  test_eval(state, "(begin #f #f #t)", PIP_TRUE);
+  test_eval(state, "(begin)", ODD_UNSPECIFIED);
+  
+  test_eval(state, "(begin #f #f #t)", ODD_TRUE);
   // Tail call
-  test_eval(state, "((lambda () ((lambda () #t))))", PIP_TRUE);
+  test_eval(state, "((lambda () ((lambda () #t))))", ODD_TRUE);
   // Quote
-  test_eval(state, "(quote #t)", PIP_TRUE);
+  test_eval(state, "(quote #t)", ODD_TRUE);
 
   // Built-in functions
-  test_eval(state, "(car (quote (#t)))", PIP_TRUE);
+  test_eval(state, "(car (quote (#t)))", ODD_TRUE);
 
   // Test that defining lambdas properly detects their names
   named_lambda named_lambda_functor;
@@ -260,13 +261,16 @@ void test_compiler(State& state) {
   test_eval<named_lambda>(state, "(define something (lambda () #t)) something", named_lambda_functor);
 
   // Stack management
-  test_eval(state, "((lambda () #t #t #t))", PIP_TRUE);
+  test_eval(state, "((lambda () #t #t #t))", ODD_TRUE);
 
   // define-syntax
-  test_eval(state, "(define-syntax hello (er-macro-transformer (lambda (x r c) #t))) (hello)", PIP_TRUE);
+  test_eval(state, "(define-syntax hello (er-macro-transformer (lambda (x r c) #t))) (hello)", ODD_TRUE);
+
+  // test define-library
+  test_eval(state, "(define-library (one two) (begin #t))", ODD_TRUE);
 
   // test runtime provided eval function
-  assert(state.eval(PIP_TRUE, (*state.core_env)) == PIP_TRUE);
+  assert(state.eval(ODD_TRUE, (*state.core_env)) == ODD_TRUE);
 }
 
 void run_test_suite(State& state) {
@@ -278,7 +282,7 @@ void run_test_suite(State& state) {
   test_vectors(state);
   test_tables(state);
   test_reader(state);
-  test_compiler(state);
+  //test_compiler(state);
 
   std::cout << "!! collections: " << state.collections << " heap size: " << FriendlySize(state.heap_size) << std::endl;
 }
@@ -293,7 +297,7 @@ void test() {
   run_test_suite(*state);
 
   // print symbol table
-  Table * tbl = PIP_CAST(Table, state->core_env->cdr);
+  Table * tbl = ODD_CAST(Table, state->core_env->cdr);
   for(size_t i = 0; i != tbl->chains->length; i++) {
     Value* cell = tbl->chains->data[i];
     while(cell->get_type() == PAIR) {

@@ -1,4 +1,4 @@
-CXXFLAGS := -O2 -Wall -g3 -fno-rtti -fno-exceptions -DPIP_DEBUG -pipe 
+CXXFLAGS := -O2 -Wall -g3 -fno-rtti -fno-exceptions -odde 
 LDFLAGS := 
 
 ifneq ($(shell uname -s),Darwin)
@@ -7,17 +7,17 @@ endif
 
 -include site.mk
 
-all: pip
+all: odd
 
-pip: cli.cpp pip.hpp test/runtime.cpp
+odd: cli.cpp odd.hpp test/runtime.cpp
 	@echo -n ' LD  ';
 	$(strip $(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $< $(LDFLAGS))
 
 .PHONY: clean cloc
 
 clean:
-	rm -f $(wildcard pip *.o)
+	rm -f $(wildcard odd *.o)
 
 cloc:
-	cloc pip.hpp
-	wc -l pip.hpp
+	cloc odd.hpp
+	wc -l odd.hpp

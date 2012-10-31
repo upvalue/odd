@@ -1,0 +1,125 @@
+// comment
+
+// fixnum
+12345
+555
+
+// boolean
+#t
+#f
+
+// symbol
+symbol
+
+// string
+"string"
+
+// function application
+fx+(2 2)
+
+// more boolean
+#t
+
+// another function application
+fx<(1 2)
+
+// function application with braces
+if(#t) {
+  #t
+} {
+  #f
+}
+
+// pile it on
+
+if(#t){#t}{#f}
+
+if(#t) {
+  if(#t) {
+    #t
+  } {
+    #f
+  } 
+} {
+  brace2
+} {
+  even-more-braces!
+}
+
+// brace-only function application
+let {
+   #t
+}
+let{#t}
+let{#t#f}
+let{}
+
+brace(thing)
+{ thing }
+
+// chaining applications
+chain(1)(2 3)(4) 
+
+// function application with spaces
+if(not(null?(cdr(obj))))
+if (not(null?(cdr(obj))))
+[if [not [null? [cdr obj]]]]
+
+double()()
+
+lambda { lambda{}() }()
+lambda() { #t }()
+
+// fibonacci test thing
+defun(fib n) {
+  if(<(n 2)) {
+    n
+  } {
+    +(fib(-(n 1)) fib(-(n 2)))
+  }
+}
+
+// list literals
+[]
+[ ]
+
+[#t]
+
+[hello how are you]
+[hello [how are you]]
+[hello . [how are you]]
+
+// list with function application
+[hello how(are you)]
+
+[hello [how are you] . [hows it goin]]
+
+// imaginary infix macro
+infix { fib(n - 1) + fib(n - 2) }
+
+// standalone braces
+{ i stand Alone }
+
+// quotes
+'#t
+'[listy list list]
+`[try ,unkwote ,@unkwote-splicing]
+
+#'sintax
+#`quasisintax
+#`[quasisintax lyst #,unsintax #,@unsintax-splicing]
+#'function(call)
+
+#'function(call) {
+  #t
+}
+
+// keywords
+
+keyword:
+
+// module access
+
+module.variable
+
+module.variable.nest
