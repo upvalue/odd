@@ -76,6 +76,8 @@
     std::cout << '>'; \
   std::cout << "VM: " << x << std::endl
 # define ODD_VM_VMSG(y) ODD_VM_MSG("(stack: " << f.si << ") " << y)
+// Execute a particular instruction, includes instruction offset
+# define ODD_VM_MSG_INSN(y) ODD_VM_MSG("INSN: " << ip-1 << " (stack: " << f.si << ") " << y)
 #else
 # define ODD_GC_MSG(x)
 # define ODD_CC_MSG(x)
@@ -1420,7 +1422,7 @@ State():
   vm_depth(0),
   vm_trampoline_function(0),
 
-  libraries(*this) {
+  modules(*this) {
 
   // Initialize garbage collector
   Block* first = new Block(ODD_HEAP_ALIGNMENT * 2, false, mark_bit);
@@ -1439,11 +1441,10 @@ State():
     "#odd#eval",
     "#odd#table",
     // Special forms
-    "brace",
     "access",
     "define",
-    "set!",
-    "begin",
+    "set",
+    "brace",
     "lambda",
     "#named-lambda",
     "if",
@@ -1451,7 +1452,7 @@ State():
     "let-syntax",
     "letrec-syntax",
     "er-macro-transformer",
-    "define-library",
+    "define-module",
     "#quote",
     "quote",
     // Other
@@ -1489,8 +1490,8 @@ State():
                global_symbol(S_SPECIAL));
   }
 
-  // Create library table
-  libraries = make_table();
+  // Create module table
+  modules = make_table();
 
   initialize_builtin_functions();
 }
@@ -1523,11 +1524,10 @@ enum Global {
   S_ODD_EVAL,
   S_ODD_TABLE,
   // Special forms
-  S_BRACE,
   S_ACCESS,
   S_DEFINE,
   S_SET,
-  S_BEGIN,
+  S_BRACE,
   S_LAMBDA,
   S_NAMED_LAMBDA,
   S_IF,
@@ -1535,7 +1535,7 @@ enum Global {
   S_LET_SYNTAX,
   S_LETREC_SYNTAX,
   S_ER_MACRO_TRANSFORMER,
-  S_DEFINE_LIBRARY,
+  S_DEFINE_module,
   S_GENERATED_QUOTE,
   S_QUOTE,
   // End special forms
@@ -2653,7 +2653,7 @@ Value* read() {
 // <--
 // The Odd compiler is a simple, one-pass compiler. An instance of the
 // compiler is created for each function (for the purposes of the compiler,
-// something like a library source file is considered a function). There is
+// something like a module source file is considered a function). There is
 // no separate parsing step; the compiler operates directly on s-expressions.
 // It is a little hairy in places because of this, but doing everything in
 // one pass makes it much shorter overall.
@@ -2736,7 +2736,7 @@ bool env_contains(Pair* env, Value* key) {
 
 void env_define(Pair* env, Value* key, Value* value, Value* src = 0) {
   Table* table = ODD_CAST(Table, env->cdr);
-  Value* chk ;
+  Value* chk = 0;
   if(env_contains(env, key)) {
     chk = table_set(table, key, value);
   } else {
@@ -2882,6 +2882,12 @@ struct Compiler {
     code.push_back(word);
   }
 
+  void emit_pop() {
+    ODD_CC_EMIT("pop");
+    emit(OP_POP);
+    pop();
+  }
+
   // In order to push a constant onto the stack, we have to save it and store
   // it along with the function. This function lazily creates the vector of
   // constants and makes sure no constants are repeated.
@@ -2922,8 +2928,9 @@ struct Compiler {
 
   void pop(ptrdiff_t i = 1) {
     stack_size -= i;
-    ODD_ASSERT(stack_size >= 0);
+    // Ensure we don't go below 0
     ODD_CC_VMSG("POP: stack_size = " << stack_size);
+    ODD_ASSERT(stack_size < (unsigned) 0-5);
   }
 
   // Annotating virtual machine instructions with their source location for
@@ -3034,8 +3041,11 @@ struct Compiler {
     if(!lookup.success) return undefined_variable(exp);
     switch(lookup.scope) {
       case REF_GLOBAL:
-        if(lookup.global == state.global_symbol(S_SPECIAL))
-          return syntax_error(exp, "special forms cannot be used as values");
+        if(lookup.global == state.global_symbol(S_SPECIAL)) {
+          std::ostringstream ss;
+          ss << "attempt to use special form '" << exp << "' as a value";
+          return syntax_error(exp, ss.str());
+        }
         if(lookup.global->applicablep())
           return syntax_error(exp, "macros cannot be used as values");
         // Why do we need lookup.global when we already have the name?
@@ -3072,7 +3082,7 @@ struct Compiler {
     return ODD_FALSE;
   }
 
-  // Generate a set! (used by both define and set!)
+  // Generate a set (used by both define and set)
   // Assumes value is already on the stack
   void generate_set(Lookup& lookup, Value* name) {
     switch(lookup.scope) {
@@ -3080,16 +3090,18 @@ struct Compiler {
         push_constant(name);
         emit(OP_GLOBAL_SET);
         ODD_CC_EMIT("global-set " << name);
-        pop(2);
+        // Note we only pop once here to compensate for the push_constant; there is another pop generated after every
+        // set
+        pop();
         break;
       case REF_LOCAL:
         emit(OP_LOCAL_SET);
         emit_arg(lookup.nonglobal.index);
         ODD_CC_EMIT("local-set " << (unsigned) lookup.nonglobal.index);
-        pop();
         break;
       case REF_UP: assert(0);
     }
+    pop();
   }
 
   // Special forms
@@ -3167,7 +3179,7 @@ restart:
     // TODO: Allow re-definitions, but warn about them
     state.env_define(**env, name, value);
 
-    // Compile body for set!
+    // Compile body for set
     ODD_FRAME(name);
     chk = compile(exp->cddr()->car());
     ODD_CHECK(chk);
@@ -3184,7 +3196,7 @@ restart:
     // Check that name is a symbol
     if(name->get_type() != SYMBOL)
       return syntax_error(S_SET, exp,
-                          "first argument to set! must be a symbol");
+                          "first argument to set must be a symbol");
 
     // Compile body 
     chk = compile(exp->cddr()->car());
@@ -3197,13 +3209,15 @@ restart:
     if(!lookup.success)
       return undefined_variable(exp->cadr());
     if(state.lookup_syntaxp(lookup))
-      return syntax_error(exp, "syntax cannot be set! like a variable");
+      return syntax_error(exp, "syntax cannot be set like a variable");
 
     generate_set(lookup, name);
+
+    // note pop
     return ODD_FALSE;
   }
 
-  Value* compile_begin(size_t argc, Value* exp, bool tail) {
+  Value* compile_brace(size_t argc, Value* exp, bool tail) {
     if(argc == 0) {
       return compile(ODD_UNSPECIFIED, tail);
     } else {
@@ -3215,12 +3229,13 @@ restart:
         if(body->cdr() == ODD_NULL) {
           return compile(elt, tail);
         } else {
+          size_t stack_chk = stack_size;
           chk = compile(elt, false);
           ODD_CHECK(chk);
           body = body->cdr();
-          // Pop result
-          emit(OP_POP);
-          pop();
+          // Pop result, if statement left anything on the stack
+          // (which may not happen if e.g. there is a set or define)
+          if(stack_size > stack_chk) emit_pop(); 
         }
       }
     }
@@ -3231,16 +3246,16 @@ restart:
                         Value* name) {
     // For checking subcompilation results
     Value* chk = 0;
-    if(form_argc < 2) return arity_error(S_LAMBDA, exp, 2, form_argc);
+    if(form_argc < 1) return arity_error(S_LAMBDA, exp, 1, form_argc);
     // Create new compiler, environment
     unsigned argc = 0;
     // Will be set to true if the function is variable arity
     // (i.e. takes unlimited arguments)
     bool variable_arity = false;
     Pair *new_env = 0;
-    Value *args = 0, *body = 0;
+    Value *args = 0, *body = 0, *arg = 0;
     Prototype* proto = 0;
-    ODD_FRAME(exp, new_env, args, body, proto);
+    ODD_FRAME(exp, new_env, args, arg, body, proto);
     // Create a new environment for the function with the current environment
     // as its parent
     new_env = state.make_env(**env);
@@ -3248,16 +3263,28 @@ restart:
     // state.vector_append(ODD_CAST(Vector, new_env), **env);
     // Now parse the function's arguments and define them within the
     // new environment
-    args = exp->cadr();
+    args = exp->cdr();
     if(args != ODD_NULL) {
       if(args->get_type() != PAIR) 
         return syntax_error(S_LAMBDA, exp, "first argument to lambda must be"
                             " either () or a list of arguments");
       while(args->get_type() == PAIR) {
-        Value* arg = unbox(args->car());
+        arg = unbox(args->car());
+        if(arg->get_type() == PAIR) {
+          if(arg->car() == state.global_symbol(State::S_BRACE)) {
+            // Encountered lambda body, stop parsing
+            if(args->cdr() != ODD_NULL)
+              return syntax_error(S_LAMBDA, exp, "additional arguments to lambda after body");
+            break;
+          } else {
+            variable_arity = true;
+          }
+          break;
+        }
         if(arg->get_type() != SYMBOL) {
-          return syntax_error(S_LAMBDA, exp,
-                              "lambda argument list must be symbols");
+          if(arg->get_type() == PAIR && variable_arity)
+            return syntax_error(S_LAMBDA, exp, "multiple variable arity arguments to lambda");
+          return syntax_error(S_LAMBDA, exp, "lambda argument list must be symbols");
         }
         // Finally, we can add them to the environment!
         // Add it as a local variable
@@ -3277,18 +3304,10 @@ restart:
     if(name) {
       cc.name = static_cast<String*>(name->symbol_name());
     }
-    body = exp->cddr();
-    while(body != ODD_NULL) {
-      // Compile body expression. Note that if cdr() is ODD_NULL, this is the
-      // tail expression and might be subject to tail call optimization
-      chk = cc.compile(body->car(), body->cdr() == ODD_NULL);
-      ODD_CHECK(chk);
-      body = body->cdr();
-      // Pop result off stack
-      if(body != ODD_NULL) {
-        cc.pop();
-      }
-    }
+    body = arg;
+    chk = cc.compile(body, true);
+    ODD_CHECK(chk);
+
     proto = cc.end(argc, variable_arity);
     push_constant(proto);
     // If the function's a closure, we'll have to close over it
@@ -3448,49 +3467,49 @@ restart:
     return compile(result, tail);
   }
 
-  // Handle a library definition
-  Value* define_library(size_t argc, Value* exp) {
-    // Library must have at least a library name and specification
-    if(argc != 2) return arity_error(S_DEFINE_LIBRARY, exp, 2, argc);
+  // Handle a module definition
+  Value* define_module(size_t argc, Value* exp) {
+    // module must have at least a module name and specification
+    if(argc != 2) return arity_error(S_DEFINE_module, exp, 2, argc);
     Value* name = exp->cadr(), *decls = exp->cddr();
-    // Parse library name
+    // Parse module name
     if(name->get_type() != PAIR)
-      return syntax_error(exp, "first argument to define-library must be a "
-                          "valid library name (a list of one or more "
+      return syntax_error(exp, "first argument to define-module must be a "
+                          "valid module name (a list of one or more "
                           "symbols)");
     if(decls->get_type() != PAIR)
-      return syntax_error(exp, "library body must be a library declaration");
+      return syntax_error(exp, "module body must be a module declaration");
     Value* internal_name = 0, *chk = 0;
-    Pair* library_env = 0;
+    Pair* module_env = 0;
 
-    ODD_FRAME(name, decls, exp, internal_name, library_env, chk);
+    ODD_FRAME(name, decls, exp, internal_name, module_env, chk);
 
-    // Convert library name into internal format
-    internal_name = state.convert_library_name(name);
+    // Convert module name into internal format
+    internal_name = state.convert_module_name(name);
     ODD_CHECK(internal_name);
 
-    // Create new library table
-    library_env = state.make_env();
+    // Create new module table
+    module_env = state.make_env();
 
-    // Register library
-    chk = state.register_library(ODD_CAST(String, internal_name), library_env);
+    // Register module
+    chk = state.register_module(ODD_CAST(String, internal_name), module_env);
     ODD_CHECK(chk);
 
-    Compiler cc(state, NULL, library_env);
+    Compiler cc(state, NULL, module_env);
 
     // Create new compiler
-    std::cout << "LIBRARY NAME " << internal_name << std::endl;
+    std::cout << "module NAME " << internal_name << std::endl;
     // Parse declarations
     while(decls->get_type() == PAIR) {
       Value* decl = decls->car();
       std::cout << "DECL: " << decl << std::endl;
       if(!listp(decl)) {
-        return syntax_error(decl, "library declaration must be a list");
+        return syntax_error(decl, "module declaration must be a list");
       }
       decls = decls->cdr();
     }
     
-    ODD_FAIL0("libraries suck dogg");
+    ODD_FAIL0("modules suck dogg");
     // (scheme base) => #scheme.base
     return ODD_FALSE; 
   }
@@ -3538,12 +3557,12 @@ restart:
             // define
             if(op == state.global_symbol(S_DEFINE)) {
               return compile_define(argc, exp, tail);
-            // set!
+            // set
             } else if(op == state.global_symbol(S_SET)) {
               return compile_set(argc, exp, tail);
-            // begin
-            } else if(op == state.global_symbol(S_BEGIN)) {
-              return compile_begin(argc, exp, tail);
+            // brace
+            } else if(op == state.global_symbol(S_BRACE)) {
+              return compile_brace(argc, exp, tail);
             // lambda
             } else if(op == state.global_symbol(S_LAMBDA)) {
               return compile_lambda(argc, exp, tail, ODD_FALSE);
@@ -3570,8 +3589,8 @@ restart:
             } else if(op == state.global_symbol(S_ER_MACRO_TRANSFORMER)) {
                 return syntax_error(exp, "er-macro-transformer can only be"
                                     " used within a macro definition");
-            } else if(op == state.global_symbol(S_DEFINE_LIBRARY)) {
-              return define_library(argc, exp);
+            } else if(op == state.global_symbol(S_DEFINE_module)) {
+              return define_module(argc, exp);
             } else assert(0);
           } else {
             ODD_CC_MSG("applying macro " << function);
@@ -3775,6 +3794,8 @@ Value* vm_apply(Prototype* prototype, Closure* closure, size_t argc,
     }
   }
 
+  ODD_VM_MSG("evaluating function with stack size " << prototype->stack_max << " and " << prototype->locals << " locals");
+
   // Some common things you will see:
   // f.stack[f.si-1] Get the top of the stack 
   // f.stack[--f.si] Pop the top of the stack
@@ -3785,12 +3806,14 @@ Value* vm_apply(Prototype* prototype, Closure* closure, size_t argc,
   while(1) {
     switch(wc[ip++]) {
       case OP_PUSH_IMMEDIATE:
+        ODD_VM_VMSG(ip-1 << " push-immediate " << (Value*) wc[ip]);
         f.stack[f.si++] = (Value*) wc[ip++]; 
         continue;
       case OP_PUSH_CONSTANT:
         f.stack[f.si++] = f.p->constants->vector_ref(wc[ip++]);
         continue;
       case OP_POP:
+        ODD_VM_VMSG(ip-1 << " pop");
         --f.si;
         continue;
       case OP_GLOBAL_SET: {
@@ -3815,8 +3838,8 @@ Value* vm_apply(Prototype* prototype, Closure* closure, size_t argc,
       case OP_LOCAL_SET: {
         // Get the local's index
         size_t index = wc[ip++];
+        ODD_VM_VMSG(ip-2 << " local-set " << (unsigned) index << " " << f.stack[f.si-1]);
         Value* val = f.stack[--f.si];
-        ODD_VM_VMSG("local-set " << (unsigned) index << " " << val);
         f.locals[index] = val;
         continue;
       }
@@ -3973,20 +3996,20 @@ tail:
 #undef VM_RETURN
 #undef VM_CHECK
 
-// Library management
-Handle<Table> libraries;
+// module management
+Handle<Table> modules;
 
-// Convert a Scheme library name into a string
+// Convert a Scheme module name into a string
 // (scheme base) => "#scheme.base"
-Value* convert_library_name(Value* spec) {
+Value* convert_module_name(Value* spec) {
   std::ostringstream out;
   out << '#';
   if(!listp(spec)) 
-    return make_exception(S_ODD_EVAL, "library name must be a list of "
+    return make_exception(S_ODD_EVAL, "module name must be a list of "
                           "symbols");
   while(spec->get_type() == PAIR) {
     if(unbox(spec->car())->get_type() != SYMBOL) {
-      return make_exception(S_ODD_EVAL, "encountered non-symbol in library "
+      return make_exception(S_ODD_EVAL, "encountered non-symbol in module "
                             "name");
     }
     out << unbox(spec->car());
@@ -3998,17 +4021,17 @@ Value* convert_library_name(Value* spec) {
   return make_string(out.str());
 }
 
-bool library_loaded(String* name) {
-  return table_contains(*libraries, name);
+bool module_loaded(String* name) {
+  return table_contains(*modules, name);
 }
 
-Value* register_library(String* name, Value* env) {
-  if(library_loaded(name)) {
+Value* register_module(String* name, Value* env) {
+  if(module_loaded(name)) {
     std::ostringstream os;
-    os << "attempt to overload existing library " << name;
+    os << "attempt to overload existing module " << name;
     return make_exception(S_ODD_EVAL, os.str());
   }
-  table_insert(*libraries, name, env);
+  table_insert(*modules, name, env);
   return ODD_FALSE;
 }
 
@@ -4214,8 +4237,10 @@ ODD_FUNCTION(rename) {
   static const char* fn_name = "rename";
   ODD_CHECK_TYPE(SYMBOL, 0);
   Value* name = args[0];
+  (void) name;
   ODD_ASSERT(closure && closure->length == 1);
   Value* cc_env = closure->data[0];
+  (void) cc_env;
   // Tag symbol with compilation environment  
 
 }
@@ -4225,6 +4250,8 @@ ODD_FUNCTION(apply_macro) {
   ODD_ASSERT(closure->length == 2);
   Value *cc_env = closure->data[0], *transformer = closure->data[1],
         *rename = 0, *compare = 0, *result = 0;
+
+  (void) rename; (void) compare;
   
   ODD_FRAME(cc_env, transformer, result);
 

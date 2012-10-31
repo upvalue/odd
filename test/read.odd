@@ -106,12 +106,7 @@ infix { fib(n - 1) + fib(n - 2) }
 '[listy list list]
 `[try ,unkwote ,@unkwote-splicing]
 
-#'sintax
-#`quasisintax
-#`[quasisintax lyst #,unsintax #,@unsintax-splicing]
-#'function(call)
-
-#'function(call) {
+'function(call) {
   #t
 }
 

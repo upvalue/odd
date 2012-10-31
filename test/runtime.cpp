@@ -219,56 +219,56 @@ void test_compiler(State& state) {
   test_eval(state, "#t", ODD_TRUE);
   test_eval(state, "#f", ODD_FALSE);
   // Global variable access
-  test_eval(state, "(define x #t) x", ODD_TRUE);
+  test_eval(state, "define(x #t) x", ODD_TRUE);
 
   // Function compilation
-  test_eval(state, "(lambda () #t) ", PROTOTYPE);
+  test_eval(state, "lambda { #t }", PROTOTYPE);
   // Simple application
-  test_eval(state, "((lambda () #t))", ODD_TRUE);
-
+  test_eval(state, "lambda { #t }()", ODD_TRUE);
   // Argument function and application
-  test_eval(state, "((lambda (x) x) #t)", ODD_TRUE);
+  test_eval(state, "lambda(x) { x }(#t)", ODD_TRUE);
   // Set!
-  test_eval(state, "(define z #f) (set! z #t) z", ODD_TRUE);
-  test_eval(state, "((lambda (x) (set! x #t) x) #f)", ODD_TRUE);
+  test_eval(state, "define(z #f) set(z #t) z", ODD_TRUE);
+  test_eval(state, "lambda(x) { set(x #t) x }(#f)", ODD_TRUE);
+//  test_eval(state, "(define z #f) (set! z #t) z", ODD_TRUE);
+  //test_eval(state, "((lambda (x) (set! x #t) x) #f)", ODD_TRUE);
   // Closures
-  test_eval(state, "((lambda (x) ((lambda () x))) #t)", ODD_TRUE);
+  test_eval(state, "lambda(x) { lambda() { x }() }(#t)", ODD_TRUE);
   // 2-level Closure
-  test_eval(state, "((lambda (x) ((lambda () ((lambda () x))))) #t)", ODD_TRUE);
-  //test_eval(state, "((lambda (x) ((lambda () ((lambda () x)))) #t))", ODD_TRUE);
+  test_eval(state, "lambda(x) { lambda() { lambda() { x }() }() }(#t)", ODD_TRUE);
   // Define lambda shortcut
-  test_eval(state, "(define (name) #t) (name)", ODD_TRUE);
+  // TODO remove
+  //test_eval(state, "define([name]) { #t } name()", ODD_TRUE);
   // If
-  test_eval(state, "(if #t #t #f)", ODD_TRUE);
+  test_eval(state, "if(#t #t #f)", ODD_TRUE);
+  test_eval(state, "if(#t) { #t } { #f }", ODD_TRUE);
   // One-arm if
-  test_eval(state, "(if #t #t)", ODD_TRUE);
-  test_eval(state, "(if #f #f)", ODD_UNSPECIFIED);
-  // Begin
-  test_eval(state, "(begin)", ODD_UNSPECIFIED);
+  test_eval(state, "if(#t #t)", ODD_TRUE);
+  test_eval(state, "if(#f #f)", ODD_UNSPECIFIED);
+  // Brace (begin)
+  test_eval(state, "brace()", ODD_UNSPECIFIED);
+  test_eval(state, "brace(#f #f #t)", ODD_TRUE);
+  // Standalone brace syntax
+  test_eval(state, "{ #f #t }", ODD_TRUE);
   
-  test_eval(state, "(begin #f #f #t)", ODD_TRUE);
   // Tail call
-  test_eval(state, "((lambda () ((lambda () #t))))", ODD_TRUE);
+  test_eval(state, "lambda() { lambda() { #t }() }()", ODD_TRUE);
   // Quote
-  test_eval(state, "(quote #t)", ODD_TRUE);
-
+  test_eval(state, "quote(#t)", ODD_TRUE);
+  test_eval(state, "'#t", ODD_TRUE);
   // Built-in functions
-  test_eval(state, "(car (quote (#t)))", ODD_TRUE);
+  test_eval(state, "car('[#t])", ODD_TRUE);
 
   // Test that defining lambdas properly detects their names
   named_lambda named_lambda_functor;
-  test_eval<named_lambda>(state, "(define (something) #t) something", named_lambda_functor);
-  test_eval<named_lambda>(state, "(define something (lambda () #t)) something", named_lambda_functor);
+  test_eval<named_lambda>(state, "define(something lambda { #t }) something", named_lambda_functor);
 
   // Stack management
-  test_eval(state, "((lambda () #t #t #t))", ODD_TRUE);
+  test_eval(state, "lambda { #t #t #t }()", ODD_TRUE);
+  
+  // Macros
 
-  // define-syntax
-  test_eval(state, "(define-syntax hello (er-macro-transformer (lambda (x r c) #t))) (hello)", ODD_TRUE);
-
-  // test define-library
-  test_eval(state, "(define-library (one two) (begin #t))", ODD_TRUE);
-
+  // Modules
   // test runtime provided eval function
   assert(state.eval(ODD_TRUE, (*state.core_env)) == ODD_TRUE);
 }
@@ -282,7 +282,7 @@ void run_test_suite(State& state) {
   test_vectors(state);
   test_tables(state);
   test_reader(state);
-  //test_compiler(state);
+  test_compiler(state);
 
   std::cout << "!! collections: " << state.collections << " heap size: " << FriendlySize(state.heap_size) << std::endl;
 }
