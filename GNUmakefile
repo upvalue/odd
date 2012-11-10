@@ -1,4 +1,4 @@
-CXXFLAGS := -O2 -Wall -g3 -fno-rtti -fno-exceptions -odde 
+CXXFLAGS := -O2 -Wall -g3 -fno-rtti -fno-exceptions 
 LDFLAGS := 
 
 ifneq ($(shell uname -s),Darwin)
@@ -16,7 +16,7 @@ odd: cli.cpp odd.hpp test/runtime.cpp
 .PHONY: clean cloc
 
 clean:
-	rm -f $(wildcard odd *.o)
+	rm -rf $(wildcard odd *.o odd.dSYM)
 
 cloc:
 	cloc odd.hpp

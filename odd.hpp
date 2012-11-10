@@ -55,10 +55,6 @@
   std::cerr << desc << std::endl; \
   ODD_ASSERT(!"failure");
 
-#define ODD_FAIL(desc, ret) \
-  ODD_FAIL0(desc); \
-  return (ret); 
-
 // Checking for exceptions
 #define ODD_CHECK(x) if((x)->active_exception()) return (x);
 
@@ -1452,7 +1448,7 @@ State():
     "let-syntax",
     "letrec-syntax",
     "er-macro-transformer",
-    "define-module",
+    "module",
     "#quote",
     "quote",
     // Other
@@ -1462,7 +1458,6 @@ State():
     "import",
     "export",
     "include",
-    "include-ci",
     "cond-expand",
     "rename",
     "#delegates",
@@ -1535,7 +1530,7 @@ enum Global {
   S_LET_SYNTAX,
   S_LETREC_SYNTAX,
   S_ER_MACRO_TRANSFORMER,
-  S_DEFINE_module,
+  S_MODULE,
   S_GENERATED_QUOTE,
   S_QUOTE,
   // End special forms
@@ -1545,7 +1540,6 @@ enum Global {
   S_IMPORT,
   S_EXPORT,
   S_INCLUDE,
-  S_INCLUDE_CI,
   S_COND_EXPAND,
   S_RENAME,
   S_DELEGATES,
@@ -2085,7 +2079,7 @@ struct Reader {
   // True if a character is a delimiter; used to determine what is NOT a
   // valid symbol character
   static bool delimiterp(char c) {
-    return c == '(' || c == ')' || c == ';' || c == '@' ||
+    return c == '(' || c == ')' || c == '@' ||
       c == EOF || isspace(c) || c == '.' || c == '#' || c == '"'
       || quotep(c) || c == '{' || c == '}' || c == '[' || c == ']' || c == '.';
   }
@@ -2746,7 +2740,7 @@ void env_define(Pair* env, Value* key, Value* value, Value* src = 0) {
 }
 
 // If an environment has no parent environment, or a list of delegate
-// environment, its variables will be global variables
+// environments, its variables will be global variables
 bool env_globalp(Pair* env) {
   return env->car == ODD_FALSE || env->car->get_type_unsafe() == VECTOR;
 }
@@ -3233,7 +3227,7 @@ restart:
           chk = compile(elt, false);
           ODD_CHECK(chk);
           body = body->cdr();
-          // Pop result, if statement left anything on the stack
+          // Pop result, if expression left anything on the stack
           // (which may not happen if e.g. there is a set or define)
           if(stack_size > stack_chk) emit_pop(); 
         }
@@ -3467,26 +3461,13 @@ restart:
     return compile(result, tail);
   }
 
-  // Handle a module definition
-  Value* define_module(size_t argc, Value* exp) {
-    // module must have at least a module name and specification
-    if(argc != 2) return arity_error(S_DEFINE_module, exp, 2, argc);
-    Value* name = exp->cadr(), *decls = exp->cddr();
-    // Parse module name
-    if(name->get_type() != PAIR)
-      return syntax_error(exp, "first argument to define-module must be a "
-                          "valid module name (a list of one or more "
-                          "symbols)");
-    if(decls->get_type() != PAIR)
-      return syntax_error(exp, "module body must be a module declaration");
-    Value* internal_name = 0, *chk = 0;
+  // Switch to module
+  
+  // Can be called either by an explicit module definition, or implicitly by load_module
+  Value* enter_module(Value* internal_name) {
     Pair* module_env = 0;
-
-    ODD_FRAME(name, decls, exp, internal_name, module_env, chk);
-
-    // Convert module name into internal format
-    internal_name = state.convert_module_name(name);
-    ODD_CHECK(internal_name);
+    Value* chk = 0;
+    ODD_FRAME(internal_name, module_env, chk);
 
     // Create new module table
     module_env = state.make_env();
@@ -3495,23 +3476,31 @@ restart:
     chk = state.register_module(ODD_CAST(String, internal_name), module_env);
     ODD_CHECK(chk);
 
-    Compiler cc(state, NULL, module_env);
-
-    // Create new compiler
-    std::cout << "module NAME " << internal_name << std::endl;
-    // Parse declarations
-    while(decls->get_type() == PAIR) {
-      Value* decl = decls->car();
-      std::cout << "DECL: " << decl << std::endl;
-      if(!listp(decl)) {
-        return syntax_error(decl, "module declaration must be a list");
-      }
-      decls = decls->cdr();
-    }
+    // Change compilers module
+    (*env) = module_env;
     
-    ODD_FAIL0("modules suck dogg");
-    // (scheme base) => #scheme.base
     return ODD_FALSE; 
+  }
+
+  // Handle a module definition
+  Value* module(size_t argc, Value* exp) {
+    // module must have at least a module name and specification
+    if(argc != 1) return arity_error(S_MODULE, exp, 2, argc);
+    Value* name = exp->cadr();
+    // Parse module name
+    if(name->get_type() != PAIR && name->get_type() != SYMBOL)
+      return syntax_error(exp, "first argument to module must be a "
+                          "valid module name (a symbol or a list of one or more symbols)");
+    Value* internal_name = 0;
+
+    ODD_FRAME(name, exp, internal_name);
+
+    // Convert module name into internal format
+    internal_name = state.convert_module_name(name);
+    // (scheme base) => #scheme.base
+    ODD_CHECK(internal_name);
+
+    return enter_module(internal_name);
   }
 
   // Compile a single expression, returns #f or an error if one occurred
@@ -3589,8 +3578,8 @@ restart:
             } else if(op == state.global_symbol(S_ER_MACRO_TRANSFORMER)) {
                 return syntax_error(exp, "er-macro-transformer can only be"
                                     " used within a macro definition");
-            } else if(op == state.global_symbol(S_DEFINE_module)) {
-              return define_module(argc, exp);
+            } else if(op == state.global_symbol(S_MODULE)) {
+              return module(argc, exp);
             } else assert(0);
           } else {
             ODD_CC_MSG("applying macro " << function);
@@ -4004,13 +3993,15 @@ Handle<Table> modules;
 Value* convert_module_name(Value* spec) {
   std::ostringstream out;
   out << '#';
+  if(spec->get_type() == SYMBOL) {
+    out << spec;
+    return make_string(out.str());
+  }
   if(!listp(spec)) 
-    return make_exception(S_ODD_EVAL, "module name must be a list of "
-                          "symbols");
+    return make_exception(S_ODD_EVAL, "module name must be a list of symbols");
   while(spec->get_type() == PAIR) {
     if(unbox(spec->car())->get_type() != SYMBOL) {
-      return make_exception(S_ODD_EVAL, "encountered non-symbol in module "
-                            "name");
+      return make_exception(S_ODD_EVAL, "encountered non-symbol in module name");
     }
     out << unbox(spec->car());
     if(spec->cdr() != ODD_NULL) {

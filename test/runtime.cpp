@@ -172,7 +172,7 @@ Value* eval_string(State& state, const std::string& string) {
     check = cc.compile(x);
     if(check != ODD_FALSE) {
       std::cerr << check << std::endl;
-      assert(0);
+      assert(1);
     }
   }
   p = cc.end();
@@ -266,9 +266,10 @@ void test_compiler(State& state) {
   // Stack management
   test_eval(state, "lambda { #t #t #t }()", ODD_TRUE);
   
+  // Modules
+  test_eval(state, "[module [x]] #t", ODD_TRUE);
   // Macros
 
-  // Modules
   // test runtime provided eval function
   assert(state.eval(ODD_TRUE, (*state.core_env)) == ODD_TRUE);
 }
