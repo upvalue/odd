@@ -1413,6 +1413,7 @@ State():
   // An environment containing special forms, core functions, and all the
   // other building blocks necessary for Odd
   core_env(*this),
+  user_env(*this),
   
   // Virtual machine
   vm_depth(0),
@@ -1431,6 +1432,7 @@ State():
     "special",
     "variable",
     "upvalue",
+    "#delegates",
     // Exception tags
     "#odd#read",
     "#odd#compile",
@@ -1460,7 +1462,6 @@ State():
     "include",
     "cond-expand",
     "rename",
-    "#delegates",
     "#er-macro-transformer"
   };
 
@@ -1479,11 +1480,14 @@ State():
   source_contents.push_back(NULL);
 
   // Initialize core environment for compiler
-  core_env = make_env();
+  core_env = make_env(ODD_FALSE, true);
+
   for(size_t i = S_DEFINE; i != S_QUOTE+1; i++) {
     env_define(*core_env, global_symbol(static_cast<Global>(i)),
                global_symbol(S_SPECIAL));
   }
+
+  user_env = make_env(ODD_FALSE, true);
 
   // Create module table
   modules = make_table();
@@ -1514,6 +1518,7 @@ enum Global {
   S_SPECIAL,
   S_VARIABLE,
   S_UPVALUE,
+  S_DELEGATES,
   S_ODD_READ,
   S_ODD_COMPILE,
   S_ODD_EVAL,
@@ -1542,7 +1547,6 @@ enum Global {
   S_INCLUDE,
   S_COND_EXPAND,
   S_RENAME,
-  S_DELEGATES,
   S_REAL_ER_MACRO_TRANSFORMER,
   GLOBAL_SYMBOL_COUNT
 };
@@ -1991,6 +1995,13 @@ Value* table_get(Table* table, Value* key, bool& found) {
     return ODD_FALSE;
   }
 }  
+
+Value* table_get(Table* table, Value* key) {
+  bool found;
+  Value* ret = table_get(table, key, found);
+  assert(found);
+  return ret;
+}
 
 bool table_contains(Table* table, Value* key) {
   ODD_ASSERT(table->get_type() == TABLE);
@@ -2670,7 +2681,9 @@ Value* read() {
 // -->
 
 // The core environment which contains special forms and builtins
-Handle<Pair> core_env;
+Handle<Table> core_env;
+// User interaction environment (eg REPL, one-off evaluations)
+Handle<Table> user_env;
 
 // Some structures that are shared by the virtual machine and compiler
 // Virtual machine instructions
@@ -2701,37 +2714,42 @@ struct UpvalLoc {
 
 // Compilation environment format
 
-// An environment is a pair containing a "parent" environment or a vector of
-// "imported" environments as the car, and a symbol table as the cdr
+// An environment is a table
 
-// Top-level environment:
-// Either (#f . <table>) 
-// Or (#(<imported env> ...) . <table>)
+// Each environment has a special value #delegates with either a vector of tables (for modules) or a single table (for
+// functions). This variable tells lookup where to search for variables if lookup in a particular table fails
 
-// Where entries in <table> are either 'special', a syntax transformer, or a
-// symbol name indicating a global variable
+// Entries in a module table are either 'special', a syntax transformer, or a symbol name indicating a global variable
 
-// Local environment:
-// (<parent env> . <table>)
+// Entries in a function table are either syntax transformers or a fixnum indicating a local variable's index in the
+// virtual machine's locals array
 
-// Where entries in <table> are either syntax transformers or a fixnum
-// indicating a local variable's index in the virtual machine's locals array
-
-Pair* make_env(Value* parent = ODD_FALSE) {
+Table* make_env(Value* parent = ODD_FALSE, bool global = false) {
   Table* table = 0;
-  ODD_S_FRAME(parent, table);
+  Vector* delegates = 0;
+  ODD_S_FRAME(parent, table, delegates);
   table = make_table();
-  return cons(parent, table);
+  if(global) {
+    delegates = make_vector();
+    if(parent) vector_append(delegates, parent);
+    table_insert(table, global_symbol(S_DELEGATES), delegates); 
+  } else {
+    table_insert(table, global_symbol(S_DELEGATES), parent);
+  }
+  return table;
 }
 
-bool env_contains(Pair* env, Value* key) {
-  return table_contains(ODD_CAST(Table, env->cdr), key);
+bool env_contains(Table* env, Value* key) {
+  return table_contains(env, key);
 }
 
-void env_define(Pair* env, Value* key, Value* value, Value* src = 0) {
-  Table* table = ODD_CAST(Table, env->cdr);
+Value* env_delegates(Table* table) {
+  return table_get(table, global_symbol(S_DELEGATES));
+}
+
+void env_define(Table* table, Value* key, Value* value, Value* src = 0) {
   Value* chk = 0;
-  if(env_contains(env, key)) {
+  if(env_contains(table, key)) {
     chk = table_set(table, key, value);
   } else {
     chk = table_insert(table, key, value);
@@ -2741,8 +2759,8 @@ void env_define(Pair* env, Value* key, Value* value, Value* src = 0) {
 
 // If an environment has no parent environment, or a list of delegate
 // environments, its variables will be global variables
-bool env_globalp(Pair* env) {
-  return env->car == ODD_FALSE || env->car->get_type_unsafe() == VECTOR;
+bool env_globalp(Table* table) {
+  return table_get(table, global_symbol(S_DELEGATES))->get_type() == VECTOR;
 }
 
 // Look up an environment variable (the result is rather complex, and
@@ -2777,13 +2795,12 @@ bool lookup_syntaxp(Lookup& lookup) {
   return false;
 }
 
-void env_lookup(Pair* env, Value* key, Lookup& lookup) {
-  Pair* start_env = env;
+void env_lookup(Table* env, Value* key, Lookup& lookup) {
+  Table* start_env = env;
   // Search through environments
-  while(env->get_type() == PAIR) {
-    Table* table = ODD_CAST(Table, env->cdr);
+  while(env->get_type() == TABLE) {
     // Search through an environment
-    Value* cell = table_get_cell(table, key);
+    Value* cell = table_get_cell(env, key);
     if(cell != ODD_FALSE) {
       // Found a match -- determine scope
       ODD_ASSERT(cell->get_type() == PAIR);
@@ -2808,7 +2825,7 @@ void env_lookup(Pair* env, Value* key, Lookup& lookup) {
     // global variable)
     lookup.nonglobal.level++;
     // TODO: Delegates
-    env = static_cast<Pair*>(env->car);
+    env = ODD_CAST(Table, env_delegates(env));
   }
   lookup.success = false;
 }
@@ -2826,14 +2843,14 @@ struct FreeVariableInfo {
 
 // An instance of the compiler, created for each function
 struct Compiler {
-  Compiler(State& state_, Compiler* parent_, Pair* env_ = NULL,
+  Compiler(State& state_, Compiler* parent_, Table* env_ = NULL,
            size_t depth_ = 0): 
     state(state_), parent(parent_),
     local_free_variable_count(0), upvalue_count(0),
     stack_max(0), stack_size(0), locals(0), constants(state), closure(false),
     name(state_), env(0), depth(depth_), last_insn(0) {
     if(!env_) env = &state.core_env;
-    else env = new Handle<Pair>(state, env_);
+    else env = new Handle<Table>(state, env_);
     env_globalp = state.env_globalp(**env);
   }
 
@@ -2860,7 +2877,7 @@ struct Compiler {
   Handle<String> name;
   // The environment of the function
   bool env_globalp;
-  Handle<Pair>* env;
+  Handle<Table>* env;
   // The depth of the function (for debug message purposes)
   size_t depth;
   // Location of last instruction emitted (for debug message purposes)
@@ -3246,7 +3263,7 @@ restart:
     // Will be set to true if the function is variable arity
     // (i.e. takes unlimited arguments)
     bool variable_arity = false;
-    Pair *new_env = 0;
+    Table *new_env = 0;
     Value *args = 0, *body = 0, *arg = 0;
     Prototype* proto = 0;
     ODD_FRAME(exp, new_env, args, arg, body, proto);
@@ -3465,7 +3482,7 @@ restart:
   
   // Can be called either by an explicit module definition, or implicitly by load_module
   Value* enter_module(Value* internal_name) {
-    Pair* module_env = 0;
+    Table* module_env = 0;
     Value* chk = 0;
     ODD_FRAME(internal_name, module_env, chk);
 
@@ -4028,7 +4045,7 @@ Value* register_module(String* name, Value* env) {
 
 // Evaluation functions
 Value* eval(Value* exp, Value* env) {
-  Pair* new_env = 0;
+  Table* new_env = 0;
   Value *chk = 0, *proto = 0, *result = 0;
   ODD_S_FRAME(exp, env, new_env, chk, proto, result);
   new_env = make_env(env);
@@ -4260,13 +4277,10 @@ ODD_FUNCTION(apply_macro) {
 }
 
 ODD_FUNCTION(er_macro_transformer) {
+#if 0
   static const char* fn_name = "#er-macro-transformer";
   ODD_CHECK_TYPE(PAIR, 0);
   ODD_CHECK_APPLICABLE(1);
-  std::cout << args[0] << std::endl << args[1] << std::endl;
-  // build apply-macro closure
-  Value* cc_env = args[0], *transformer = args[1];
-  NativeFunction* apply_macro_fn = 0;
   VectorStorage* apply_macro_closure = 0;
   ODD_FRAME(cc_env, transformer, apply_macro_fn, apply_macro_closure);
 
@@ -4279,6 +4293,8 @@ ODD_FUNCTION(er_macro_transformer) {
                                               apply_macro_closure);
   
   return apply_macro_fn;
+#endif
+  return 0;
 }
 
 inline void State::initialize_builtin_functions() {

@@ -267,7 +267,8 @@ void test_compiler(State& state) {
   test_eval(state, "lambda { #t #t #t }()", ODD_TRUE);
   
   // Modules
-  test_eval(state, "[module [x]] #t", ODD_TRUE);
+  //test_eval(state, "[module [x]] #t", ODD_TRUE);
+
   // Macros
 
   // test runtime provided eval function
@@ -298,7 +299,7 @@ void test() {
   run_test_suite(*state);
 
   // print symbol table
-  Table * tbl = ODD_CAST(Table, state->core_env->cdr);
+  Table * tbl = ODD_CAST(Table, *state->core_env);
   for(size_t i = 0; i != tbl->chains->length; i++) {
     Value* cell = tbl->chains->data[i];
     while(cell->get_type() == PAIR) {
