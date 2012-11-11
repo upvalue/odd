@@ -1458,8 +1458,8 @@ State():
     "unquote",
     "unquote-splicing",
     "import",
-    "export",
-    "include",
+    "public",
+    "private",
     "cond-expand",
     "rename",
     "#er-macro-transformer"
@@ -1543,8 +1543,8 @@ enum Global {
   S_UNQUOTE,
   S_UNQUOTE_SPLICING,
   S_IMPORT,
-  S_EXPORT,
-  S_INCLUDE,
+  S_PUBLIC,
+  S_PRIVATE,
   S_COND_EXPAND,
   S_RENAME,
   S_REAL_ER_MACRO_TRANSFORMER,
@@ -2749,7 +2749,7 @@ Value* env_delegates(Table* table) {
 
 void env_define(Table* table, Value* key, Value* value, Value* src = 0) {
   Value* chk = 0;
-  if(env_contains(table, key)) {
+  if(table_contains(table, key)) {
     chk = table_set(table, key, value);
   } else {
     chk = table_insert(table, key, value);
@@ -2848,7 +2848,7 @@ struct Compiler {
     state(state_), parent(parent_),
     local_free_variable_count(0), upvalue_count(0),
     stack_max(0), stack_size(0), locals(0), constants(state), closure(false),
-    name(state_), env(0), depth(depth_), last_insn(0) {
+    name(state_), exporting(false), env(0), depth(depth_), last_insn(0) {
     if(!env_) env = &state.core_env;
     else env = new Handle<Table>(state, env_);
     env_globalp = state.env_globalp(**env);
@@ -2877,6 +2877,8 @@ struct Compiler {
   Handle<String> name;
   // The environment of the function
   bool env_globalp;
+  // For modules only: whether to export definitions
+  bool exporting;
   Handle<Table>* env;
   // The depth of the function (for debug message purposes)
   size_t depth;
@@ -3124,32 +3126,7 @@ restart:
     if(argc != 2) return arity_error(S_DEFINE, exp, 2, argc);
     Value* name = unbox(exp->cadr());
     Value* args = 0;
-    if(name->get_type() != SYMBOL) {
-      // Parse a lambda shortcut, e.g. (define (x) #t) becomes 
-      // (define x (#named-lambda x () #t))
-      if(name->get_type() == PAIR) {
-        args = name->cdr();
-        name = name->car();
-        if(unbox(name)->get_type() != SYMBOL)
-          return syntax_error(S_DEFINE, exp, "first argument to define a "
-                              "function must be a symbol");
-        Value* named_lambda = 0, *tmp = 0;
-        ODD_FRAME(exp, name, args, named_lambda, tmp);
-        // Get the argument list and body
-        tmp = state.cons(args, exp->cddr());
-        // Put the function's name in front of them
-        tmp = state.cons(name, tmp);
-        // Finally put all that in a (named-lambda ...) expression
-        named_lambda = state.cons(state.global_symbol(S_NAMED_LAMBDA), tmp);
-        named_lambda = state.cons_source(named_lambda, ODD_NULL, exp);
-        // This is kind of hacky, but we're just going to twiddle the
-        // expression a little bit and start parsing again
-        exp->cdr()->set_car(name);
-        exp->cdr()->set_cdr(named_lambda);
-        goto restart;
-      } else return syntax_error(S_DEFINE, exp,
-                                "first argument to define must be a symbol");
-    }
+
     // Parse a define lambda expression, e.g.: 
     // (define name (lambda () #t))
     // becomes
