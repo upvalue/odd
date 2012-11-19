@@ -60,17 +60,22 @@
 
 // Trace messages
 #ifdef ODD_TRACE
-# define ODD_GC_MSG(x) std::cout << "GC: " << x << std::endl
+# define ODD_GC_MSG(x) if(trace) std::cout << "GC: " << x << std::endl
 # define ODD_CC_MSG(x) \
-    for(size_t _x = (depth); _x; _x--) \
-      std::cout << '>'; std::cout << "CC: " << x << std::endl;
-# define ODD_CC_VMSG(x) ODD_CC_MSG(x)
-# define ODD_CC_EMIT(x) ODD_CC_MSG((last_insn) << ": " << x)
+    if(state.trace) { \
+      for(size_t _x = (depth); _x; _x--) \
+        std::cout << '>'; std::cout << "CC: " << x << std::endl; \
+    }
+# define ODD_CC_VMSG(x) if(state.trace) ODD_CC_MSG(x)
+# define ODD_CC_EMIT(x) if(state.trace) ODD_CC_MSG((last_insn) << ": " << x)
 
 # define ODD_VM_MSG(x) \
-  for(size_t _x = (vm_depth); _x != 1; _x--) \
-    std::cout << '>'; \
-  std::cout << "VM: " << x << std::endl
+  if(trace) { \
+    for(size_t _x = (vm_depth); _x != 1; _x--) \
+      std::cout << '>'; \
+    std::cout << "VM: " << x << std::endl; \
+  }
+
 # define ODD_VM_VMSG(y) ODD_VM_MSG("(stack: " << f.si << ") " << y)
 // Execute a particular instruction, includes instruction offset
 # define ODD_VM_MSG_INSN(y) ODD_VM_MSG("INSN: " << ip-1 << " (stack: " << f.si << ") " << y)
@@ -791,6 +796,7 @@ std::vector<Block*> blocks;
 Handle<Value>* handle_list;
 std::vector<VMFrame*> vm_frames;
 Frame* frame_list;
+bool trace;
 bool collect_before_every_allocation;
 int mark_bit;
 size_t heap_size, block_cursor, live_at_last_collection, collections;
@@ -988,7 +994,6 @@ void finish_mark() {
 
 // Mark all live memory
 void mark_heap() {
-  // Symbols are roots (for now)
   for(Frame* f = frame_list; f != NULL; f = f->previous)
     for(size_t i = 0; i != f->root_count; i++)
       recursive_mark(*f->roots[i]);
@@ -1023,6 +1028,11 @@ void mark_heap() {
     while(cell->get_type() == PAIR) {
       // If the value has been collected
       if(!markedp(cell->cdar())) {
+        // If this symbol has its value set, we'll consider it a root
+        if(ODD_CAST(Symbol, cell->cdar())->value != ODD_FALSE) {
+          recursive_mark(cell->cdar());
+          continue;
+        }        
         // If this is the head of the linked list
         if(cell == symbol_table->chains->data[i]) {
           // remove from front
@@ -1398,9 +1408,8 @@ void compact() {
 
 State(): 
   // Garbage collector
-  handle_list(0),
-  frame_list(0), 
-  collect_before_every_allocation(false), mark_bit(1),
+  handle_list(0), frame_list(0), 
+  trace(false), collect_before_every_allocation(false), mark_bit(1),
   heap_size(ODD_HEAP_ALIGNMENT),
   block_cursor(0),  live_at_last_collection(0), collections(0),
   sweep_cursor(0),
@@ -1412,8 +1421,9 @@ State():
 
   // An environment containing special forms, core functions, and all the
   // other building blocks necessary for Odd
-  core_env(*this),
-  user_env(*this),
+  core_module(*this),
+  // User interaction environment (eg REPL, one-off evaluations)
+  user_module(*this),
   
   // Virtual machine
   vm_depth(0),
@@ -1432,7 +1442,10 @@ State():
     "special",
     "variable",
     "upvalue",
+    // Hidden module variables
     "#delegates",
+    "#module-name",
+    "#exported",
     // Exception tags
     "#odd#read",
     "#odd#compile",
@@ -1453,13 +1466,13 @@ State():
     "module",
     "#quote",
     "quote",
+    "import",
+    "public",
+    "private",
     // Other
     "quasiquote",
     "unquote",
     "unquote-splicing",
-    "import",
-    "public",
-    "private",
     "cond-expand",
     "rename",
     "#er-macro-transformer"
@@ -1480,19 +1493,22 @@ State():
   source_contents.push_back(NULL);
 
   // Initialize core environment for compiler
-  core_env = make_env(ODD_FALSE, true);
+  core_module = make_env(ODD_FALSE, "#odd#core");
 
   for(size_t i = S_DEFINE; i != S_QUOTE+1; i++) {
-    env_define(*core_env, global_symbol(static_cast<Global>(i)),
+    env_define(*core_module, global_symbol(static_cast<Global>(i)),
                global_symbol(S_SPECIAL));
   }
 
-  user_env = make_env(ODD_FALSE, true);
+  user_module = make_env(ODD_FALSE, "#user");
 
   // Create module table
   modules = make_table();
 
   initialize_builtin_functions();
+
+  register_module("#odd#core", *core_module);
+  register_module("#user", *user_module);
 }
 
 ~State() {
@@ -1515,10 +1531,14 @@ Table* symbol_table;
 std::vector<Handle<Value> *> globals;
 
 enum Global {
+  // Compiler forms
   S_SPECIAL,
   S_VARIABLE,
   S_UPVALUE,
   S_DELEGATES,
+  S_MODULE_NAME,
+  S_EXPORTED,
+  // Exceptions
   S_ODD_READ,
   S_ODD_COMPILE,
   S_ODD_EVAL,
@@ -1538,13 +1558,13 @@ enum Global {
   S_MODULE,
   S_GENERATED_QUOTE,
   S_QUOTE,
+  S_IMPORT,
+  S_PUBLIC,
+  S_PRIVATE,
   // End special forms
   S_QUASIQUOTE,
   S_UNQUOTE,
   S_UNQUOTE_SPLICING,
-  S_IMPORT,
-  S_PUBLIC,
-  S_PRIVATE,
   S_COND_EXPAND,
   S_RENAME,
   S_REAL_ER_MACRO_TRANSFORMER,
@@ -1652,6 +1672,7 @@ Symbol* make_symbol(String* string) {
     cpy = make_string(string);
     sym->name = cpy;
     table_insert(symbol_table, cpy, sym);
+    if(trace) std::cout << "CREATING NEW SYMBOL " << sym << " ID: " << (ptrdiff_t) sym << " HASH: " << x31_string_hash(sym->symbol_name()->string_data()) << std::endl;
   }
   return sym;
 }
@@ -1757,11 +1778,13 @@ void defun(const std::string& cname, NativeFunction::ptr_t ptr,
            unsigned arguments, bool variable_arity) {
   NativeFunction* fn = 0;
   Symbol* name = 0;
-  ODD_S_FRAME(fn, name);
+  Symbol* qualified_name= 0;
+  ODD_S_FRAME(fn, name, qualified_name);
   fn = make_native_function(ptr, arguments, variable_arity);
   name = make_symbol(cname);
-  env_define(*core_env, name, name);
-  name->value = fn;
+  env_define(*core_module, name, name);
+  qualified_name = ODD_CAST(Symbol, env_qualify_name(*core_module, name));
+  qualified_name->value = fn;
 }
 
 VectorStorage* vector_storage_realloc(size_t capacity, VectorStorage* old) {
@@ -2681,9 +2704,9 @@ Value* read() {
 // -->
 
 // The core environment which contains special forms and builtins
-Handle<Table> core_env;
+Handle<Table> core_module;
 // User interaction environment (eg REPL, one-off evaluations)
-Handle<Table> user_env;
+Handle<Table> user_module;
 
 // Some structures that are shared by the virtual machine and compiler
 // Virtual machine instructions
@@ -2724,15 +2747,19 @@ struct UpvalLoc {
 // Entries in a function table are either syntax transformers or a fixnum indicating a local variable's index in the
 // virtual machine's locals array
 
-Table* make_env(Value* parent = ODD_FALSE, bool global = false) {
+Table* make_env(Value* parent = ODD_FALSE, const char* module_name = 0) {
   Table* table = 0;
   Vector* delegates = 0;
-  ODD_S_FRAME(parent, table, delegates);
+  String* name = 0;
+  ODD_S_FRAME(parent, table, delegates, name);
   table = make_table();
-  if(global) {
+  // If this is a module
+  if(module_name) {
     delegates = make_vector();
     if(parent) vector_append(delegates, parent);
     table_insert(table, global_symbol(S_DELEGATES), delegates); 
+    name = make_string(module_name);
+    table_insert(table, global_symbol(S_MODULE_NAME), name);
   } else {
     table_insert(table, global_symbol(S_DELEGATES), parent);
   }
@@ -2771,13 +2798,16 @@ struct Lookup {
   Lookup(): scope(REF_LOCAL), success(true) {
     // Make sure everything is zero-initialized
     nonglobal.index = nonglobal.level = 0;
-    global = nonglobal.value = 0;
+    nonglobal.value = 0;
+
+    global.value = 0;
+    global.module = 0;
   }
 
   RefScope scope;
   bool success;
   union {
-    Value* global;
+    struct { Value* value; Table* module; } global; 
     struct { unsigned index, level; Value* value; } nonglobal;
   };
 };
@@ -2786,13 +2816,23 @@ struct Lookup {
 bool lookup_syntaxp(Lookup& lookup) {
   if(lookup.success) {
     if(lookup.scope == REF_GLOBAL) {
-      return lookup.global == global_symbol(S_SPECIAL) ||
-             lookup.global->applicablep();
+      return lookup.global.value == global_symbol(S_SPECIAL) ||
+             lookup.global.value->applicablep();
     } else {
       return lookup.nonglobal.value->applicablep();
     }
   }
   return false;
+}
+
+Value* env_qualify_name(Table* env, Value* name) {
+  bool found;
+  Value* module_name = table_get(env, global_symbol(S_MODULE_NAME), found);
+  ODD_ASSERT(found);
+  std::ostringstream ss;
+  ss << module_name->string_data() << '#' << name;
+
+  return make_symbol(ss.str());
 }
 
 void env_lookup(Table* env, Value* key, Lookup& lookup) {
@@ -2806,7 +2846,8 @@ void env_lookup(Table* env, Value* key, Lookup& lookup) {
       ODD_ASSERT(cell->get_type() == PAIR);
       if(env_globalp(env)) {
         lookup.scope = REF_GLOBAL;
-        lookup.global = cell->cdr();
+        lookup.global.value = cell->cdr();
+        lookup.global.module = env;
         return;
       } else {
         // If we're still searching through the original environment, it's a
@@ -2824,8 +2865,17 @@ void env_lookup(Table* env, Value* key, Lookup& lookup) {
     // fine to increment because it'll be discarded if we go all the way to a
     // global variable)
     lookup.nonglobal.level++;
-    // TODO: Delegates
-    env = ODD_CAST(Table, env_delegates(env));
+    // Nothing in this environment, keep searching
+    Value* delegates = env_delegates(env);
+    if(delegates->get_type() == TABLE) {
+      env = ODD_CAST(Table, delegates);
+      continue;
+    }
+    if(delegates->get_type() == VECTOR) {
+      ODD_ASSERT(0);
+    }
+    // No delegates, we're done
+    break;
   }
   lookup.success = false;
 }
@@ -2841,7 +2891,7 @@ struct FreeVariableInfo {
   unsigned index;
 };
 
-// An instance of the compiler, created for each function
+// An instance of the compiler, created for each function or module
 struct Compiler {
   Compiler(State& state_, Compiler* parent_, Table* env_ = NULL,
            size_t depth_ = 0): 
@@ -2849,13 +2899,13 @@ struct Compiler {
     local_free_variable_count(0), upvalue_count(0),
     stack_max(0), stack_size(0), locals(0), constants(state), closure(false),
     name(state_), exporting(false), env(0), depth(depth_), last_insn(0) {
-    if(!env_) env = &state.core_env;
+    if(!env_) env = &state.core_module;
     else env = new Handle<Table>(state, env_);
     env_globalp = state.env_globalp(**env);
   }
 
   ~Compiler() {
-    if(env != &state.core_env) delete env;    
+    if(env != &state.core_module) delete env;    
   }
 
   State& state;
@@ -3008,7 +3058,7 @@ struct Compiler {
     Lookup lookup;
     state.env_lookup(**env, check, lookup);
     return lookup.success && lookup.scope == REF_GLOBAL &&
-      lookup.global == state.global_symbol(S_SPECIAL);
+      lookup.global.value == state.global_symbol(S_SPECIAL);
   }
 
   // free variable handling
@@ -3053,23 +3103,29 @@ struct Compiler {
     state.env_lookup(**env, name, lookup);
     if(!lookup.success) return undefined_variable(exp);
     switch(lookup.scope) {
-      case REF_GLOBAL:
-        if(lookup.global == state.global_symbol(S_SPECIAL)) {
+      case REF_GLOBAL: {
+        if(lookup.global.value == state.global_symbol(S_SPECIAL)) {
           std::ostringstream ss;
           ss << "attempt to use special form '" << exp << "' as a value";
           return syntax_error(exp, ss.str());
         }
-        if(lookup.global->applicablep())
+        if(lookup.global.value->applicablep())
           return syntax_error(exp, "macros cannot be used as values");
-        // Why do we need lookup.global when we already have the name?
-        // Because it could be a reference to a module variable, 
-        // eg car => #core.car
-        push_constant(lookup.global);
+
+        //push_constant(lookup.global.value);
+        Table *module = lookup.global.module;
+        Value* tmp = 0;
+        ODD_FRAME(exp, name, module, tmp);
+        tmp = state.env_qualify_name(module, name);
+
+        push_constant(tmp);
+
         emit(OP_GLOBAL_GET);
-        ODD_CC_EMIT("global-get " << name);
+        ODD_CC_EMIT("global-get " << tmp);
         // No stack change -- the name will be popped, but the value will be
         // pushed       
         break;
+      }
       case REF_UP:
       case REF_LOCAL: {
         // Make sure we haven't been passed a macro (there can be local
@@ -3097,16 +3153,25 @@ struct Compiler {
 
   // Generate a set (used by both define and set)
   // Assumes value is already on the stack
-  void generate_set(Lookup& lookup, Value* name) {
+  void generate_set(Table* env, Lookup& lookup, Value* name) {
     switch(lookup.scope) {
-      case REF_GLOBAL:
-        push_constant(name);
+      case REF_GLOBAL: {
+        // The global-set must be qualified with the module's name, for instance if we're in the module "user" and have
+        // a variable "x", it should become #user#x
+
+        // Retrieve the module's name
+        Value* qualified_name = 0;
+        ODD_FRAME(env, name, qualified_name);
+        qualified_name = state.env_qualify_name(env, name);
+
+        push_constant(qualified_name);
         emit(OP_GLOBAL_SET);
         ODD_CC_EMIT("global-set " << name);
         // Note we only pop once here to compensate for the push_constant; there is another pop generated after every
         // set
         pop();
         break;
+      }
       case REF_LOCAL:
         emit(OP_LOCAL_SET);
         emit_arg(lookup.nonglobal.index);
@@ -3139,8 +3204,7 @@ restart:
         ODD_FRAME(exp, name, args, named_lambda, test);
         // Get the rest of the expression
         named_lambda = state.cons(name, test->cdr());
-        named_lambda = state.cons(
-          state.global_symbol(S_NAMED_LAMBDA), named_lambda);
+        named_lambda = state.cons(state.global_symbol(S_NAMED_LAMBDA), named_lambda);
         named_lambda = state.cons_source(named_lambda, ODD_NULL, exp);
         exp->cdr()->set_cdr(named_lambda);
         goto restart;
@@ -3172,7 +3236,7 @@ restart:
     chk = compile(exp->cddr()->car());
     ODD_CHECK(chk);
     // Set variable
-    generate_set(lookup, name);
+    generate_set(**env, lookup, name);
     return ODD_FALSE;
   }
 
@@ -3199,7 +3263,7 @@ restart:
     if(state.lookup_syntaxp(lookup))
       return syntax_error(exp, "syntax cannot be set like a variable");
 
-    generate_set(lookup, name);
+    generate_set(**env, lookup, name);
 
     // note pop
     return ODD_FALSE;
@@ -3442,7 +3506,7 @@ restart:
     state.vm_trampoline_arguments.push_back(ODD_FALSE);
     state.vm_trampoline_arguments.push_back(ODD_FALSE);
 
-    Value* function = lookup.scope == REF_GLOBAL ? lookup.global :
+    Value* function = lookup.scope == REF_GLOBAL ? lookup.global.value :
       lookup.nonglobal.value;
 
     // No need to protect anything as it will all be discared
@@ -3490,8 +3554,8 @@ restart:
     ODD_FRAME(name, exp, internal_name);
 
     // Convert module name into internal format
+    // (scheme base) => #scheme#base
     internal_name = state.convert_module_name(name);
-    // (scheme base) => #scheme.base
     ODD_CHECK(internal_name);
 
     return enter_module(internal_name);
@@ -3534,7 +3598,7 @@ restart:
         }
         if(syntax) {
           size_t argc = length(exp->cdr());
-          if(lookup.global == state.global_symbol(S_SPECIAL)) {
+          if(lookup.global.value == state.global_symbol(S_SPECIAL)) {
             // Dispatch on the special form
             Symbol* op = ODD_CAST(Symbol, function);
             // define
@@ -3549,6 +3613,13 @@ restart:
             // lambda
             } else if(op == state.global_symbol(S_LAMBDA)) {
               return compile_lambda(argc, exp, tail, ODD_FALSE);
+            // public & private
+            } else if(op == state.global_symbol(S_PUBLIC)) {
+              exporting = true;
+              return ODD_FALSE;
+            } else if(op == state.global_symbol(S_PRIVATE)) {
+              exporting = false;
+              return ODD_FALSE;
             // named-lambda
             } else if(op == state.global_symbol(S_NAMED_LAMBDA)) {  
               // This is a little hacky, but we're going to extract the name
@@ -4010,6 +4081,13 @@ bool module_loaded(String* name) {
   return table_contains(*modules, name);
 }
 
+Value* register_module(const char* name, Value* env) {
+  String* sname = 0;
+  ODD_S_FRAME(sname);
+  sname = make_string(name);
+  return register_module(sname, env);
+}
+
 Value* register_module(String* name, Value* env) {
   if(module_loaded(name)) {
     std::ostringstream os;
@@ -4258,6 +4336,11 @@ ODD_FUNCTION(er_macro_transformer) {
   static const char* fn_name = "#er-macro-transformer";
   ODD_CHECK_TYPE(PAIR, 0);
   ODD_CHECK_APPLICABLE(1);
+  VectorStorage* apply_macro_closure = 0;
+  ODD_FRAME(cc_env, transformer, apply_macro_fn, apply_macro_closure);
+
+  apply_macro_closure = state.vector_storage_realloc(2, 0);
+  apply_macro_closure->data[0] = cc_env;
   VectorStorage* apply_macro_closure = 0;
   ODD_FRAME(cc_env, transformer, apply_macro_fn, apply_macro_closure);
 

@@ -220,7 +220,6 @@ void test_compiler(State& state) {
   test_eval(state, "#f", ODD_FALSE);
   // Global variable access
   test_eval(state, "define(x #t) x", ODD_TRUE);
-
   // Function compilation
   test_eval(state, "lambda { #t }", PROTOTYPE);
   // Simple application
@@ -230,15 +229,10 @@ void test_compiler(State& state) {
   // Set!
   test_eval(state, "define(z #f) set(z #t) z", ODD_TRUE);
   test_eval(state, "lambda(x) { set(x #t) x }(#f)", ODD_TRUE);
-//  test_eval(state, "(define z #f) (set! z #t) z", ODD_TRUE);
-  //test_eval(state, "((lambda (x) (set! x #t) x) #f)", ODD_TRUE);
   // Closures
   test_eval(state, "lambda(x) { lambda() { x }() }(#t)", ODD_TRUE);
   // 2-level Closure
   test_eval(state, "lambda(x) { lambda() { lambda() { x }() }() }(#t)", ODD_TRUE);
-  // Define lambda shortcut
-  // TODO remove
-  //test_eval(state, "define([name]) { #t } name()", ODD_TRUE);
   // If
   test_eval(state, "if(#t #t #f)", ODD_TRUE);
   test_eval(state, "if(#t) { #t } { #f }", ODD_TRUE);
@@ -272,7 +266,7 @@ void test_compiler(State& state) {
   // Macros
 
   // test runtime provided eval function
-  assert(state.eval(ODD_TRUE, (*state.core_env)) == ODD_TRUE);
+//;  assert(state.eval(ODD_TRUE, (*state.core_module)) == ODD_TRUE);
 }
 
 void run_test_suite(State& state) {
@@ -293,13 +287,9 @@ void test() {
   State* state = new State;
   
   run_test_suite(*state);
-  state->compact();
-  run_test_suite(*state);
-  state->compact();
-  run_test_suite(*state);
 
   // print symbol table
-  Table * tbl = ODD_CAST(Table, *state->core_env);
+  Table * tbl = ODD_CAST(Table, *state->core_module);
   for(size_t i = 0; i != tbl->chains->length; i++) {
     Value* cell = tbl->chains->data[i];
     while(cell->get_type() == PAIR) {
