@@ -261,12 +261,16 @@ void test_compiler(State& state) {
   test_eval(state, "lambda { #t #t #t }()", ODD_TRUE);
   
   // Modules
-  //test_eval(state, "[module [x]] #t", ODD_TRUE);
+  test_eval(state, "[module [a]] #t", ODD_TRUE);
+  state.trace = true;
+  test_eval(state, "[module [b]] define(x #t) x", ODD_TRUE);
+
+  test_eval(state, "[module [c]] [public] define(x #t) x", ODD_TRUE);
 
   // Macros
 
   // test runtime provided eval function
-//;  assert(state.eval(ODD_TRUE, (*state.core_module)) == ODD_TRUE);
+  assert(state.eval(ODD_TRUE, (*state.core_module)) == ODD_TRUE);
 }
 
 void run_test_suite(State& state) {

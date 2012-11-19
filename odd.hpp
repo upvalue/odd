@@ -1672,7 +1672,6 @@ Symbol* make_symbol(String* string) {
     cpy = make_string(string);
     sym->name = cpy;
     table_insert(symbol_table, cpy, sym);
-    if(trace) std::cout << "CREATING NEW SYMBOL " << sym << " ID: " << (ptrdiff_t) sym << " HASH: " << x31_string_hash(sym->symbol_name()->string_data()) << std::endl;
   }
   return sym;
 }
@@ -2835,7 +2834,7 @@ Value* env_qualify_name(Table* env, Value* name) {
   return make_symbol(ss.str());
 }
 
-void env_lookup(Table* env, Value* key, Lookup& lookup) {
+void env_lookup(Table* env, Value* key, Lookup& lookup, bool search_exports = false) {
   Table* start_env = env;
   // Search through environments
   while(env->get_type() == TABLE) {
@@ -2872,9 +2871,17 @@ void env_lookup(Table* env, Value* key, Lookup& lookup) {
       continue;
     }
     if(delegates->get_type() == VECTOR) {
-      ODD_ASSERT(0);
+      // Search through delegates; take the most recent one first
+      for(size_t i = delegates->vector_length() - 1; i != ((size_t)0)-1; i--) {
+        Lookup sublookup;
+        env_lookup(ODD_CAST(Table, delegates->vector_ref(i)), key, sublookup, true);
+        if(sublookup.success) {
+          lookup = sublookup;
+          return;
+        }
+      }
     }
-    // No delegates, we're done
+    // No delegates or delegate search failed, we're done
     break;
   }
   lookup.success = false;
@@ -3528,7 +3535,7 @@ restart:
     ODD_FRAME(internal_name, module_env, chk);
 
     // Create new module table
-    module_env = state.make_env();
+    module_env = state.make_env(*state.core_module, internal_name->string_data());
 
     // Register module
     chk = state.register_module(ODD_CAST(String, internal_name), module_env);
