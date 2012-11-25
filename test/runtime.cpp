@@ -275,6 +275,10 @@ void test_compiler(State& state) {
   assert(state.eval(ODD_TRUE, (*state.core_module)) == ODD_TRUE);
 }
 
+void test_module(State& state) {
+  state.load_module("#test#module");
+}
+
 void run_test_suite(State& state) {
   std::cout << "!! sizeof(State) " << sizeof(State) << " [" << FriendlySize(sizeof(State)) << "]" << std::endl;
   state.collect_before_every_allocation = true;
@@ -285,12 +289,15 @@ void run_test_suite(State& state) {
   test_tables(state);
   test_reader(state);
   test_compiler(state);
+  test_module(state);
 
   std::cout << "!! collections: " << state.collections << " heap size: " << FriendlySize(state.heap_size) << std::endl;
 }
 
 void test() {
   State* state = new State;
+
+  state->module_search_paths.push_back("./");
   
   run_test_suite(*state);
 

@@ -51,9 +51,11 @@
 #endif
 
 // Try to give a graceful error message when internal errors occur
-#define ODD_FAIL0(desc) \
+#define ODD_FAIL(desc) \
+  { \
   std::cerr << desc << std::endl; \
-  ODD_ASSERT(!"failure");
+  ODD_ASSERT(!"failure"); \
+  }
 
 // Checking for exceptions
 #define ODD_CHECK(x) if((x)->active_exception()) return (x);
@@ -873,7 +875,7 @@ void recursive_mark(Value* x) {
         continue;
       }
       default:
-        ODD_FAIL0("recursive_mark got bad type " << x->get_type());
+        ODD_FAIL("recursive_mark got bad type " << x->get_type());
     }
   }
 }
@@ -1239,7 +1241,7 @@ static size_t minimum_size(Value* x) {
       break;
       // Should not occur
     case TRANSIENT: case FIXNUM: case CONSTANT:
-      ODD_FAIL0("minimum_size type should not occur: " << x->get_type());
+      ODD_FAIL("minimum_size type should not occur: " << x->get_type());
    }
    return align(POINTER_ALIGNMENT, size);
  }
@@ -1389,7 +1391,7 @@ void compact() {
         }
         continue;
       default: case TRANSIENT: case FIXNUM: case CONSTANT:
-        ODD_FAIL0("compact encountered bad type: " << x->get_type()); 
+        ODD_FAIL("compact encountered bad type: " << x->get_type()); 
 #undef ODD_FWD
     }
   }
@@ -3617,7 +3619,7 @@ restart:
 
   // Resolve an access statement (called both when an "access" statement is encountered in plain code and when it's
   // applied (eg 'module.macro()')
-  Value* resolve_access(Value* exp, Value* args) {
+  Value* resolve_access(Value* exp, Value* args, Table*& modref, Value *& nameref) {
     Value* qualified_imports = state.table_get(**env, state.global_symbol(S_QUALIFIED_IMPORTS));
     Value* module_name = 0;
     Value* variable_name = 0;
@@ -3652,28 +3654,24 @@ restart:
       return syntax_error(exp, ss.str());
     }
 
-    Lookup lookup;
-    state.env_lookup(module, variable_name, lookup);
-    if(!lookup.success) return undefined_variable(exp);
-    return generate_ref(lookup, exp, variable_name);    
+    modref = module;
+    nameref = variable_name;
+
+    return ODD_FALSE;
   }
 
   Value* compile_access_ref(size_t argc, Value* exp) {
     if(argc < 2) return arity_error_least(S_ACCESS, exp, 2, argc);
 
-    Value* ref = resolve_access(exp, exp->cdr());
+    Value* variable_name = 0;
+    Table* module = 0;
+    Value* chk = resolve_access(exp, exp->cdr(), module, variable_name);
+    if(chk->active_exception()) return chk;
 
-
-    // module.macro(1 2 3)
-    // [[access module macro] 1 2 3]
-
-    // Get module name
-    
-    // Get variable
-
-    // Compile reference
-
-    return ODD_FALSE;
+    Lookup lookup;
+    state.env_lookup(module, variable_name, lookup);
+    if(!lookup.success) return undefined_variable(exp);
+    return generate_ref(lookup, exp, variable_name);    
   }
 
   // Handle an import statement
@@ -4202,7 +4200,7 @@ tail:
                  static_cast<NativeFunction*>(function)->closure);
     }
     default:
-      ODD_FAIL0("attempt to apply bad type" << function->get_type());
+      ODD_FAIL("attempt to apply bad type" << function->get_type());
   }
   return ODD_UNSPECIFIED;
 } 
@@ -4212,6 +4210,7 @@ tail:
 
 // module management
 Handle<Table> modules;
+std::vector<std::string> module_search_paths;
 
 // Convert a Scheme module name into a string
 // (scheme base) => "#scheme.base"
@@ -4263,8 +4262,41 @@ Value* load_module(String* name) {
   if(module_loaded(name)) {
     return table_get(*modules, name);
   }
-  ODD_FAIL0("loading external modules unimplemented");
+
+  // Convert internal module to OS path
+  // eg #test#module becomes test/module.odd
+  std::string path;
+  const char* string = name->string_data();
+  for(size_t i = 1; i < name->string_length(); i++) {
+    char c = string[i];
+    if(c == '#') {
+      path += '/';
+      continue;
+    }
+    path += c;
+  }
+  path += ".odd";
+
+  if(!module_search_paths.size())
+    ODD_FAIL("no module search paths added (try state.module_search_paths.push_back(\"./\"); before attempting to load modules");
+
+  for(size_t i = module_search_paths.size(); i != 0; i--) {
+    std::string whole_path(module_search_paths[i-1]);
+    whole_path += path;
+
+    std::ifstream fs(whole_path.c_str());
+    if(!fs) continue;    
+
+    std::cout << "LOADING MODULE " << whole_path << std::endl;
+  }
+
+  std::cout << "attempt to load module " << path << std::endl;
+
+  ODD_FAIL("loading external modules unimplemented");
+  return ODD_FALSE;
 }
+
+Value* load_module(const std::string& name) { return load_module(make_string(name)); }
 
 // Evaluation functions
 Value* eval(Value* exp, Value* env) {
