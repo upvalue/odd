@@ -1,5 +1,3 @@
-Odd
-
 Odd is a Scheme-derived programming language. 
 
 Short version:
