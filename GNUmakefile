@@ -1,10 +1,6 @@
 CXXFLAGS := -O2 -Wall -g3 -fno-rtti -fno-exceptions 
 LDFLAGS := 
 
-ifneq ($(shell uname -s),Darwin)
-	CXXFLAGS := $(CXXFLAGS) -std=c++11
-endif
-
 -include site.mk
 
 all: odd

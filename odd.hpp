@@ -91,7 +91,7 @@
 // Heap alignment is both the default size of the heap and the threshold for
 // allocating large objects separate from the normal heap
 #ifndef ODD_HEAP_ALIGNMENT
-# define ODD_HEAP_ALIGNMENT 4096
+# define ODD_HEAP_ALIGNMENT 4096 // 4KB
 #endif
 
 // The "load factor" is a percentage used to determine when to grow the heap.
@@ -130,6 +130,7 @@ inline std::ostream& operator<<(std::ostream& os, FriendlySize f) {
   char ending = 'b';
   if(f.s >= 1024) { f.s /= 1024; ending = 'K'; }
   if(f.s >= 1024) { f.s /= 1024; ending = 'M'; }
+  if(f.s >= 1024) { f.s /= 1024; ending = 'G'; }
   return os << f.s << ending;
 }
 
@@ -177,8 +178,7 @@ struct SourceInfo {
 
 // Cast with assertions (will cause double evaluation; do not give an argument
 // with side effects)
-#define ODD_CAST(klass, x) \
-  (ODD_ASSERT((x)->get_type() == odd::klass ::CLASS_TYPE), (klass *) (x))
+#define ODD_CAST(klass, x) (ODD_ASSERT((x)->get_type() == odd::klass ::CLASS_TYPE), (klass *) (x))
 
 // Constant values 
 #define ODD_FALSE ((odd::Value*) 0)
@@ -307,6 +307,8 @@ struct Value {
   Value* cadr() const;
   Value* cddr() const;
   Value* cdar() const;
+  Value* caadr() const;
+  Value* cdadr() const;
   Value* caddr() const;
 
   void set_car(Value*);
@@ -426,6 +428,16 @@ Value* Value::cddr() const {
 Value* Value::cdar() const {
   ODD_ASSERT(get_type() == PAIR);
   return static_cast<const Pair*>(this)->car->cdr();
+}
+
+Value* Value::cdadr() const {
+  ODD_ASSERT(get_type() == PAIR);
+  return static_cast<const Pair*>(this)->cdr->car()->cdr();
+}
+
+Value* Value::caadr() const {
+  ODD_ASSERT(get_type() == PAIR);
+  return static_cast<const Pair*>(this)->cdr->car()->car();
 }
 
 Value* Value::caddr() const {
@@ -1443,7 +1455,9 @@ State():
     "variable",
     "upvalue",
     // Hidden module variables
-    "#delegates",
+    "#parent",
+    "#unqualified-imports",
+    "#qualified-imports",
     "#module-name",
     "#exported",
     // Exception tags
@@ -1452,8 +1466,8 @@ State():
     "#odd#eval",
     "#odd#table",
     // Special forms
-    "access",
     "define",
+    "access",
     "set",
     "brace",
     "lambda",
@@ -1495,7 +1509,7 @@ State():
   // Initialize core environment for compiler
   core_module = make_env(ODD_FALSE, "#odd#core");
 
-  for(size_t i = S_DEFINE; i != S_QUOTE+1; i++) {
+  for(size_t i = S_DEFINE; i != S_PRIVATE+1; i++) {
     env_define(*core_module, global_symbol(static_cast<Global>(i)),
                global_symbol(S_SPECIAL));
   }
@@ -1535,7 +1549,9 @@ enum Global {
   S_SPECIAL,
   S_VARIABLE,
   S_UPVALUE,
-  S_DELEGATES,
+  S_PARENT,
+  S_UNQUALIFIED_IMPORTS,
+  S_QUALIFIED_IMPORTS,
   S_MODULE_NAME,
   S_EXPORTED,
   // Exceptions
@@ -1544,8 +1560,8 @@ enum Global {
   S_ODD_EVAL,
   S_ODD_TABLE,
   // Special forms
-  S_ACCESS,
   S_DEFINE,
+  S_ACCESS,
   S_SET,
   S_BRACE,
   S_LAMBDA,
@@ -2016,7 +2032,13 @@ Value* table_get(Table* table, Value* key, bool& found) {
     found = false;
     return ODD_FALSE;
   }
-}  
+}
+
+bool table_has_key(Table* table, Value* key) {
+  bool found;
+  (void) table_get(table, key, found);
+  return found;
+}
 
 Value* table_get(Table* table, Value* key) {
   bool found;
@@ -2756,21 +2778,20 @@ Table* make_env(Value* parent = ODD_FALSE, const char* module_name = 0) {
   if(module_name) {
     delegates = make_vector();
     if(parent) vector_append(delegates, parent);
-    table_insert(table, global_symbol(S_DELEGATES), delegates); 
+    table_insert(table, global_symbol(S_UNQUALIFIED_IMPORTS), delegates); 
+    delegates = make_vector();
+    table_insert(table, global_symbol(S_QUALIFIED_IMPORTS), delegates);
+
     name = make_string(module_name);
     table_insert(table, global_symbol(S_MODULE_NAME), name);
   } else {
-    table_insert(table, global_symbol(S_DELEGATES), parent);
+    table_insert(table, global_symbol(S_PARENT), parent);
   }
   return table;
 }
 
 bool env_contains(Table* env, Value* key) {
   return table_contains(env, key);
-}
-
-Value* env_delegates(Table* table) {
-  return table_get(table, global_symbol(S_DELEGATES));
 }
 
 void env_define(Table* table, Value* key, Value* value, Value* src = 0) {
@@ -2786,7 +2807,7 @@ void env_define(Table* table, Value* key, Value* value, Value* src = 0) {
 // If an environment has no parent environment, or a list of delegate
 // environments, its variables will be global variables
 bool env_globalp(Table* table) {
-  return table_get(table, global_symbol(S_DELEGATES))->get_type() == VECTOR;
+  return table_has_key(table, global_symbol(S_UNQUALIFIED_IMPORTS));
 }
 
 // Look up an environment variable (the result is rather complex, and
@@ -2835,6 +2856,7 @@ Value* env_qualify_name(Table* env, Value* name) {
 }
 
 void env_lookup(Table* env, Value* key, Lookup& lookup, bool search_exports = false) {
+  bool found = false;
   Table* start_env = env;
   // Search through environments
   while(env->get_type() == TABLE) {
@@ -2865,25 +2887,31 @@ void env_lookup(Table* env, Value* key, Lookup& lookup, bool search_exports = fa
     // global variable)
     lookup.nonglobal.level++;
     // Nothing in this environment, keep searching
-    Value* delegates = env_delegates(env);
-    if(delegates->get_type() == TABLE) {
-      env = ODD_CAST(Table, delegates);
+
+    // Check whether this environment is a child environment (such as a function within a module)
+    if(table_has_key(env, global_symbol(S_PARENT))) {
+      env = ODD_CAST(Table, table_get(env, global_symbol(S_PARENT), found));
+      ODD_ASSERT(found);
       continue;
-    }
-    if(delegates->get_type() == VECTOR) {
-      // Search through delegates; take the most recent one first
-      for(size_t i = delegates->vector_length() - 1; i != ((size_t)0)-1; i--) {
-        Lookup sublookup;
-        env_lookup(ODD_CAST(Table, delegates->vector_ref(i)), key, sublookup, true);
-        if(sublookup.success) {
-          lookup = sublookup;
-          return;
-        }
-      }
     }
     // No delegates or delegate search failed, we're done
     break;
   }
+
+  // Check for unqualified imports
+  if(table_has_key(env, global_symbol(S_UNQUALIFIED_IMPORTS))) {
+    Vector* modules = ODD_CAST(Vector, table_get(env, global_symbol(S_UNQUALIFIED_IMPORTS), found));
+    for(size_t i = modules->vector_length() - 1; i != ((size_t)0)-1; i--) {
+      Lookup sublookup;
+      env_lookup(ODD_CAST(Table, modules->vector_ref(i)), key, sublookup, true);
+      if(sublookup.success) {
+        lookup = sublookup;
+        return;
+      }
+    }
+  }
+
+
   lookup.success = false;
 }
 
@@ -3029,6 +3057,14 @@ struct Compiler {
     return syntax_error(form, ss.str());
   }
 
+  Value* arity_error_least(Global name, Value* form, size_t expected,
+                          unsigned got) {
+    std::ostringstream ss;
+    ss << "malformed " << state.global_symbol(name) << ": expected at least "
+       << expected << " arguments, but got " << got;
+    return syntax_error(form, ss.str());
+  }
+
   Value* arity_error_most(Global name, Value* form, size_t expected,
                           unsigned got) {
     std::ostringstream ss;
@@ -3102,13 +3138,7 @@ struct Compiler {
     return free_variables.size() - 1;
   }
 
-  // Compile a variable reference
-  Value* compile_ref(Value* exp) {
-    annotate(exp);
-    Value* name = unbox(exp);
-    Lookup lookup;
-    state.env_lookup(**env, name, lookup);
-    if(!lookup.success) return undefined_variable(exp);
+  Value* generate_ref(Lookup& lookup, Value* exp,  Value* name) {
     switch(lookup.scope) {
       case REF_GLOBAL: {
         if(lookup.global.value == state.global_symbol(S_SPECIAL)) {
@@ -3156,6 +3186,16 @@ struct Compiler {
       }
     }
     return ODD_FALSE;
+  }
+
+  // Compile a variable reference
+  Value* compile_ref(Value* exp) {
+    annotate(exp);
+    Value* name = unbox(exp);
+    Lookup lookup;
+    state.env_lookup(**env, name, lookup);
+    if(!lookup.success) return undefined_variable(exp);
+    return generate_ref(lookup, exp, name);
   }
 
   // Generate a set (used by both define and set)
@@ -3389,6 +3429,13 @@ restart:
     then_branch = exp->cddr()->car();
     else_branch = argc == 2 ? ODD_UNSPECIFIED : exp->cddr()->cdr()->car();
 
+    // Compiling ifs is actually pretty simple. We push the condition onto the stack and then place jumps in the code.
+    // If the condition is false, we'll skip the "then" branch. At the end of the "then" branch, we'll skip the "else"
+    // branch, so if the condition was true and the "then" branch was executed, we skip it.
+
+    // Since we don't know exactly where to jump to, what we do is emit the jump instructions with arguments of 0, then
+    // change them after we know where to jump to.
+
     chk = compile(condition);
     ODD_CHECK(chk);
     // Jump to the else branch if the condition is false
@@ -3568,6 +3615,105 @@ restart:
     return enter_module(internal_name);
   }
 
+  // Resolve an access statement (called both when an "access" statement is encountered in plain code and when it's
+  // applied (eg 'module.macro()')
+  Value* resolve_access(Value* exp, Value* args) {
+    Value* qualified_imports = state.table_get(**env, state.global_symbol(S_QUALIFIED_IMPORTS));
+    Value* module_name = 0;
+    Value* variable_name = 0;
+    Value* tmp = 0;
+    Table* module = 0;
+
+    ODD_FRAME(args, qualified_imports, module_name, variable_name, tmp, module);
+
+    module_name = tmp = args;
+
+    while(args->get_type() == PAIR) {
+      if(args->cdr() == ODD_NULL) {
+        variable_name = unbox(args->car());
+        tmp->set_cdr(ODD_NULL);
+        break;
+      }
+      tmp = args;
+      args = args->cdr();
+    }
+
+    module_name = state.convert_module_name(module_name);
+
+    for(size_t i = 0; i != qualified_imports->vector_length(); i++) {
+      if(equals(module_name, state.table_get(ODD_CAST(Table, qualified_imports->vector_ref(i)), state.global_symbol(S_MODULE_NAME)))) {
+        module = ODD_CAST(Table, qualified_imports->vector_ref(i));
+      }
+    }
+
+    if(!module) {
+      std::ostringstream ss;
+      ss << "attempt to access unimported module " << module_name;
+      return syntax_error(exp, ss.str());
+    }
+
+    Lookup lookup;
+    state.env_lookup(module, variable_name, lookup);
+    if(!lookup.success) return undefined_variable(exp);
+    return generate_ref(lookup, exp, variable_name);    
+  }
+
+  Value* compile_access_ref(size_t argc, Value* exp) {
+    if(argc < 2) return arity_error_least(S_ACCESS, exp, 2, argc);
+
+    Value* ref = resolve_access(exp, exp->cdr());
+
+
+    // module.macro(1 2 3)
+    // [[access module macro] 1 2 3]
+
+    // Get module name
+    
+    // Get variable
+
+    // Compile reference
+
+    return ODD_FALSE;
+  }
+
+  // Handle an import statement
+  Value* import(size_t argc, Value* exp) {
+    if(argc != 1) return arity_error(S_IMPORT, exp, 2, argc);
+    //(car (car (cdr x)))
+    if(exp->cadr()->get_type() != PAIR || exp->caadr() != state.global_symbol(S_BRACE))
+      return syntax_error(exp, "import must be followed by a brace clause");
+    
+    Value* modules = exp->cdadr();
+    Value* clause = 0;
+    Value* name = 0;
+    Vector* qualified_imports = 0;
+    Value* module = 0;
+    
+    ODD_FRAME(exp, modules, clause, name, qualified_imports, module);
+
+    qualified_imports = ODD_CAST(Vector, state.table_get(**env, state.global_symbol(S_QUALIFIED_IMPORTS)));
+
+    while(modules->get_type() == PAIR) {
+      Value* clause = unbox(modules->car());
+
+      if(clause->get_type() != SYMBOL && clause->get_type() != PAIR &&
+         !(clause->get_type() == PAIR && clause->car() != state.global_symbol(S_ACCESS))) {
+        std::ostringstream ss;
+        ss << "import arguments must be either symbols or accesses (eg odd or odd.core) but got " << clause;
+        return syntax_error(exp, ss.str());
+      }
+      
+      name = clause->get_type() == PAIR ? state.convert_module_name(clause->cdr()) : state.convert_module_name(clause);
+
+      module = state.load_module(ODD_CAST(String, name));
+      state.vector_append(qualified_imports, module);
+
+      modules = modules->cdr();
+    }
+
+    return ODD_FALSE;
+  }
+
   // Compile a single expression, returns #f or an error if one occurred
   Value* compile(Value* exp, bool tail = false) {
     // Dispatch based on an object's type
@@ -3620,6 +3766,7 @@ restart:
             // lambda
             } else if(op == state.global_symbol(S_LAMBDA)) {
               return compile_lambda(argc, exp, tail, ODD_FALSE);
+            // modules
             // public & private
             } else if(op == state.global_symbol(S_PUBLIC)) {
               exporting = true;
@@ -3627,6 +3774,12 @@ restart:
             } else if(op == state.global_symbol(S_PRIVATE)) {
               exporting = false;
               return ODD_FALSE;
+            // access
+            } else if(op == state.global_symbol(S_ACCESS)) {
+              return compile_access_ref(argc, exp);
+            // import
+            } else if(op == state.global_symbol(S_IMPORT)) {
+              return import(argc, exp);
             // named-lambda
             } else if(op == state.global_symbol(S_NAMED_LAMBDA)) {  
               // This is a little hacky, but we're going to extract the name
@@ -3672,7 +3825,7 @@ restart:
 
   // Creates the actual Prototype at the end of compilation
   Prototype* end(unsigned arguments = 0, bool variable_arity = false) {
-    ODD_ASSERT(stack_size <= 1);
+    //ODD_ASSERT(stack_size <= 1);
     emit(OP_RETURN);
     ODD_CC_EMIT("return");
     Prototype* p = 0;
@@ -4062,6 +4215,7 @@ Handle<Table> modules;
 
 // Convert a Scheme module name into a string
 // (scheme base) => "#scheme.base"
+// scheme => "#scheme"
 Value* convert_module_name(Value* spec) {
   std::ostringstream out;
   out << '#';
@@ -4103,6 +4257,13 @@ Value* register_module(String* name, Value* env) {
   }
   table_insert(*modules, name, env);
   return ODD_FALSE;
+}
+
+Value* load_module(String* name) {
+  if(module_loaded(name)) {
+    return table_get(*modules, name);
+  }
+  ODD_FAIL0("loading external modules unimplemented");
 }
 
 // Evaluation functions
