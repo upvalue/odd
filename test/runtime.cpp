@@ -157,6 +157,7 @@ static void test_reader(State& state) {
 Value* eval_string(State& state, const std::string& string) {
   unsigned file = state.register_string("string", string);
   State::Compiler cc(state, NULL);
+  cc.enter_module(state.table_get(*(state.user_module), state.global_symbol(State::S_MODULE_NAME)));
   std::stringstream ss;
   ss << std::noskipws;
   ss << string;
@@ -265,11 +266,12 @@ void test_compiler(State& state) {
   test_eval(state, "[module [b]] define(x #t) x", ODD_TRUE);
 
   // Qualified imports
-  state.trace = true;
   test_eval(state, "[module [c]] [public] define(x #t) [module [d]] import { c } c.x", ODD_TRUE);
-  state.trace = false;
 
   // Macros
+  state.trace = true;
+  test_eval(state, "defsyntax(hello x i c) { #t } hello()", ODD_TRUE);
+  state.trace = false;
 
   // test runtime provided eval function
   assert(state.eval(ODD_TRUE, (*state.core_module)) == ODD_TRUE);

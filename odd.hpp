@@ -313,6 +313,8 @@ struct Value {
   Value* cdadr() const;
   Value* caddr() const;
 
+  Value* list_ref(size_t i) const;
+
   void set_car(Value*);
   void set_cdr(Value*);
 
@@ -445,6 +447,15 @@ Value* Value::caadr() const {
 Value* Value::caddr() const {
   ODD_ASSERT(get_type() == PAIR);
   return static_cast<const Pair*>(this)->cdr->cdr()->car();
+}
+
+Value* Value::list_ref(size_t i) const {
+  ODD_ASSERT(get_type() == PAIR);
+  const Value* lst = this;
+  while(i--) {
+    lst = lst->cdr();
+  }
+  return lst ? lst->car() : ODD_FALSE;
 }
 
 void Value::set_car(Value* car_) { 
@@ -744,6 +755,13 @@ struct Frame {
 // Assumes there is a variable State& state
 #define ODD_FRAME(...) ODD_E_FRAME((state), __VA_ARGS__)
 #define ODD_S_FRAME(...) ODD_E_FRAME((*this), __VA_ARGS__)
+
+// Some forward declarations for state
+#define ODD_FUNCTION(name) \
+  inline Value* name (State& state, unsigned argc, Value* args[], \
+                      VectorStorage* closure)
+
+ODD_FUNCTION(apply_macro);
 
 struct State {
 struct VMFrame;
@@ -1475,12 +1493,8 @@ State():
     "lambda",
     "#named-lambda",
     "if",
-    "define-syntax",
-    "let-syntax",
-    "letrec-syntax",
-    "er-macro-transformer",
+    "defsyntax",
     "module",
-    "#quote",
     "quote",
     "import",
     "public",
@@ -1488,10 +1502,7 @@ State():
     // Other
     "quasiquote",
     "unquote",
-    "unquote-splicing",
-    "cond-expand",
-    "rename",
-    "#er-macro-transformer"
+    "unquote-splicing"
   };
 
   // Allocate the symbol table, with a fair bit of space because we're going
@@ -1569,12 +1580,8 @@ enum Global {
   S_LAMBDA,
   S_NAMED_LAMBDA,
   S_IF,
-  S_DEFINE_SYNTAX,
-  S_LET_SYNTAX,
-  S_LETREC_SYNTAX,
-  S_ER_MACRO_TRANSFORMER,
+  S_DEFSYNTAX,
   S_MODULE,
-  S_GENERATED_QUOTE,
   S_QUOTE,
   S_IMPORT,
   S_PUBLIC,
@@ -1583,9 +1590,6 @@ enum Global {
   S_QUASIQUOTE,
   S_UNQUOTE,
   S_UNQUOTE_SPLICING,
-  S_COND_EXPAND,
-  S_RENAME,
-  S_REAL_ER_MACRO_TRANSFORMER,
   GLOBAL_SYMBOL_COUNT
 };
 
@@ -1842,8 +1846,9 @@ void format_source_error(Value* exp, const std::string& msg,
   unwrap_source_info(exp, info);
   if(info.file) {
     std::ostringstream ss;
-    ss << source_names[info.file] << ':' << info.line << ": " << msg << 
-      std::endl << "  " << source_contents[info.file]->at(info.line-1);
+    ss << source_names[info.file] << ':' << info.line << ": " << msg;
+    // TODO: Print source code? 
+    // "       " << source_contents[info.file]->at(info.line-1);
     out = ss.str();
   } else {
     out = msg;
@@ -2930,8 +2935,7 @@ struct FreeVariableInfo {
 
 // An instance of the compiler, created for each function or module
 struct Compiler {
-  Compiler(State& state_, Compiler* parent_, Table* env_ = NULL,
-           size_t depth_ = 0): 
+  Compiler(State& state_, Compiler* parent_, Table* env_ = NULL, size_t depth_ = 0): 
     state(state_), parent(parent_),
     local_free_variable_count(0), upvalue_count(0),
     stack_max(0), stack_size(0), locals(0), constants(state), closure(false),
@@ -3343,8 +3347,8 @@ restart:
     return ODD_FALSE; // should never be reached
   }
 
-  Value* compile_lambda(size_t form_argc, Value* exp, bool tail,
-                        Value* name) {
+  Value* generate_lambda(size_t form_argc, Value* exp, bool tail, Value* name, bool& closure) {
+
     // For checking subcompilation results
     Value* chk = 0;
     if(form_argc < 1) return arity_error(S_LAMBDA, exp, 1, form_argc);
@@ -3410,9 +3414,17 @@ restart:
     ODD_CHECK(chk);
 
     proto = cc.end(argc, variable_arity);
+    closure = cc.closure;
+    return proto;
+  }
+
+  Value* compile_lambda(size_t form_argc, Value* exp, bool tail, Value* name) {
+    bool closure = false;
+    Value* proto = generate_lambda(form_argc, exp, tail, name, closure);
+    if(proto->active_exception()) return proto;
     push_constant(proto);
     // If the function's a closure, we'll have to close over it
-    if(cc.closure) {
+    if(closure) {
       ODD_CC_EMIT("close-over");
       emit(OP_CLOSE_OVER);
     }
@@ -3524,33 +3536,46 @@ restart:
   }
 
   Value* compile_define_syntax(size_t argc, Value* exp, bool tail) {
-    if(argc != 2) return arity_error(S_DEFINE_SYNTAX, exp, 2, argc);
-    Value* name = unbox(exp->cadr());
-    if(name->get_type() != SYMBOL)
-      return syntax_error(exp,"first define-syntax argument must be symbol");
-    Value* body = exp->caddr();
-    Value* transformer = 0, *swap = 0;
-    ODD_FRAME(exp, name, body, transformer, swap);
-    // Check for (er-macro-transformer ...)
-    // And replace it with (#er-macro-transformer <compiler-env> ...)
-    std::cout << body << std::endl;
-    if(check_special_form(body, S_ER_MACRO_TRANSFORMER)) {
-      body->set_car(state.global_symbol(S_REAL_ER_MACRO_TRANSFORMER));
-      // FIXME: If quote is bound somewhere else, this won't work
-      swap = state.cons(**env, ODD_NULL);
-      swap = state.cons(state.global_symbol(S_GENERATED_QUOTE), swap); 
-      swap = state.cons(swap, body->cdr());
-      body->set_cdr(swap);
-      std::cout << listp(body) << std::endl;
-      std::cout << body << std::endl;
-    }
-    transformer = state.eval(body, **env);
-    ODD_CHECK(transformer);
-    if(!transformer->applicablep())
-      return syntax_error(exp,"define-syntax body did not evaluate to "
-                              "a function");
-    ODD_CC_MSG("define-syntax " << name << ' ' << transformer);
-    state.env_define(**env, name, transformer);
+    if(argc != 5) return arity_error(S_DEFSYNTAX, exp, 5, argc);
+    // Macro name
+    Value* name = unbox(exp->list_ref(1));
+    // Argument names
+    Value* expr_name = unbox(exp->list_ref(2));
+    Value* inject_name = unbox(exp->list_ref(3));
+    Value* compare_name = unbox(exp->list_ref(4));
+    Value* body = unbox(exp->list_ref(5));
+
+    if(name->get_type() != SYMBOL || expr_name->get_type() != SYMBOL || inject_name->get_type() != SYMBOL || compare_name->get_type() != SYMBOL)
+      return syntax_error(exp, "first four arguments to defsyntax must be symbols");
+
+    std::cout << "DEFINING MACRO " << name << ' ' << expr_name << ' ' << inject_name << ' ' << compare_name << std::endl;
+
+    Value* transformer = 0, *swap = 0, *lambda = 0, *apply_macro_fn = 0;
+    VectorStorage* apply_macro_closure = 0;
+    ODD_FRAME(exp, name, expr_name, inject_name, compare_name, transformer, swap, lambda, apply_macro_fn,
+              apply_macro_closure);
+
+    // Create transformer function expression
+    swap = state.cons(body, ODD_NULL);
+    swap = state.cons(compare_name, swap);
+    swap = state.cons(inject_name, swap);
+    swap = state.cons(expr_name, swap);
+    swap = state.cons(ODD_FALSE, swap);
+
+    bool closure;
+    transformer = generate_lambda(4, swap, tail, name, closure);
+    ODD_ASSERT(!closure);
+    ODD_ASSERT(transformer->applicablep());
+
+    ODD_CC_MSG("defsyntax " << name << ' ' << transformer);
+    
+    apply_macro_closure = state.vector_storage_realloc(2, 0);
+    apply_macro_closure->data[0] = **env;
+    apply_macro_closure->data[1] = transformer;
+    apply_macro_closure->length = 2;
+    apply_macro_fn = state.make_native_function(&apply_macro, 0, true, apply_macro_closure);
+    
+    state.env_define(**env, name, apply_macro_fn);
     return ODD_FALSE;
   }
 
@@ -3582,6 +3607,10 @@ restart:
     Table* module_env = 0;
     Value* chk = 0;
     ODD_FRAME(internal_name, module_env, chk);
+
+    if(state.module_loaded(ODD_CAST(String, internal_name))) {
+      return state.table_get(*state.modules, internal_name);
+    }
 
     // Create new module table
     module_env = state.make_env(*state.core_module, internal_name->string_data());
@@ -3793,14 +3822,10 @@ restart:
               return compile_lambda(argc-1, exp, tail, name);
             } else if(op == state.global_symbol(S_IF)) {
               return compile_if(argc, exp, tail);
-            } else if(op == state.global_symbol(S_QUOTE) ||
-                      op == state.global_symbol(S_GENERATED_QUOTE)) {
+            } else if(op == state.global_symbol(S_QUOTE)) {
               return compile_quote(argc, exp);
-            } else if(op == state.global_symbol(S_DEFINE_SYNTAX)) {
+            } else if(op == state.global_symbol(S_DEFSYNTAX)) {
               return compile_define_syntax(argc, exp, tail);
-            } else if(op == state.global_symbol(S_ER_MACRO_TRANSFORMER)) {
-                return syntax_error(exp, "er-macro-transformer can only be"
-                                    " used within a macro definition");
             } else if(op == state.global_symbol(S_MODULE)) {
               return module(argc, exp);
             } else assert(0);
@@ -4285,9 +4310,20 @@ Value* load_module(String* name) {
     whole_path += path;
 
     std::ifstream fs(whole_path.c_str());
+    // If file doesn't exist, keep searching
     if(!fs) continue;    
 
-    std::cout << "LOADING MODULE " << whole_path << std::endl;
+    // Load the module
+    Value* chk = load_file(whole_path.c_str(), name);
+    // Failure to load
+    if(chk->active_exception()) return chk;
+    // Now check that the file actually provided this module
+
+    if(module_loaded(name)) {
+      return table_get(*modules, name);
+    }
+
+        std::cout << "LOADING MODULE " << whole_path << std::endl;
   }
 
   std::cout << "attempt to load module " << path << std::endl;
@@ -4299,6 +4335,36 @@ Value* load_module(String* name) {
 Value* load_module(const std::string& name) { return load_module(make_string(name)); }
 
 // Evaluation functions
+Value* load_file(const char* path, Value* module_name = 0) {
+  unsigned fid = register_file(path);
+  if(fid == 0) return ODD_FALSE;
+
+  std::ifstream handle(path);
+  ODD_ASSERT(handle);
+
+  State::Reader reader(*this, handle, fid);
+
+  Value* x = 0;
+  Value* chk = 0;
+  Prototype* p = 0;
+  ODD_S_FRAME(x, p, chk, module_name);
+  State::Compiler cc(*this, 0);
+  if(module_name)
+    cc.enter_module(module_name);
+  else
+    cc.enter_module(*user_module);
+  while(true) {
+    x = reader.read();
+    if(x == ODD_EOF) break;
+    if(x->active_exception()) return x;
+    chk = cc.compile(x);
+    if(chk != ODD_FALSE) return chk;
+  }
+  p = cc.end();
+  x = apply(p, 0, 0);
+  return x;
+}
+
 Value* eval(Value* exp, Value* env) {
   Table* new_env = 0;
   Value *chk = 0, *proto = 0, *result = 0;
@@ -4480,10 +4546,6 @@ inline std::ostream& operator<<(std::ostream& os, Value* x) {
                                      args[(number)]->get_type()); \
   }
 
-#define ODD_FUNCTION(name) \
-  inline Value* name (State& state, unsigned argc, Value* args[], \
-                      VectorStorage* closure)
-
 ODD_FUNCTION(car) {
   static const char* fn_name = "car";
   ODD_CHECK_TYPE(PAIR, 0);
@@ -4531,36 +4593,9 @@ ODD_FUNCTION(apply_macro) {
   return result;
 }
 
-ODD_FUNCTION(er_macro_transformer) {
-#if 0
-  static const char* fn_name = "#er-macro-transformer";
-  ODD_CHECK_TYPE(PAIR, 0);
-  ODD_CHECK_APPLICABLE(1);
-  VectorStorage* apply_macro_closure = 0;
-  ODD_FRAME(cc_env, transformer, apply_macro_fn, apply_macro_closure);
-
-  apply_macro_closure = state.vector_storage_realloc(2, 0);
-  apply_macro_closure->data[0] = cc_env;
-  VectorStorage* apply_macro_closure = 0;
-  ODD_FRAME(cc_env, transformer, apply_macro_fn, apply_macro_closure);
-
-  apply_macro_closure = state.vector_storage_realloc(2, 0);
-  apply_macro_closure->data[0] = cc_env;
-  apply_macro_closure->data[1] = transformer;
-  apply_macro_closure->length = 2;
-
-  apply_macro_fn = state.make_native_function(&apply_macro, 0, true,
-                                              apply_macro_closure);
-  
-  return apply_macro_fn;
-#endif
-  return 0;
-}
-
 inline void State::initialize_builtin_functions() {
   defun("car", &car, 1, false);
   defun("cdr", &cdr, 1, false);
-  defun("#er-macro-transformer", &er_macro_transformer, 1, false);
 }
 
 } // odd

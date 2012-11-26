@@ -3,13 +3,18 @@
 
 #include "odd.hpp"
 
+#include "vendor/linenoise/linenoise.h"
+#include "vendor/linenoise/linenoise.c"
+
 using namespace odd;
+
+State* state = 0;
 
 #include "test/runtime.cpp"
 
 static const char help[] = \
   "commands: \n" \
-  "  -r <file>           print s-expressions from file\n" \
+  "  -r <file>           convert file to s-expressions and prin;t\n" \
   "  -c <file>           compile file to bytecode\n" \
   "  -C <file> <output>  compile file to bytecode with specific output file\n" \
   "  -I <file>           dump image to file\n" \
@@ -27,7 +32,22 @@ static void print_help(char** argv) {
         << help << std::endl;
 }
 
+void repl() {
+  char *line = 0;
+
+  std::ostringstream ss; 
+  State::Compiler cc(*state, NULL);
+
+  ss << "> ";
+
+  while((line = linenoise(ss.str().c_str())) != NULL) {
+    printf("yecho\n");
+    free(line);
+  }
+}
+
 int main(int argc, char** argv) {
+  state = new State;
   // Parse options
   for(int i = 1; i < argc; i++) {
     std::string arg(argv[i]);
@@ -42,8 +62,19 @@ int main(int argc, char** argv) {
             return EXIT_FAILURE;
         }
       }
+    } else {
+      // filename
+      Value* chk = state->load_file(arg.c_str());
+      if(chk->active_exception()) {
+        std::cout << "ERROR: " << chk->exception_message()->string_data() << std::endl;
+        return EXIT_FAILURE;
+      }
     }
   }
 
+  if(argc == 1)
+    repl();
+
+  delete state; 
   return EXIT_SUCCESS;
 }
