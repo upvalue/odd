@@ -1,5 +1,7 @@
 Odd is a Scheme-derived programming language. 
 
+Make sure to run 'git submodule update --init' after cloning.
+
 Short version:
 
 - Scheme semantics

@@ -261,10 +261,11 @@ void test_compiler(State& state) {
   // Stack management
   test_eval(state, "lambda { #t #t #t }()", ODD_TRUE);
   
+  std::cout << *(state.core_module) << std::endl;
   // Modules
   test_eval(state, "[module [a]] #t", ODD_TRUE);
-  test_eval(state, "[module [b]] define(x #t) x", ODD_TRUE);
 
+  test_eval(state, "[module [b]] define(x #t) x", ODD_TRUE);
   // Qualified imports
   test_eval(state, "[module [c]] [public] define(x #t) [module [d]] import { c } c.x", ODD_TRUE);
 
@@ -278,7 +279,8 @@ void test_compiler(State& state) {
 }
 
 void test_module(State& state) {
-  state.load_module("#test#module");
+  Value* x = state.load_module("#test#module");
+  if(x->active_exception()) std::cout << x->exception_message()->string_data() << std::endl;
 }
 
 void run_test_suite(State& state) {
@@ -301,18 +303,13 @@ void test() {
 
   state->module_search_paths.push_back("./");
   
-  run_test_suite(*state);
 
   // print symbol table
-  std::cout << "!! printing #odd#core keys" << std::endl;
-  Table * tbl = ODD_CAST(Table, *state->core_module);
-  for(size_t i = 0; i != tbl->chains->length; i++) {
-    Value* cell = tbl->chains->data[i];
-    while(cell->get_type() == PAIR) {
-      std::cout << cell->caar() << std::endl;
-      cell = cell->cdr();
-    }
-  }
+  std::cout << "!! printing #odd#core exported definitions" << std::endl;
+  Table * tbl = ODD_CAST(Table, state->table_get(ODD_CAST(Table, *state->core_module), state->global_symbol(State::S_EXPORTS)));
+  print_table(std::cout, tbl);
+
+  run_test_suite(*state);
 
   delete state;
 }

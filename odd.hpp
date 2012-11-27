@@ -1479,7 +1479,9 @@ State():
     "#unqualified-imports",
     "#qualified-imports",
     "#module-name",
-    "#exported",
+    "#global-environment",
+    "#exports",
+    "#export-parent",
     // Exception tags
     "#odd#read",
     "#odd#compile",
@@ -1524,7 +1526,7 @@ State():
 
   for(size_t i = S_DEFINE; i != S_PRIVATE+1; i++) {
     env_define(*core_module, global_symbol(static_cast<Global>(i)),
-               global_symbol(S_SPECIAL));
+               global_symbol(S_SPECIAL), true);
   }
 
   user_module = make_env(ODD_FALSE, "#user");
@@ -1562,11 +1564,14 @@ enum Global {
   S_SPECIAL,
   S_VARIABLE,
   S_UPVALUE,
+  // For environments
   S_PARENT,
   S_UNQUALIFIED_IMPORTS,
   S_QUALIFIED_IMPORTS,
   S_MODULE_NAME,
-  S_EXPORTED,
+  S_GLOBAL_ENVIRONMENT,
+  S_EXPORTS,
+  S_EXPORT_PARENT,
   // Exceptions
   S_ODD_READ,
   S_ODD_COMPILE,
@@ -1803,7 +1808,7 @@ void defun(const std::string& cname, NativeFunction::ptr_t ptr,
   ODD_S_FRAME(fn, name, qualified_name);
   fn = make_native_function(ptr, arguments, variable_arity);
   name = make_symbol(cname);
-  env_define(*core_module, name, name);
+  env_define(*core_module, name, name, true);
   qualified_name = ODD_CAST(Symbol, env_qualify_name(*core_module, name));
   qualified_name->value = fn;
 }
@@ -2776,10 +2781,10 @@ struct UpvalLoc {
 // virtual machine's locals array
 
 Table* make_env(Value* parent = ODD_FALSE, const char* module_name = 0) {
-  Table* table = 0;
+  Table* table = 0, *exports = 0;
   Vector* delegates = 0;
   String* name = 0;
-  ODD_S_FRAME(parent, table, delegates, name);
+  ODD_S_FRAME(parent, table, delegates, name, exports);
   table = make_table();
   // If this is a module
   if(module_name) {
@@ -2789,8 +2794,17 @@ Table* make_env(Value* parent = ODD_FALSE, const char* module_name = 0) {
     delegates = make_vector();
     table_insert(table, global_symbol(S_QUALIFIED_IMPORTS), delegates);
 
+    exports = make_table();
+
+    table_insert(exports, global_symbol(S_GLOBAL_ENVIRONMENT), ODD_TRUE);
+    table_insert(exports, global_symbol(S_EXPORT_PARENT), table);
+
+    table_insert(table, global_symbol(S_EXPORTS), exports);
+
     name = make_string(module_name);
     table_insert(table, global_symbol(S_MODULE_NAME), name);
+
+    table_insert(table, global_symbol(S_GLOBAL_ENVIRONMENT), ODD_TRUE);
   } else {
     table_insert(table, global_symbol(S_PARENT), parent);
   }
@@ -2801,20 +2815,26 @@ bool env_contains(Table* env, Value* key) {
   return table_contains(env, key);
 }
 
-void env_define(Table* table, Value* key, Value* value, Value* src = 0) {
+void env_define(Table* table, Value* key, Value* value, bool exported = false) {
   Value* chk = 0;
+  Table* exports = 0;
+  if(exported) exports = ODD_CAST(Table, table_get(table, global_symbol(S_EXPORTS)));
+  ODD_S_FRAME(table, key, value, chk, exports);
   if(table_contains(table, key)) {
     chk = table_set(table, key, value);
+    if(exported) table_set(exports, key, value);
   } else {
     chk = table_insert(table, key, value);
+    if(exported) {
+      table_insert(exports, key, value);
+    }
   }
   ODD_ASSERT(!chk->active_exception());
 }
 
-// If an environment has no parent environment, or a list of delegate
-// environments, its variables will be global variables
+// Whether variables in this environment are global or not
 bool env_globalp(Table* table) {
-  return table_has_key(table, global_symbol(S_UNQUALIFIED_IMPORTS));
+  return table_has_key(table, global_symbol(S_GLOBAL_ENVIRONMENT));
 }
 
 // Look up an environment variable (the result is rather complex, and
@@ -2876,6 +2896,9 @@ void env_lookup(Table* env, Value* key, Lookup& lookup, bool search_exports = fa
         lookup.scope = REF_GLOBAL;
         lookup.global.value = cell->cdr();
         lookup.global.module = env;
+        if(search_exports) {
+        }
+        if(search_exports) lookup.global.module = (Table*)table_get(env, global_symbol(S_EXPORT_PARENT));
         return;
       } else {
         // If we're still searching through the original environment, it's a
@@ -2910,14 +2933,16 @@ void env_lookup(Table* env, Value* key, Lookup& lookup, bool search_exports = fa
     Vector* modules = ODD_CAST(Vector, table_get(env, global_symbol(S_UNQUALIFIED_IMPORTS), found));
     for(size_t i = modules->vector_length() - 1; i != ((size_t)0)-1; i--) {
       Lookup sublookup;
-      env_lookup(ODD_CAST(Table, modules->vector_ref(i)), key, sublookup, true);
+      Table* exports = ODD_CAST(Table, table_get(ODD_CAST(Table, modules->vector_ref(i)), global_symbol(S_EXPORTS)));
+
+      env_lookup(exports, key, sublookup, true);
+
       if(sublookup.success) {
         lookup = sublookup;
         return;
       }
     }
   }
-
 
   lookup.success = false;
 }
@@ -2939,15 +2964,15 @@ struct Compiler {
     state(state_), parent(parent_),
     local_free_variable_count(0), upvalue_count(0),
     stack_max(0), stack_size(0), locals(0), constants(state), closure(false),
-    name(state_), exporting(false), env(0), depth(depth_), last_insn(0) {
-    if(!env_) env = &state.core_module;
-    else env = new Handle<Table>(state, env_);
-    env_globalp = state.env_globalp(**env);
+    name(state_), exporting(false), env(state_), depth(depth_), last_insn(0) {
+
+    if(!env_) env = (*state.core_module);
+    else env = env_;
+
+    env_globalp = state.env_globalp(*env);
   }
 
-  ~Compiler() {
-    if(env != &state.core_module) delete env;    
-  }
+  ~Compiler() {}
 
   State& state;
   // The parent function -- necessary for free variables
@@ -2970,7 +2995,7 @@ struct Compiler {
   bool env_globalp;
   // For modules only: whether to export definitions
   bool exporting;
-  Handle<Table>* env;
+  Handle<Table> env;
   // The depth of the function (for debug message purposes)
   size_t depth;
   // Location of last instruction emitted (for debug message purposes)
@@ -3105,7 +3130,7 @@ struct Compiler {
     // But we still need to do a real lookup because form names could be
     // shadowed by other definitions
     Lookup lookup;
-    state.env_lookup(**env, check, lookup);
+    state.env_lookup(*env, check, lookup);
     return lookup.success && lookup.scope == REF_GLOBAL &&
       lookup.global.value == state.global_symbol(S_SPECIAL);
   }
@@ -3199,7 +3224,7 @@ struct Compiler {
     annotate(exp);
     Value* name = unbox(exp);
     Lookup lookup;
-    state.env_lookup(**env, name, lookup);
+    state.env_lookup(*env, name, lookup);
     if(!lookup.success) return undefined_variable(exp);
     return generate_ref(lookup, exp, name);
   }
@@ -3282,14 +3307,14 @@ restart:
     }
 
     // TODO: Allow re-definitions, but warn about them
-    state.env_define(**env, name, value);
+    state.env_define(*env, name, value, exporting);
 
     // Compile body for set
     ODD_FRAME(name);
     chk = compile(exp->cddr()->car());
     ODD_CHECK(chk);
     // Set variable
-    generate_set(**env, lookup, name);
+    generate_set(*env, lookup, name);
     return ODD_FALSE;
   }
 
@@ -3309,14 +3334,14 @@ restart:
 
     // Look up variable
     Lookup lookup;
-    state.env_lookup(**env, name, lookup);
+    state.env_lookup(*env, name, lookup);
     // Don't allow special forms or syntax
     if(!lookup.success)
       return undefined_variable(exp->cadr());
     if(state.lookup_syntaxp(lookup))
       return syntax_error(exp, "syntax cannot be set like a variable");
 
-    generate_set(**env, lookup, name);
+    generate_set(*env, lookup, name);
 
     // note pop
     return ODD_FALSE;
@@ -3363,9 +3388,9 @@ restart:
     ODD_FRAME(exp, new_env, args, arg, body, proto);
     // Create a new environment for the function with the current environment
     // as its parent
-    new_env = state.make_env(**env);
+    new_env = state.make_env(*env);
     // Make the current environment its parent environment
-    // state.vector_append(ODD_CAST(Vector, new_env), **env);
+    // state.vector_append(ODD_CAST(Vector, new_env), *env);
     // Now parse the function's arguments and define them within the
     // new environment
     args = exp->cdr();
@@ -3548,8 +3573,6 @@ restart:
     if(name->get_type() != SYMBOL || expr_name->get_type() != SYMBOL || inject_name->get_type() != SYMBOL || compare_name->get_type() != SYMBOL)
       return syntax_error(exp, "first four arguments to defsyntax must be symbols");
 
-    std::cout << "DEFINING MACRO " << name << ' ' << expr_name << ' ' << inject_name << ' ' << compare_name << std::endl;
-
     Value* transformer = 0, *swap = 0, *lambda = 0, *apply_macro_fn = 0;
     VectorStorage* apply_macro_closure = 0;
     ODD_FRAME(exp, name, expr_name, inject_name, compare_name, transformer, swap, lambda, apply_macro_fn,
@@ -3570,12 +3593,12 @@ restart:
     ODD_CC_MSG("defsyntax " << name << ' ' << transformer);
     
     apply_macro_closure = state.vector_storage_realloc(2, 0);
-    apply_macro_closure->data[0] = **env;
+    apply_macro_closure->data[0] = *env;
     apply_macro_closure->data[1] = transformer;
     apply_macro_closure->length = 2;
     apply_macro_fn = state.make_native_function(&apply_macro, 0, true, apply_macro_closure);
     
-    state.env_define(**env, name, apply_macro_fn);
+    state.env_define(*env, name, apply_macro_fn, exporting);
     return ODD_FALSE;
   }
 
@@ -3620,7 +3643,7 @@ restart:
     ODD_CHECK(chk);
 
     // Change compilers module
-    (*env) = module_env;
+    env = module_env;
     
     return ODD_FALSE; 
   }
@@ -3649,7 +3672,7 @@ restart:
   // Resolve an access statement (called both when an "access" statement is encountered in plain code and when it's
   // applied (eg 'module.macro()')
   Value* resolve_access(Value* exp, Value* args, Table*& modref, Value *& nameref) {
-    Value* qualified_imports = state.table_get(**env, state.global_symbol(S_QUALIFIED_IMPORTS));
+    Value* qualified_imports = state.table_get(*env, state.global_symbol(S_QUALIFIED_IMPORTS));
     Value* module_name = 0;
     Value* variable_name = 0;
     Value* tmp = 0;
@@ -3718,7 +3741,7 @@ restart:
     
     ODD_FRAME(exp, modules, clause, name, qualified_imports, module);
 
-    qualified_imports = ODD_CAST(Vector, state.table_get(**env, state.global_symbol(S_QUALIFIED_IMPORTS)));
+    qualified_imports = ODD_CAST(Vector, state.table_get(*env, state.global_symbol(S_QUALIFIED_IMPORTS)));
 
     while(modules->get_type() == PAIR) {
       Value* clause = unbox(modules->car());
@@ -3773,7 +3796,7 @@ restart:
         Value* function = unbox(exp->car());
         bool syntax = false;
         if(function->get_type() == SYMBOL) {
-          state.env_lookup(**env, function, lookup);
+          state.env_lookup(*env, function, lookup);
           syntax = state.lookup_syntaxp(lookup);
         }
         if(syntax) {
@@ -4322,14 +4345,17 @@ Value* load_module(String* name) {
     if(module_loaded(name)) {
       return table_get(*modules, name);
     }
-
-        std::cout << "LOADING MODULE " << whole_path << std::endl;
   }
 
-  std::cout << "attempt to load module " << path << std::endl;
+  std::ostringstream ss;
+  ss << "failed to find module " << path;
+  ss << " searched paths [";
+  for(size_t i = 0; i != module_search_paths.size(); i++) {
+    ss << module_search_paths[i] << (i != (module_search_paths.size() - 1) ? " " : "");
+  }
+  ss << ']';
 
-  ODD_FAIL("loading external modules unimplemented");
-  return ODD_FALSE;
+  return make_exception(State::S_ODD_COMPILE, ss.str());
 }
 
 Value* load_module(const std::string& name) { return load_module(make_string(name)); }
@@ -4352,7 +4378,7 @@ Value* load_file(const char* path, Value* module_name = 0) {
   if(module_name)
     cc.enter_module(module_name);
   else
-    cc.enter_module(*user_module);
+    cc.enter_module(table_get(*user_module, global_symbol(S_MODULE_NAME)));
   while(true) {
     x = reader.read();
     if(x == ODD_EOF) break;
@@ -4571,6 +4597,7 @@ ODD_FUNCTION(rename) {
 }
 
 ODD_FUNCTION(apply_macro) { 
+  static const char* fn_name = "apply-macro";
   ODD_ASSERT(closure);
   ODD_ASSERT(closure->length == 2);
   Value *cc_env = closure->data[0], *transformer = closure->data[1],
@@ -4588,8 +4615,13 @@ ODD_FUNCTION(apply_macro) {
   // Build comparison closure
 
   // Apply transformer
-  //result = state.apply(transformer, 3, &vm_trampoline_arguments[0]);
-  return ODD_TRUE;
+  state.vm_trampoline_arguments.clear();
+  state.vm_trampoline_arguments.push_back(ODD_FALSE);
+  state.vm_trampoline_arguments.push_back(ODD_FALSE);
+  state.vm_trampoline_arguments.push_back(ODD_FALSE);
+
+  result = state.apply(transformer, 3, &state.vm_trampoline_arguments[0]);
+  std::cout << "APPLY-MACRO: " << ODD_TRUE << std::endl;
   return result;
 }
 
