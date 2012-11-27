@@ -268,6 +268,8 @@ void test_compiler(State& state) {
   test_eval(state, "[module [b]] define(x #t) x", ODD_TRUE);
   // Qualified imports
   test_eval(state, "[module [c]] [public] define(x #t) [module [d]] import { c } c.x", ODD_TRUE);
+  // Unqualified imports
+  test_eval(state, "[module [e]] import { c.* } x", ODD_TRUE);
 
   // Macros
   state.trace = true;

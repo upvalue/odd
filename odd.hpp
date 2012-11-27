@@ -1504,7 +1504,8 @@ State():
     // Other
     "quasiquote",
     "unquote",
-    "unquote-splicing"
+    "unquote-splicing",
+    "*"
   };
 
   // Allocate the symbol table, with a fair bit of space because we're going
@@ -1595,6 +1596,7 @@ enum Global {
   S_QUASIQUOTE,
   S_UNQUOTE,
   S_UNQUOTE_SPLICING,
+  S_ASTERISK,
   GLOBAL_SYMBOL_COUNT
 };
 
@@ -3737,11 +3739,13 @@ restart:
     Value* clause = 0;
     Value* name = 0;
     Vector* qualified_imports = 0;
+    Vector* unqualified_imports = 0;
     Value* module = 0;
     
-    ODD_FRAME(exp, modules, clause, name, qualified_imports, module);
+    ODD_FRAME(exp, modules, clause, name, qualified_imports, unqualified_imports, module);
 
     qualified_imports = ODD_CAST(Vector, state.table_get(*env, state.global_symbol(S_QUALIFIED_IMPORTS)));
+    unqualified_imports = ODD_CAST(Vector, state.table_get(*env, state.global_symbol(S_UNQUALIFIED_IMPORTS)));
 
     while(modules->get_type() == PAIR) {
       Value* clause = unbox(modules->car());
@@ -3753,10 +3757,21 @@ restart:
         return syntax_error(exp, ss.str());
       }
       
+      bool unqualified = false;
+      Value* tmp = clause;
+      while(tmp->get_type() == PAIR) {
+        if(tmp->cdr() != ODD_NULL && unbox(tmp->cadr()) == state.global_symbol(S_ASTERISK)) {
+          unqualified = true;
+          tmp->set_cdr(ODD_NULL);
+        }
+        tmp = tmp->cdr();
+      }
+
       name = clause->get_type() == PAIR ? state.convert_module_name(clause->cdr()) : state.convert_module_name(clause);
 
       module = state.load_module(ODD_CAST(String, name));
-      state.vector_append(qualified_imports, module);
+      ODD_CHECK(module);
+      state.vector_append(unqualified ? unqualified_imports : qualified_imports, module);
 
       modules = modules->cdr();
     }
@@ -4278,7 +4293,7 @@ Value* convert_module_name(Value* spec) {
     }
     out << unbox(spec->car());
     if(spec->cdr() != ODD_NULL) {
-      out << '.';
+      out << '#';
     }
     spec = spec->cdr();
   }
