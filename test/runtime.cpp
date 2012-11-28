@@ -278,8 +278,10 @@ void test_compiler(State& state) {
   state.trace = true;
   // simple macro
   test_eval(state, "defsyntax(hello x e) { '[define x #t] } hello() x", ODD_TRUE);
+  /*
   test_eval(state, "defsyntax(hello2 x e) { synclo(e '[define hello2-var #t]) } [module [hello2-test]] "\
                    "import { macro-test } macro-test.hello2() hello2-var", ODD_TRUE);
+                   */
   state.trace = false;
 
   // test runtime provided eval function
@@ -300,7 +302,7 @@ void run_test_suite(State& state) {
   test_vectors(state);
   test_tables(state);
   test_reader(state);
-  //test_compiler(state);
+  test_compiler(state);
   //test_module(state);
 
   std::cout << "!! collections: " << state.collections << " heap size: " << FriendlySize(state.heap_size) << std::endl;

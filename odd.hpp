@@ -207,7 +207,9 @@ enum Type {
   CLOSURE,
   UPVALUE,
   NATIVE_FUNCTION,
+  // Other
   TABLE,
+  SYNCLO,
   // Immediate values
   FIXNUM,
   CONSTANT,
@@ -682,6 +684,15 @@ struct Table : Value {
   static const Type CLASS_TYPE = TABLE;
 };
 
+// Syntactic closures
+struct Synclo : Value {
+  Table* env;
+  Vector* escaped_variables;
+  Value* expr;
+
+  static const Type CLASS_TYPE = SYNCLO;
+};
+
 ///// GARBAGE COLLECTOR TRACKING
 
 // Handles are auto-tracked heap-allocated pointers
@@ -725,6 +736,7 @@ struct FrameHack {
   ODD_(Closure)
   ODD_(Upvalue)
   ODD_(NativeFunction)
+  ODD_(Synclo)
   ODD_(Table)
 #undef ODD_
   
@@ -863,6 +875,7 @@ void recursive_mark(Value* x) {
         x = static_cast<Pair*>(x)->car;
         continue;
       // Three pointers
+      case SYNCLO:
       case EXCEPTION:
         recursive_mark(static_cast<Exception*>(x)->tag);
         recursive_mark(static_cast<Exception*>(x)->message);
@@ -1237,6 +1250,7 @@ static size_t minimum_size(Value* x) {
     case PROTOTYPE: size = sizeof(Prototype); break; 
     case UPVALUE: size = sizeof(Upvalue); break;
     case NATIVE_FUNCTION: size =  sizeof(NativeFunction); break;
+    case SYNCLO: size = sizeof(Synclo); break;
     case TABLE: size = sizeof(Table); break;
     case PAIR:
       size = sizeof(Pair) + src_size<Pair>(x->pair_has_source());
@@ -1379,6 +1393,7 @@ void compact() {
         update_forward(&((Pair*) x)->cdr);
         continue;
       // Three pointers
+      case SYNCLO:
       case EXCEPTION:
         ODD_FWD(Exception, tag);
         ODD_FWD(Exception, message);
@@ -1481,6 +1496,7 @@ State():
     "#module-name",
     "#global-environment",
     "#exports",
+    "#exporting",
     "#export-parent",
     // Exception tags
     "#odd#read",
@@ -1572,6 +1588,7 @@ enum Global {
   S_MODULE_NAME,
   S_GLOBAL_ENVIRONMENT,
   S_EXPORTS,
+  S_EXPORTING,
   S_EXPORT_PARENT,
   // Exceptions
   S_ODD_READ,
@@ -2812,6 +2829,7 @@ Table* make_env(Value* parent = ODD_FALSE, const char* module_name = 0) {
     table_insert(table, global_symbol(S_MODULE_NAME), name);
 
     table_insert(table, global_symbol(S_GLOBAL_ENVIRONMENT), ODD_TRUE);
+    table_insert(table, global_symbol(S_EXPORTING), ODD_FALSE);
   } else {
     table_insert(table, global_symbol(S_PARENT), parent);
   }
@@ -2971,7 +2989,7 @@ struct Compiler {
     state(state_), parent(parent_),
     local_free_variable_count(0), upvalue_count(0),
     stack_max(0), stack_size(0), locals(0), constants(state), closure(false),
-    name(state_), exporting(false), env(state_), depth(depth_), last_insn(0) {
+    name(state_), env(state_), depth(depth_), last_insn(0) {
 
     if(!env_) env = (*state.core_module);
     else env = env_;
@@ -2997,8 +3015,6 @@ struct Compiler {
   bool closure;
   // The name of the function (if any)
   Handle<String> name;
-  // For modules only: whether to export definitions
-  bool exporting;
   // The environment of the function
   Handle<Table> env;
   // The depth of the function (for debug message purposes)
@@ -3122,6 +3138,8 @@ struct Compiler {
     state.format_source_error(form, ss.str(), out);
     return state.make_exception(State::S_ODD_COMPILE, out);
   }
+
+  bool exporting() { return state.table_get(*env, state.global_symbol(S_EXPORTING)); }
 
   // Checks a function to see whether it is a call to a particular special
   // form
@@ -3318,7 +3336,7 @@ restart:
     }
 
     // TODO: Allow re-definitions, but warn about them
-    state.env_define(*env, name, value, exporting);
+    state.env_define(*env, name, value, exporting());
 
     // Compile body for set
     ODD_FRAME(name);
@@ -3611,7 +3629,7 @@ restart:
     apply_macro_fn = state.make_native_function(&apply_macro, 0, true, apply_macro_closure);
     
     // Define macro
-    state.env_define(*env, name, apply_macro_fn, exporting);
+    state.env_define(*env, name, apply_macro_fn, exporting());
     return ODD_FALSE;
   }
 
@@ -3841,10 +3859,10 @@ restart:
             // modules
             // public & private
             } else if(op == state.global_symbol(S_PUBLIC)) {
-              exporting = true;
+              state.table_set(*env, state.global_symbol(S_EXPORTING), ODD_TRUE);
               return ODD_FALSE;
             } else if(op == state.global_symbol(S_PRIVATE)) {
-              exporting = false;
+              state.table_set(*env, state.global_symbol(S_EXPORTING), ODD_FALSE);
               return ODD_FALSE;
             // access
             } else if(op == state.global_symbol(S_ACCESS)) {
@@ -4496,6 +4514,7 @@ inline std::ostream& operator<<(std::ostream& os, Type& t) {
     case PROTOTYPE: os << "a scheme function"; break;
     case CLOSURE: os << "a scheme closure"; break;
     case NATIVE_FUNCTION: os << "a native function"; break;
+    case SYNCLO: os << "a syntactic closure"; break;
     case TABLE: os << "a table"; break;
     case FIXNUM: os << "a fixnum"; break;
     case CONSTANT: os << "a constant"; break;
@@ -4563,7 +4582,8 @@ inline std::ostream& operator<<(std::ostream& os, Value* x) {
                 << " native>";
     case UPVALUE: return os << "#<upvalue "
                             << (x->upvalue_closed() ? "(closed) " : "")
-                            << " " << x->upvalue() << ')' << std::endl;
+                            << " " << x->upvalue() << ')';
+    case SYNCLO: return os << "#<synclo>";
     case TABLE: {
       Table* t = static_cast<Table*>(x);
       return os << "#<table entries: " << t->entries
@@ -4629,9 +4649,31 @@ ODD_FUNCTION(apply_macro) {
   return result;
 }
 
+ODD_FUNCTION(synclo) {
+  const char* fn_name = "synclo";
+  ODD_CHECK_TYPE(TABLE, 0);
+  Synclo* c = state.allocate<Synclo>();
+  c->env = ODD_CAST(Table, args[0]);
+  c->expr = args[1];
+  if(argc > 2) {
+    if(argc > 3) ODD_FAIL("too many arguments");
+    Value* vars = args[3];
+    ODD_CHECK_TYPE(PAIR, 2);
+    Vector* v = 0;
+    ODD_FRAME(c, v, vars);
+    v = state.make_vector();
+    while(vars->get_type() == PAIR) {
+      state.vector_append(v, vars->car());
+      vars = vars->cdr();
+    }
+  }
+  return c;
+}
+
 inline void State::initialize_builtin_functions() {
   defun("car", &car, 1, false);
   defun("cdr", &cdr, 1, false);
+  defun("synclo", &synclo, 2, true);
 }
 
 } // odd
