@@ -3257,7 +3257,13 @@ struct Compiler {
         emit_arg(lookup.nonglobal.index);
         ODD_CC_EMIT("local-set " << (unsigned) lookup.nonglobal.index);
         break;
-      case REF_UP: assert(0);
+      case REF_UP: {
+        unsigned index = register_free_variable(lookup);
+        emit(OP_UPVALUE_SET);
+        emit_arg(index);
+        ODD_CC_EMIT("upvalue-set " << name << ' ' << index);
+        break;
+      }
     }
     pop();
   }
@@ -3615,12 +3621,12 @@ restart:
     Value* function = lookup.scope == REF_GLOBAL ? lookup.global.value :
       lookup.nonglobal.value;
 
-    // No need to protect anything as it will all be discared
-    Value* result = state.apply(function,
-        state.vm_trampoline_arguments.size(),
-        &state.vm_trampoline_arguments[0]);
-
+    ODD_CC_MSG("macro application " << exp);
+    // No need to protect anything as it will all be discarded
+    Value* result = state.apply(function, state.vm_trampoline_arguments.size(), &state.vm_trampoline_arguments[0]);
+    
     ODD_CHECK(result);
+    ODD_CC_MSG("macro expansion result " << result);
 
     return compile(result, tail);
   }
@@ -4138,6 +4144,7 @@ Value* vm_apply(Prototype* prototype, Closure* closure, size_t argc,
         Value* val = f.stack[--f.si];
         ODD_VM_VMSG("upvalue-set " << (unsigned)index);
         closure->upvalues->data[index]->upvalue_set(val);
+        continue;
       }
       case OP_CLOSE_OVER: {
         // Create a closure

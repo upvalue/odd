@@ -14,7 +14,7 @@ State* state = 0;
 
 static const char help[] = \
   "commands: \n" \
-  "  -r <file>           convert file to s-expressions and prin;t\n" \
+  "  -r <file>           convert file to s-expressions and print\n" \
   "  -c <file>           compile file to bytecode\n" \
   "  -C <file> <output>  compile file to bytecode with specific output file\n" \
   "  -I <file>           dump image to file\n" \
@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
         }
       }
     } else {
-      // filename
+      // File name
       Value* chk = state->load_file(arg.c_str());
       if(chk->active_exception()) {
         std::cout << "ERROR: " << chk->exception_message()->string_data() << std::endl;

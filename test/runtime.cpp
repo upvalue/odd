@@ -234,6 +234,7 @@ void test_compiler(State& state) {
   test_eval(state, "lambda(x) { lambda() { x }() }(#t)", ODD_TRUE);
   // 2-level Closure
   test_eval(state, "lambda(x) { lambda() { lambda() { x }() }() }(#t)", ODD_TRUE);
+  test_eval(state, "lambda(x) { lambda() { set(x #t) lambda() { x }() }() }(#f)", ODD_TRUE);
   // If
   test_eval(state, "if(#t #t #f)", ODD_TRUE);
   test_eval(state, "if(#t) { #t } { #f }", ODD_TRUE);
@@ -261,17 +262,17 @@ void test_compiler(State& state) {
   // Stack management
   test_eval(state, "lambda { #t #t #t }()", ODD_TRUE);
   
-  std::cout << *(state.core_module) << std::endl;
   // Modules
   test_eval(state, "[module [a]] #t", ODD_TRUE);
 
   test_eval(state, "[module [b]] define(x #t) x", ODD_TRUE);
   // Qualified imports
-  test_eval(state, "[module [c]] [public] define(x #t) [module [d]] import { c } c.x", ODD_TRUE);
+  test_eval(state, "[module [c]] [public] define(x #t) define(y #t) [module [d]] import { c } c.x", ODD_TRUE);
   // Unqualified imports
-  test_eval(state, "[module [e]] import { c.* } x", ODD_TRUE);
+  test_eval(state, "[module [e]] import { c.* } y", ODD_TRUE);
 
   // Macros
+  test_eval(state, "[module [macro-test]] #t", ODD_TRUE);
   state.trace = true;
   test_eval(state, "defsyntax(hello x i c) { #t } hello()", ODD_TRUE);
   state.trace = false;
