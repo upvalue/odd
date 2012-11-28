@@ -5,15 +5,15 @@
 # define BOEHM_GC 0
 #endif
 
-#define PIP_LINK
-#define PIP_GC_STATS 1
+#define ODD_LINK
+#define ODD_GC_STATS 1
 
 #include <iostream>
 #include <sys/time.h>
 
-#include "pip.hpp"
+#include "odd.hpp"
 
-using namespace pip;
+using namespace odd;
 using namespace std;
 
 #if BOEHM_GC
@@ -129,65 +129,65 @@ static void bench_boehm() {
 
 #endif
 
-static void pip_populate(State& state, int depth, Pair* node) {
+static void odd_populate(State& state, int depth, Pair* node) {
   Pair* cell = 0;
-  PIP_FRAME(cell, node);
+  ODD_FRAME(cell, node);
   if(depth <= 0) return;
   depth--;
 
-  cell = state.cons(PIP_FALSE, PIP_FALSE);
+  cell = state.cons(ODD_FALSE, ODD_FALSE);
   node->car = cell;
 
-  cell = state.cons(PIP_FALSE, PIP_FALSE);
+  cell = state.cons(ODD_FALSE, ODD_FALSE);
   node->cdr = cell;
 
-  pip_populate(state, depth, (Pair*)node->car);
-  pip_populate(state, depth, (Pair*)node->cdr);
+  odd_populate(state, depth, (Pair*)node->car);
+  odd_populate(state, depth, (Pair*)node->cdr);
 }
 
-static Pair* pip_make_tree(State& state, int depth) {
+static Pair* odd_make_tree(State& state, int depth) {
   if(depth <= 0) {
-    return state.cons(PIP_FALSE, PIP_FALSE);
+    return state.cons(ODD_FALSE, ODD_FALSE);
   } else {
     Value *kar = 0, *kdr = 0, *cell = 0;
-    PIP_FRAME(kar, kdr, cell);
-    kar = pip_make_tree(state, depth-1);
-    kdr = pip_make_tree(state, depth-1);
+    ODD_FRAME(kar, kdr, cell);
+    kar = odd_make_tree(state, depth-1);
+    kdr = odd_make_tree(state, depth-1);
     cell = (Pair*)state.cons(kar, kdr);
     return (Pair*)cell;
   }
 }
 
-static void pip_time_construction(State& state, int depth) {
+static void odd_time_construction(State& state, int depth) {
   long start;
   long bu_time = 0, td_time = 0;
   int iterations = numiters(depth);
   Pair* temp_tree = 0;
-  PIP_FRAME(temp_tree);
+  ODD_FRAME(temp_tree);
   
   start = CURRENT_TIME();
   for(int i = 0; i < iterations; ++i) {
-    temp_tree = state.cons(PIP_FALSE, PIP_FALSE);
-    pip_populate(state, depth, temp_tree);
+    temp_tree = state.cons(ODD_FALSE, ODD_FALSE);
+    odd_populate(state, depth, temp_tree);
   }
   td_time = CURRENT_TIME() - start;
   start = CURRENT_TIME();
   for(int i = 0; i < iterations; ++i) {
-    temp_tree = pip_make_tree(state, depth);
+    temp_tree = odd_make_tree(state, depth);
   }
   bu_time = CURRENT_TIME() - start;
   cout << "> Created " << iterations << " trees of depth " << depth;
   cout << " (top down: " << td_time << "ms" << " bottom up: " << bu_time << "ms)" << endl;
 }
 
-static void bench_pip() {
+static void bench_odd() {
   State state;
 
   Pair *root = 0, *long_lived_tree = 0, *temp_tree = 0;
   Blob* array = 0;
-  PIP_FRAME(root, long_lived_tree, temp_tree, array);
+  ODD_FRAME(root, long_lived_tree, temp_tree, array);
 
-  temp_tree = pip_make_tree(state, kStretchTreeDepth);
+  temp_tree = odd_make_tree(state, kStretchTreeDepth);
   temp_tree = 0;
 
   // Create long-lived array
@@ -201,13 +201,13 @@ static void bench_pip() {
   cout << "! Creating a long-lived binary tree of depth " << kLongLivedTreeDepth << endl;
 
   // Create long-lived tree
-  long_lived_tree = state.cons(PIP_FALSE, PIP_FALSE);
-  pip_populate(state, kLongLivedTreeDepth, long_lived_tree);
+  long_lived_tree = state.cons(ODD_FALSE, ODD_FALSE);
+  odd_populate(state, kLongLivedTreeDepth, long_lived_tree);
 
   int i=2;
   while(i--) {
     for(int d = kMinTreeDepth; d <= kMaxTreeDepth; d += 2) {
-      pip_time_construction(state, d);
+      odd_time_construction(state, d);
     };
   }  
  
@@ -220,7 +220,7 @@ static void bench_pip() {
 
 int main(int argc, char** argv) {
   long start = CURRENT_TIME();
-  cout << "! BEGIN " << (BOEHM_GC ? "BOEHM" : "PIP") << endl;
+  cout << "! BEGIN " << (BOEHM_GC ? "BOEHM" : "ODD") << endl;
   cout << "! Live storage will peak at " << 
     FriendlySize((2 * sizeof(Pair) * tree_size(kLongLivedTreeDepth)) + (sizeof(double) * kArraySize)) << endl <<
     "! Stretching memory with a binary tree of depth " << kStretchTreeDepth << endl <<
@@ -233,7 +233,7 @@ int main(int argc, char** argv) {
   cout << "! Completed " << GC_gc_no << " collections" << endl;
   cout << "! Heap size is " << FriendlySize(GC_get_heap_size()) << endl;
 #else
-  bench_pip();
+  bench_odd();
 #endif
 
   cout << "! Completed in " << CURRENT_TIME() - start << "ms" << endl;
