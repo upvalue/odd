@@ -2971,7 +2971,6 @@ struct Compiler {
     if(!env_) env = (*state.core_module);
     else env = env_;
 
-    env_globalp = state.env_globalp(*env);
   }
 
   ~Compiler() {}
@@ -2993,10 +2992,9 @@ struct Compiler {
   bool closure;
   // The name of the function (if any)
   Handle<String> name;
-  // The environment of the function
-  bool env_globalp;
   // For modules only: whether to export definitions
   bool exporting;
+  // The environment of the function
   Handle<Table> env;
   // The depth of the function (for debug message purposes)
   size_t depth;
@@ -3301,7 +3299,7 @@ restart:
     // We'll create a fake lookup structure for generate_set here
     Lookup lookup;
     Value* value = 0;
-    if(env_globalp) {
+    if(state.env_globalp(*env)) {
       // If this is a global variable, the compile-time value of the variable
       // will be the actual global symbol
       lookup.scope = REF_GLOBAL;
@@ -4017,10 +4015,6 @@ Value* type_error(const std::string& name, size_t arg_number,
 // Apply Scheme function
 Value* vm_apply(Prototype* prototype, Closure* closure, size_t argc,
                 Value* args[], bool& trampoline) {
-  // Track how many frames have been lost due to tail calls for debugging
-  // purposes eg if we're in a loop and an error occurs on the 857th
-  // iteration, we'll be able to print that information
-
   // Track virtual machine depth
   vm_depth++;
 
@@ -4619,7 +4613,7 @@ ODD_FUNCTION(rename) {
 }
 
 ODD_FUNCTION(apply_macro) { 
-  static const char* fn_name = "apply-macro";
+  // static const char* fn_name = "apply-macro";
   ODD_ASSERT(closure);
   ODD_ASSERT(closure->length == 2);
   Value *cc_env = closure->data[0], *transformer = closure->data[1],
