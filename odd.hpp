@@ -2601,7 +2601,31 @@ Value* read_access(Value* sym) {
       break;
     }
   }
-  return lst_h;
+  token_value = lst_h;
+  return check_function_application(lst_h);
+}
+
+Value* check_function_application(Value* save_token) {
+  Token token2 = peek_token();
+  ODD_READ_CHECK_TK(token2);
+
+  // There is a function application
+  if(token2 == TK_LPAREN) {
+    discard_lookahead();
+    save_token = read_list(APPLICATION_ARGUMENTS, pop_token_value());
+    ODD_CHECK(save_token);
+    return save_token;
+  }
+  
+  // Check for braces
+  if(token2 == TK_LBRACE) {
+    discard_lookahead();
+    save_token = read_list(BRACE_CLAUSE, pop_token_value());
+    ODD_CHECK(save_token);
+    return save_token;
+  }
+
+  return save_token;
 }
 
 Value* read() {
@@ -2633,26 +2657,7 @@ Value* read() {
           return save_token;
         }
 
-        token2 = peek_token();
-        ODD_READ_CHECK_TK(token2);
-
-        // There is a function application
-        if(token2 == TK_LPAREN) {
-          discard_lookahead();
-          save_token = read_list(APPLICATION_ARGUMENTS, pop_token_value());
-          ODD_CHECK(save_token);
-          return save_token;
-        }
-        
-        // Check for braces
-        if(token2 == TK_LBRACE) {
-          discard_lookahead();
-          save_token = read_list(BRACE_CLAUSE, pop_token_value());
-          ODD_CHECK(save_token);
-          return save_token;
-        }
-
-        return save_token;
+        return check_function_application(save_token);
       }
       // List literals
       case TK_LBRACKET: {
@@ -3379,7 +3384,6 @@ restart:
   }
 
   Value* generate_lambda(size_t form_argc, Value* exp, bool tail, Value* name, bool& closure) {
-
     // For checking subcompilation results
     Value* chk = 0;
     if(form_argc < 1) return arity_error(S_LAMBDA, exp, 1, form_argc);
@@ -3392,6 +3396,7 @@ restart:
     Value *args = 0, *body = 0, *arg = 0;
     Prototype* proto = 0;
     ODD_FRAME(exp, new_env, args, arg, body, proto);
+
     // Create a new environment for the function with the current environment
     // as its parent
     new_env = state.make_env(*env);
@@ -3433,6 +3438,7 @@ restart:
         }
       }
     }
+
     // Compile the function's body
     ODD_CC_MSG("compiling subfunction");
     Compiler cc(state, this, new_env, depth+1);
@@ -3567,57 +3573,54 @@ restart:
   }
 
   Value* compile_define_syntax(size_t argc, Value* exp, bool tail) {
-    if(argc != 5) return arity_error(S_DEFSYNTAX, exp, 5, argc);
+    if(argc != 4) return arity_error(S_DEFSYNTAX, exp, 4, argc);
     // Macro name
     Value* name = unbox(exp->list_ref(1));
     // Argument names
     Value* expr_name = unbox(exp->list_ref(2));
-    Value* inject_name = unbox(exp->list_ref(3));
-    Value* compare_name = unbox(exp->list_ref(4));
-    Value* body = unbox(exp->list_ref(5));
+    Value* env_name = unbox(exp->list_ref(3));
+    Value* body = unbox(exp->list_ref(4));
 
-    if(name->get_type() != SYMBOL || expr_name->get_type() != SYMBOL || inject_name->get_type() != SYMBOL || compare_name->get_type() != SYMBOL)
-      return syntax_error(exp, "first four arguments to defsyntax must be symbols");
+    if(name->get_type() != SYMBOL || expr_name->get_type() != SYMBOL || env_name->get_type() != SYMBOL)
+      return syntax_error(exp, "first three arguments to defsyntax must be symbols");
 
     Value* transformer = 0, *swap = 0, *lambda = 0, *apply_macro_fn = 0;
     VectorStorage* apply_macro_closure = 0;
-    ODD_FRAME(exp, name, expr_name, inject_name, compare_name, transformer, swap, lambda, apply_macro_fn,
-              apply_macro_closure);
+    ODD_FRAME(exp, name, expr_name, env_name, transformer, swap, lambda, apply_macro_fn, apply_macro_closure);
 
     // Create transformer function expression
     swap = state.cons(body, ODD_NULL);
-    swap = state.cons(compare_name, swap);
-    swap = state.cons(inject_name, swap);
+    swap = state.cons(env_name, swap);
     swap = state.cons(expr_name, swap);
     swap = state.cons(ODD_FALSE, swap);
 
+    // Compile transformer function
     bool closure;
-    transformer = generate_lambda(4, swap, tail, name, closure);
+    transformer = generate_lambda(3, swap, tail, name, closure);
     ODD_ASSERT(!closure);
+    ODD_CHECK(transformer);
     ODD_ASSERT(transformer->applicablep());
 
     ODD_CC_MSG("defsyntax " << name << ' ' << transformer);
     
+    // Create a closure with apply-macro, the transformer function and the current compilation environment
     apply_macro_closure = state.vector_storage_realloc(2, 0);
     apply_macro_closure->data[0] = *env;
     apply_macro_closure->data[1] = transformer;
     apply_macro_closure->length = 2;
     apply_macro_fn = state.make_native_function(&apply_macro, 0, true, apply_macro_closure);
     
+    // Define macro
     state.env_define(*env, name, apply_macro_fn, exporting);
     return ODD_FALSE;
   }
 
-  Value* compile_macro_application(size_t argc, Value* exp, bool tail,
-                                   Lookup& lookup) {
+  Value* compile_macro_application(size_t argc, Value* exp, bool tail, Lookup& lookup) {
     // Syntax
     state.vm_trampoline_arguments.clear();
-    state.vm_trampoline_arguments.push_back(exp->cdr());
-    state.vm_trampoline_arguments.push_back(ODD_FALSE);
-    state.vm_trampoline_arguments.push_back(ODD_FALSE);
+    state.vm_trampoline_arguments.push_back(exp);
 
-    Value* function = lookup.scope == REF_GLOBAL ? lookup.global.value :
-      lookup.nonglobal.value;
+    Value* function = lookup.scope == REF_GLOBAL ? lookup.global.value : lookup.nonglobal.value;
 
     ODD_CC_MSG("macro application " << exp);
     // No need to protect anything as it will all be discarded
@@ -3882,6 +3885,7 @@ restart:
         ODD_ASSERT(0);
       }
       default:
+        std::cerr << exp << std::endl;
         ODD_ASSERT(!"unknown expression given to compiler");
         break;
     }
@@ -4600,28 +4604,13 @@ ODD_FUNCTION(cdr) {
   return args[0]->cdr();
 }
 
-ODD_FUNCTION(rename) {
-  static const char* fn_name = "rename";
-  ODD_CHECK_TYPE(SYMBOL, 0);
-  Value* name = args[0];
-  (void) name;
-  ODD_ASSERT(closure && closure->length == 1);
-  Value* cc_env = closure->data[0];
-  (void) cc_env;
-  // Tag symbol with compilation environment  
-
-}
-
 ODD_FUNCTION(apply_macro) { 
   // static const char* fn_name = "apply-macro";
   ODD_ASSERT(closure);
   ODD_ASSERT(closure->length == 2);
-  Value *cc_env = closure->data[0], *transformer = closure->data[1],
-        *rename = 0, *compare = 0, *result = 0;
+  Value *cc_env = closure->data[0], *transformer = closure->data[1], *exp = args[0], *result = 0;
 
-  (void) rename; (void) compare;
-  
-  ODD_FRAME(cc_env, transformer, result);
+  ODD_FRAME(cc_env, transformer, result, exp);
 
   std::cout << "CC_ENV: " << cc_env << std::endl;
   std::cout << "TRANSFORMER: " << transformer << std::endl;
@@ -4632,12 +4621,11 @@ ODD_FUNCTION(apply_macro) {
 
   // Apply transformer
   state.vm_trampoline_arguments.clear();
-  state.vm_trampoline_arguments.push_back(ODD_FALSE);
-  state.vm_trampoline_arguments.push_back(ODD_FALSE);
-  state.vm_trampoline_arguments.push_back(ODD_FALSE);
+  state.vm_trampoline_arguments.push_back(exp);
+  state.vm_trampoline_arguments.push_back(cc_env);
 
-  result = state.apply(transformer, 3, &state.vm_trampoline_arguments[0]);
-  std::cout << "APPLY-MACRO: " << ODD_TRUE << std::endl;
+  result = state.apply(transformer, 2, &state.vm_trampoline_arguments[0]);
+  std::cout << "APPLY-MACRO: " << result << std::endl;
   return result;
 }
 

@@ -119,3 +119,6 @@ keyword:
 module.variable
 
 module.variable.nest
+
+// module access function
+module.function()
