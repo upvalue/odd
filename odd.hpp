@@ -1546,7 +1546,7 @@ State():
                global_symbol(S_SPECIAL), true);
   }
 
-  user_module = make_env(ODD_FALSE, "#user");
+  user_module = make_env(*core_module, "#user");
 
   // Create module table
   modules = make_table();
@@ -2921,8 +2921,6 @@ void env_lookup(Table* env, Value* key, Lookup& lookup, bool search_exports = fa
         lookup.scope = REF_GLOBAL;
         lookup.global.value = cell->cdr();
         lookup.global.module = env;
-        if(search_exports) {
-        }
         if(search_exports) lookup.global.module = (Table*)table_get(env, global_symbol(S_EXPORT_PARENT));
         return;
       } else {
@@ -3630,6 +3628,7 @@ restart:
     
     // Define macro
     state.env_define(*env, name, apply_macro_fn, exporting());
+    ODD_CC_MSG("defsyntax " << name << ' ' << transformer << ' ' << state.table_get(*env, state.global_symbol(S_MODULE_NAME)));
     return ODD_FALSE;
   }
 
@@ -3639,6 +3638,7 @@ restart:
     state.vm_trampoline_arguments.push_back(exp);
 
     Value* function = lookup.scope == REF_GLOBAL ? lookup.global.value : lookup.nonglobal.value;
+
 
     ODD_CC_MSG("macro application " << exp);
     // No need to protect anything as it will all be discarded
@@ -3654,12 +3654,15 @@ restart:
   
   // Can be called either by an explicit module definition, or implicitly by load_module
   Value* enter_module(Value* internal_name) {
+    ODD_CC_MSG("entering module " << internal_name);
     Table* module_env = 0;
     Value* chk = 0;
     ODD_FRAME(internal_name, module_env, chk);
 
     if(state.module_loaded(ODD_CAST(String, internal_name))) {
-      return state.table_get(*state.modules, internal_name);
+      env = ODD_CAST(Table, state.table_get(*state.modules, internal_name));
+
+      return ODD_FALSE;
     }
 
     // Create new module table
@@ -3705,7 +3708,7 @@ restart:
     Value* tmp = 0;
     Table* module = 0;
 
-    ODD_FRAME(args, qualified_imports, module_name, variable_name, tmp, module);
+    ODD_FRAME(exp, args, qualified_imports, module_name, variable_name, tmp, module);
 
     module_name = tmp = args;
 
@@ -3745,10 +3748,17 @@ restart:
     Value* variable_name = 0;
     Table* module = 0;
     Value* chk = resolve_access(exp, exp->cdr(), module, variable_name);
-    if(chk->active_exception()) return chk;
+    ODD_CHECK(chk);
 
     Lookup lookup;
     state.env_lookup(module, variable_name, lookup);
+    // TODO: Improve error message
+    if(!lookup.success) {
+      String* modname = ODD_CAST(String, state.table_get(module, state.global_symbol(S_MODULE_NAME)));
+      std::ostringstream ss;
+      ss << "failed to resolve name '" << variable_name << "' in module '" << write_module_name(modname) << "'";
+      return syntax_error(exp, ss.str());
+    }
     if(!lookup.success) return undefined_variable(exp);
     return generate_ref(lookup, exp, variable_name);    
   }
@@ -3901,6 +3911,28 @@ restart:
           return compile_apply(exp, tail);
         }
         ODD_ASSERT(0);
+      }
+      case SYNCLO: {
+        Synclo *s = static_cast<Synclo*>(exp);
+        Table* senv = s->env;
+        Vector* vars = s->escaped_variables;
+        Value* expr = s->expr;
+        Table* swap = 0;
+        Value* chk = 0;
+
+        ODD_FRAME(s, senv, vars, expr, swap, chk);
+
+        swap = *env;
+        env = senv;
+        senv = swap;
+       
+        chk = compile(expr, tail);
+
+        swap = *env;
+        env = senv;
+        senv = swap;
+
+        return ODD_FALSE;
       }
       default:
         std::cerr << exp << std::endl;
@@ -4321,6 +4353,20 @@ Value* convert_module_name(Value* spec) {
     spec = spec->cdr();
   }
   return make_string(out.str());
+}
+
+// Write module name like it'd be written in an import statement
+// eg #scheme#base becomes scheme.base
+static std::string write_module_name(String* name) {
+  std::string str;
+  if(!name->string_length()) return str;
+  // skip # at beginning
+  const char* data = name->string_data();
+  for(size_t i = 1; i <= name->string_length(); i++) {
+    if(data[i] == '#') str += '.';
+    else str += data[i];    
+  }
+  return str;
 }
 
 bool module_loaded(String* name) {
