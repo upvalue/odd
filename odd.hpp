@@ -3639,7 +3639,6 @@ restart:
 
     Value* function = lookup.scope == REF_GLOBAL ? lookup.global.value : lookup.nonglobal.value;
 
-
     ODD_CC_MSG("macro application " << exp);
     // No need to protect anything as it will all be discarded
     Value* result = state.apply(function, state.vm_trampoline_arguments.size(), &state.vm_trampoline_arguments[0]);
@@ -3742,9 +3741,7 @@ restart:
     return ODD_FALSE;
   }
 
-  Value* compile_access_ref(size_t argc, Value* exp) {
-    if(argc < 2) return arity_error_least(S_ACCESS, exp, 2, argc);
-
+  Value* lookup_access_ref(size_t argc, Value* exp, Value*& nameref, Lookup& lookupref) {
     Value* variable_name = 0;
     Table* module = 0;
     Value* chk = resolve_access(exp, exp->cdr(), module, variable_name);
@@ -3759,8 +3756,21 @@ restart:
       ss << "failed to resolve name '" << variable_name << "' in module '" << write_module_name(modname) << "'";
       return syntax_error(exp, ss.str());
     }
-    if(!lookup.success) return undefined_variable(exp);
-    return generate_ref(lookup, exp, variable_name);    
+    
+    lookupref = lookup;
+    nameref = variable_name;
+    return ODD_FALSE;
+  }
+
+  Value* compile_access_ref(size_t argc, Value* exp) {
+    if(argc < 2) return arity_error_least(S_ACCESS, exp, 2, argc);
+
+    Lookup lookup;
+    Value* name = 0;
+    Value* chk = lookup_access_ref(argc, exp, name, lookup);
+    ODD_CHECK(chk);
+
+    return generate_ref(lookup, exp, name);    
   }
 
   // Handle an import statement
@@ -3848,6 +3858,23 @@ restart:
         if(function->get_type() == SYMBOL) {
           state.env_lookup(*env, function, lookup);
           syntax = state.lookup_syntaxp(lookup);
+        }
+        // Special case: access macro application
+        if(function->get_type() == PAIR) {
+          if(function->car()->get_type() == SYMBOL) {
+            Value* maybe_access = unbox(function->car());
+            state.env_lookup(*env, maybe_access, lookup);
+            if(state.lookup_syntaxp(lookup) && maybe_access == state.global_symbol(S_ACCESS)) {
+              Value* name = 0;
+              Value* chk = lookup_access_ref(length(function->cdr()), function, name, lookup);
+              // If this is a macro application, do that instead
+              if(state.lookup_syntaxp(lookup) && lookup.global.value != state.global_symbol(S_SPECIAL)) {
+                return compile_macro_application(length(exp->cdr()), exp, tail, lookup);
+              }
+              ODD_CHECK(chk);
+              return ODD_FALSE;
+            }
+          }
         }
         if(syntax) {
           size_t argc = length(exp->cdr());

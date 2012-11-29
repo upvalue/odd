@@ -278,12 +278,12 @@ void test_compiler(State& state) {
   test_eval(state, "[module [macro-test]] defsyntax(hello x e) { '[define x #t] } hello() x", ODD_TRUE);
   test_eval(state, "[module [macro-test2]] defsyntax(hello2 x e) { synclo(e '[define hello2-var #t]) } hello2() hello2-var", ODD_TRUE);
   state.trace = true;
-  test_eval(state, "[module [macro-test]] #t", ODD_TRUE);
+  test_eval(state, "[module [macro-test]] defsyntax(hello3 x e) { synclo(e '[define hello3-var #t]) }"\
+                   "import { macro-test } macro-test.hello3() hello3-var", ODD_TRUE);
   //test_eval(state, "[module [macro-test]] defsyntax(hello3 x e) { synclo(e '[define hello3-var #t]) }", ODD_TRUE);
   // [module [hello3-test]] "
   //                 "import { macro-test } macro-test.hello3() hello3-var", ODD_TRUE);
 
-  print_table(std::cout,(Table*) state.load_module("#macro-test"));
   state.trace = false;
 
   // test runtime provided eval function
