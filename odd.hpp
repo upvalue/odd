@@ -51,11 +51,7 @@
 #endif
 
 // Try to give a graceful error message when internal errors occur
-#define ODD_FAIL(desc) \
-  { \
-  std::cerr << desc << std::endl; \
-  ODD_ASSERT(!"failure"); \
-  }
+#define ODD_FAIL(desc) { std::cerr << desc << std::endl; ODD_ASSERT(!"failure"); }
 
 // Checking for exceptions
 #define ODD_CHECK(x) if((x)->active_exception()) return (x);
@@ -187,7 +183,8 @@ struct SourceInfo {
 #define ODD_TRUE ((odd::Value*) 2)
 #define ODD_NULL ((odd::Value*) 6)
 #define ODD_EOF ((odd::Value*) 10)
-#define ODD_UNSPECIFIED ((odd::Value*) 18)
+#define ODD_UNSPECIFIED ((odd::Value*) 14)
+#define ODD_SYMBOL_UNSET ((odd::Value*) 18)
 
 // C++ object types (which may not match up exactly with Scheme predicates)
 
@@ -1045,6 +1042,9 @@ void mark_heap() {
 
   for(Handle<Value>* i = handle_list; i != NULL; i = i->previous)
     recursive_mark(i->ref);
+
+  for(size_t i = 0; i != safestack.size(); i++) 
+    recursive_mark(safestack[i]);
   
   for(size_t i = 0; i != vm_frames.size(); i++) {
     VMFrame* f = vm_frames[i];
@@ -1074,7 +1074,7 @@ void mark_heap() {
       // If the value has been collected
       if(!markedp(cell->cdar())) {
         // If this symbol has its value set, we'll consider it a root
-        if(ODD_CAST(Symbol, cell->cdar())->value != ODD_FALSE) {
+        if(ODD_CAST(Symbol, cell->cdar())->value != ODD_SYMBOL_UNSET) {
           recursive_mark(cell->cdar());
           continue;
         }        
@@ -1461,6 +1461,7 @@ State():
   block_cursor(0),  live_at_last_collection(0), collections(0),
   sweep_cursor(0),
 
+  gensym_counter(0),
   // Reader
   source_counter(1),
  
@@ -1504,7 +1505,7 @@ State():
     "#odd#eval",
     "#odd#table",
     // Special forms
-    "define",
+    "def",
     "access",
     "set",
     "brace",
@@ -1541,9 +1542,8 @@ State():
   // Initialize core environment for compiler
   core_module = make_env(ODD_FALSE, "#odd#core");
 
-  for(size_t i = S_DEFINE; i != S_PRIVATE+1; i++) {
-    env_define(*core_module, global_symbol(static_cast<Global>(i)),
-               global_symbol(S_SPECIAL), true);
+  for(size_t i = S_DEF; i != S_PRIVATE+1; i++) {
+    env_define(*core_module, global_symbol(static_cast<Global>(i)), global_symbol(S_SPECIAL), ODD_FALSE, true);
   }
 
   user_module = make_env(*core_module, "#user");
@@ -1573,6 +1573,7 @@ void delete_blocks() {
   blocks.clear();
 }
 
+size_t gensym_counter;
 Table* symbol_table;
 std::vector<Handle<Value> *> globals;
 
@@ -1596,7 +1597,7 @@ enum Global {
   S_ODD_EVAL,
   S_ODD_TABLE,
   // Special forms
-  S_DEFINE,
+  S_DEF,
   S_ACCESS,
   S_SET,
   S_BRACE,
@@ -1717,6 +1718,7 @@ Symbol* make_symbol(String* string) {
     sym = allocate<Symbol>();
     cpy = make_string(string);
     sym->name = cpy;
+    sym->value = ODD_SYMBOL_UNSET;
     table_insert(symbol_table, cpy, sym);
   }
   return sym;
@@ -1724,6 +1726,14 @@ Symbol* make_symbol(String* string) {
 
 Symbol* make_symbol(const std::string& str) {
   return make_symbol(make_string(str));
+}
+
+Symbol* gensym(const std::string& str) {
+  std::ostringstream ss;
+  if(str.length() == 0) ss << "#gensym";
+  else ss << str;
+  ss << source_counter++;
+  return make_symbol(ss.str());
 }
 
 Vector* make_vector(unsigned capacity = 2) {
@@ -1827,7 +1837,7 @@ void defun(const std::string& cname, NativeFunction::ptr_t ptr,
   ODD_S_FRAME(fn, name, qualified_name);
   fn = make_native_function(ptr, arguments, variable_arity);
   name = make_symbol(cname);
-  env_define(*core_module, name, name, true);
+  env_define(*core_module, name, name, ODD_FALSE, true);
   qualified_name = ODD_CAST(Symbol, env_qualify_name(*core_module, name));
   qualified_name->value = fn;
 }
@@ -2836,30 +2846,40 @@ Table* make_env(Value* parent = ODD_FALSE, const char* module_name = 0) {
   return table;
 }
 
-bool env_contains(Table* env, Value* key) {
-  return table_contains(env, key);
-}
-
-void env_define(Table* table, Value* key, Value* value, bool exported = false) {
-  Value* chk = 0;
-  Table* exports = 0;
-  if(exported) exports = ODD_CAST(Table, table_get(table, global_symbol(S_EXPORTS)));
-  ODD_S_FRAME(table, key, value, chk, exports);
-  if(table_contains(table, key)) {
-    chk = table_set(table, key, value);
-    if(exported) table_set(exports, key, value);
-  } else {
-    chk = table_insert(table, key, value);
-    if(exported) {
-      table_insert(exports, key, value);
-    }
-  }
-  ODD_ASSERT(!chk->active_exception());
-}
-
 // Whether variables in this environment are global or not
 bool env_globalp(Table* table) {
   return table_has_key(table, global_symbol(S_GLOBAL_ENVIRONMENT));
+}
+
+void env_define(Table* table, Value* key, Value* value, Value* color, bool exported = false) {
+  Value* chk = 0;
+  Table* exports = 0;
+  Value* pairs = 0;
+  if(exported) exports = ODD_CAST(Table, table_get(table, global_symbol(S_EXPORTS)));
+  ODD_S_FRAME(table, key, value, chk, exports, color);
+  if(env_globalp(table)) {
+    if(table_contains(table, key)) {
+      chk = table_set(table, key, value);
+      if(exported) table_set(exports, key, value);
+    } else {
+      chk = table_insert(table, key, value);
+      if(exported) {
+        table_insert(exports, key, value);
+      }
+    }
+  } else {
+    // Colors.
+    chk = cons(color, value);
+    if(table_contains(table, key)) {
+      pairs = table_get(table, key);
+      chk = cons(chk, pairs);
+      table_insert(table, key, chk);
+    } else {
+      chk = cons(chk, ODD_NULL);
+      table_insert(table, key, chk);
+    }
+  }
+  ODD_ASSERT(!chk->active_exception());
 }
 
 // Look up an environment variable (the result is rather complex, and
@@ -2907,68 +2927,6 @@ Value* env_qualify_name(Table* env, Value* name) {
   return make_symbol(ss.str());
 }
 
-void env_lookup(Table* env, Value* key, Lookup& lookup, bool search_exports = false) {
-  bool found = false;
-  Table* start_env = env;
-  // Search through environments
-  while(env->get_type() == TABLE) {
-    // Search through an environment
-    Value* cell = table_get_cell(env, key);
-    if(cell != ODD_FALSE) {
-      // Found a match -- determine scope
-      ODD_ASSERT(cell->get_type() == PAIR);
-      if(env_globalp(env)) {
-        lookup.scope = REF_GLOBAL;
-        lookup.global.value = cell->cdr();
-        lookup.global.module = env;
-        if(search_exports) lookup.global.module = (Table*)table_get(env, global_symbol(S_EXPORT_PARENT));
-        return;
-      } else {
-        // If we're still searching through the original environment, it's a
-        // local variable, and if not, it's a free variable
-        lookup.scope = env == start_env ? REF_LOCAL : REF_UP;
-        lookup.nonglobal.value = cell->cdr();
-        // If this is a variable and not a macro, calculate its local index
-        if(cell->cdr()->get_type() == FIXNUM) {
-          lookup.nonglobal.index = cell->cdr()->fixnum_value();
-        }
-        return;
-      }
-    }
-    // No dice (note that even though this is in a union with global, it's
-    // fine to increment because it'll be discarded if we go all the way to a
-    // global variable)
-    lookup.nonglobal.level++;
-    // Nothing in this environment, keep searching
-
-    // Check whether this environment is a child environment (such as a function within a module)
-    if(table_has_key(env, global_symbol(S_PARENT))) {
-      env = ODD_CAST(Table, table_get(env, global_symbol(S_PARENT), found));
-      ODD_ASSERT(found);
-      continue;
-    }
-    // No delegates or delegate search failed, we're done
-    break;
-  }
-
-  // Check for unqualified imports
-  if(table_has_key(env, global_symbol(S_UNQUALIFIED_IMPORTS))) {
-    Vector* modules = ODD_CAST(Vector, table_get(env, global_symbol(S_UNQUALIFIED_IMPORTS), found));
-    for(size_t i = modules->vector_length() - 1; i != ((size_t)0)-1; i--) {
-      Lookup sublookup;
-      Table* exports = ODD_CAST(Table, table_get(ODD_CAST(Table, modules->vector_ref(i)), global_symbol(S_EXPORTS)));
-
-      env_lookup(exports, key, sublookup, true);
-
-      if(sublookup.success) {
-        lookup = sublookup;
-        return;
-      }
-    }
-  }
-
-  lookup.success = false;
-}
 
 // A structure describing the location of a free variable relative to the
 // function it's being used in
@@ -2987,7 +2945,7 @@ struct Compiler {
     state(state_), parent(parent_),
     local_free_variable_count(0), upvalue_count(0),
     stack_max(0), stack_size(0), locals(0), constants(state), closure(false),
-    name(state_), env(state_), depth(depth_), last_insn(0) {
+    name(state_), env(state_), depth(depth_), last_insn(0), color(state_) {
 
     if(!env_) env = (*state.core_module);
     else env = env_;
@@ -3019,6 +2977,9 @@ struct Compiler {
   size_t depth;
   // Location of last instruction emitted (for debug message purposes)
   size_t last_insn;
+
+  // For hygienic macros, all local variables are tagged with this symbol
+  Handle<Symbol> color;
 
   // Basic code generation
   void emit(size_t word) {
@@ -3151,7 +3112,7 @@ struct Compiler {
     // But we still need to do a real lookup because form names could be
     // shadowed by other definitions
     Lookup lookup;
-    state.env_lookup(*env, check, lookup);
+    env_lookup(*env, check, lookup);
     return lookup.success && lookup.scope == REF_GLOBAL &&
       lookup.global.value == state.global_symbol(S_SPECIAL);
   }
@@ -3188,6 +3149,85 @@ struct Compiler {
     }
     free_variables.push_back(l);
     return free_variables.size() - 1;
+  }
+
+  // environment search
+  void env_lookup(Table* env, Value* key, Lookup& lookup, bool search_exports = false) {
+    bool found = false;
+    Table* start_env = env;
+    Value* color = (*Compiler::color);
+    // Search through environments
+    while(env->get_type() == TABLE) {
+      // Search through an environment
+      Value* cell = state.table_get_cell(env, key);
+      if(cell != ODD_FALSE) {
+        // Found a match -- determine scope
+        ODD_ASSERT(cell->get_type() == PAIR);
+        if(state.env_globalp(env)) {
+          lookup.scope = REF_GLOBAL;
+          lookup.global.value = cell->cdr();
+          lookup.global.module = env;
+          if(search_exports) lookup.global.module = (Table*)state.table_get(env, state.global_symbol(S_EXPORT_PARENT));
+          return;
+        } else {
+          cell = cell->cdr();
+          ODD_ASSERT(cell->get_type() == PAIR);
+
+          // Check list for color matching variable
+          while(cell->get_type() == PAIR) {
+            ODD_ASSERT(cell->car()->get_type() == PAIR);
+
+            // Check color
+            if(cell->caar() == color) {
+              // If we're still searching through the original environment, it's a
+              // local variable, and if not, it's a free variable
+              Value* subcell = cell->car();
+              lookup.scope = env == start_env ? REF_LOCAL : REF_UP;
+              lookup.nonglobal.value = subcell->cdr();
+              // If this is a variable and not a macro, calculate its local index
+              if(subcell->cdr()->get_type() == FIXNUM) {
+                lookup.nonglobal.index = subcell->cdr()->fixnum_value();
+              }
+              return;
+            }
+
+            cell = cell->cdr();
+          }
+        }
+      }
+      // No dice (note that even though this is in a union with global, it's
+      // fine to increment because it'll be discarded if we go all the way to a
+      // global variable)
+      lookup.nonglobal.level++;
+      // Nothing in this environment, keep searching
+
+      // Check whether this environment is a child environment (such as a function within a module)
+      if(state.table_has_key(env, state.global_symbol(S_PARENT))) {
+        env = ODD_CAST(Table, state.table_get(env, state.global_symbol(S_PARENT), found));
+        ODD_ASSERT(found);
+        continue;
+      }
+      // No delegates or delegate search failed, we're done
+      break;
+    }
+
+    // Check for unqualified imports
+    if(state.table_has_key(env, state.global_symbol(S_UNQUALIFIED_IMPORTS))) {
+      Vector* modules = ODD_CAST(Vector, state.table_get(env, state.global_symbol(S_UNQUALIFIED_IMPORTS), found));
+      for(size_t i = modules->vector_length() - 1; i != ((size_t)0)-1; i--) {
+        Lookup sublookup;
+        Table* exports = ODD_CAST(Table, state.table_get(ODD_CAST(Table, modules->vector_ref(i)), state.global_symbol(S_EXPORTS)));
+
+        env_lookup(exports, key, sublookup, true);
+
+        if(sublookup.success) {
+          lookup = sublookup;
+          return;
+        }
+      }
+    }
+
+    lookup.success = false;
   }
 
   Value* generate_ref(Lookup& lookup, Value* exp,  Value* name) {
@@ -3245,7 +3285,7 @@ struct Compiler {
     annotate(exp);
     Value* name = unbox(exp);
     Lookup lookup;
-    state.env_lookup(*env, name, lookup);
+    env_lookup(*env, name, lookup);
     if(!lookup.success) return undefined_variable(exp);
     return generate_ref(lookup, exp, name);
   }
@@ -3293,7 +3333,7 @@ struct Compiler {
     // process if this define is a function definition
 restart:
     Value* chk = 0;
-    if(argc != 2) return arity_error(S_DEFINE, exp, 2, argc);
+    if(argc != 2) return arity_error(S_DEF, exp, 2, argc);
     Value* name = unbox(exp->cadr());
     Value* args = 0;
 
@@ -3334,7 +3374,7 @@ restart:
     }
 
     // TODO: Allow re-definitions, but warn about them
-    state.env_define(*env, name, value, exporting());
+    state.env_define(*env, name, value, *color, exporting());
 
     // Compile body for set
     ODD_FRAME(name);
@@ -3361,7 +3401,7 @@ restart:
 
     // Look up variable
     Lookup lookup;
-    state.env_lookup(*env, name, lookup);
+    env_lookup(*env, name, lookup);
     // Don't allow special forms or syntax
     if(!lookup.success)
       return undefined_variable(exp->cadr());
@@ -3445,7 +3485,7 @@ restart:
         }
         // Finally, we can add them to the environment!
         // Add it as a local variable
-        state.env_define(new_env, arg, Value::make_fixnum(argc));
+        state.env_define(new_env, arg, Value::make_fixnum(argc), *color);
         argc++;
         args = args->cdr();
         if(args->get_type() != PAIR) {
@@ -3456,7 +3496,7 @@ restart:
     }
 
     // Compile the function's body
-    ODD_CC_MSG("compiling subfunction");
+    ODD_CC_MSG("compiling subfunction with " << argc << " arguments");
     Compiler cc(state, this, new_env, depth+1);
     cc.locals = argc;
     if(name) {
@@ -3613,8 +3653,8 @@ restart:
     // Compile transformer function
     bool closure;
     transformer = generate_lambda(3, swap, tail, name, closure);
-    ODD_ASSERT(!closure);
     ODD_CHECK(transformer);
+    ODD_ASSERT(!closure);
     ODD_ASSERT(transformer->applicablep());
 
     ODD_CC_MSG("defsyntax " << name << ' ' << transformer);
@@ -3627,26 +3667,37 @@ restart:
     apply_macro_fn = state.make_native_function(&apply_macro, 0, true, apply_macro_closure);
     
     // Define macro
-    state.env_define(*env, name, apply_macro_fn, exporting());
-    ODD_CC_MSG("defsyntax " << name << ' ' << transformer << ' ' << state.table_get(*env, state.global_symbol(S_MODULE_NAME)));
+    state.env_define(*env, name, apply_macro_fn, *color, exporting());
     return ODD_FALSE;
   }
 
   Value* compile_macro_application(size_t argc, Value* exp, bool tail, Lookup& lookup) {
     // Syntax
-    state.vm_trampoline_arguments.clear();
-    state.vm_trampoline_arguments.push_back(exp);
+    state.safestack.clear();
+    state.safestack.push_back(exp);
 
     Value* function = lookup.scope == REF_GLOBAL ? lookup.global.value : lookup.nonglobal.value;
 
     ODD_CC_MSG("macro application " << exp);
-    // No need to protect anything as it will all be discarded
-    Value* result = state.apply(function, state.vm_trampoline_arguments.size(), &state.vm_trampoline_arguments[0]);
-    
+    Value* result = 0, *def_env = 0, *swap = 0, *chk = 0;
+    ODD_FRAME(function, result);
+
+    def_env = ODD_CAST(NativeFunction, function)->closure->data[0];
+
+    result = state.apply(function, state.safestack.size(), &state.safestack[0]);
+
     ODD_CHECK(result);
     ODD_CC_MSG("macro expansion result " << result);
 
-    return compile(result, tail);
+    // Temporary environment swap
+    swap = *env;
+    env = ODD_CAST(Table, def_env);
+
+    chk = compile(result, tail);
+
+    env = ODD_CAST(Table, swap);
+
+    return chk;
   }
 
   // Switch to module
@@ -3706,14 +3757,18 @@ restart:
     Value* variable_name = 0;
     Value* tmp = 0;
     Table* module = 0;
+    Value* gross_hack = 0;
 
-    ODD_FRAME(exp, args, qualified_imports, module_name, variable_name, tmp, module);
+    ODD_FRAME(exp, args, qualified_imports, module_name, variable_name, tmp, module, gross_hack);
 
     module_name = tmp = args;
 
+    // Gross hack = we chop the variable name off the end of the access statement, then glue it back on after passing
+    // the module part of the access statement to convert_module_name
     while(args->get_type() == PAIR) {
       if(args->cdr() == ODD_NULL) {
         variable_name = unbox(args->car());
+        gross_hack = args;
         tmp->set_cdr(ODD_NULL);
         break;
       }
@@ -3722,6 +3777,8 @@ restart:
     }
 
     module_name = state.convert_module_name(module_name);
+
+    tmp->set_cdr(gross_hack);
 
     for(size_t i = 0; i != qualified_imports->vector_length(); i++) {
       if(equals(module_name, state.table_get(ODD_CAST(Table, qualified_imports->vector_ref(i)), state.global_symbol(S_MODULE_NAME)))) {
@@ -3748,7 +3805,7 @@ restart:
     ODD_CHECK(chk);
 
     Lookup lookup;
-    state.env_lookup(module, variable_name, lookup);
+    env_lookup(module, variable_name, lookup);
     // TODO: Improve error message
     if(!lookup.success) {
       String* modname = ODD_CAST(String, state.table_get(module, state.global_symbol(S_MODULE_NAME)));
@@ -3838,6 +3895,9 @@ restart:
         push();
         ODD_CC_EMIT("push-immediate " << exp);
         break;
+      case STRING: 
+        push_constant(exp);
+        break;
       // Variable references
       case SYMBOL:
       case BOX: {
@@ -3856,14 +3916,15 @@ restart:
         Value* function = unbox(exp->car());
         bool syntax = false;
         if(function->get_type() == SYMBOL) {
-          state.env_lookup(*env, function, lookup);
+          env_lookup(*env, function, lookup);
           syntax = state.lookup_syntaxp(lookup);
         }
         // Special case: access macro application
+        // TODO: Perhaps this should all be moved to compile-apply
         if(function->get_type() == PAIR) {
           if(function->car()->get_type() == SYMBOL) {
             Value* maybe_access = unbox(function->car());
-            state.env_lookup(*env, maybe_access, lookup);
+            env_lookup(*env, maybe_access, lookup);
             if(state.lookup_syntaxp(lookup) && maybe_access == state.global_symbol(S_ACCESS)) {
               Value* name = 0;
               Value* chk = lookup_access_ref(length(function->cdr()), function, name, lookup);
@@ -3872,7 +3933,6 @@ restart:
                 return compile_macro_application(length(exp->cdr()), exp, tail, lookup);
               }
               ODD_CHECK(chk);
-              return ODD_FALSE;
             }
           }
         }
@@ -3882,7 +3942,7 @@ restart:
             // Dispatch on the special form
             Symbol* op = ODD_CAST(Symbol, function);
             // define
-            if(op == state.global_symbol(S_DEFINE)) {
+            if(op == state.global_symbol(S_DEF)) {
               return compile_define(argc, exp, tail);
             // set
             } else if(op == state.global_symbol(S_SET)) {
@@ -4044,10 +4104,8 @@ if(x->active_exception()) { \
 }
 
 size_t vm_depth;
-// Passing arguments for tail calls. No need to protect 
-// for garbage collector because no allocations will be triggered while
-// trampolining.
-std::vector<Value*> vm_trampoline_arguments;
+// Passing arguments for tail calls and other applications.
+std::vector<Value*> safestack;
 Value* vm_trampoline_function;
 
 // A frame containing information that needs to be tracked by the garbage
@@ -4137,7 +4195,10 @@ Value* vm_apply(Prototype* prototype, Closure* closure, size_t argc,
 
   // Load normal arguments
   size_t i;
-  for(i = 0; i != prototype->arguments; i++) f.locals[i] = args[i];
+  for(i = 0; i != prototype->arguments; i++) {
+    ODD_VM_MSG("load argument " << i << ": " << args[i]);
+    f.locals[i] = args[i];
+  }
 
   // If we're not done yet, either we've received too many arguments or this
   // is a variable arity function
@@ -4262,9 +4323,9 @@ Value* vm_apply(Prototype* prototype, Closure* closure, size_t argc,
         // Pop the function, which should be at the top of the stack
         Value* fn = f.stack[f.si-1];
         f.si--;
-        vm_trampoline_arguments.clear();
+        safestack.clear();
         for(size_t i = 0; i != argc; i++) {
-          vm_trampoline_arguments.push_back(f.stack[f.si-argc+i]);
+          safestack.push_back(f.stack[f.si-argc+i]);
         }
         vm_trampoline_function = fn;
         trampoline = true;
@@ -4315,6 +4376,7 @@ Value* vm_apply(Prototype* prototype, Closure* closure, size_t argc,
 
 // Apply frontend
 Value* apply(Value* function, size_t argc, Value* args[]) {
+  // Tracking call frames lost due to tail call optimization
   size_t frames_lost = 0;
 tail:
   bool trampoline = false;
@@ -4333,8 +4395,8 @@ tail:
       result = vm_apply(prototype, closure, argc, args, trampoline);
       if(trampoline && !result->active_exception()) {
         function = vm_trampoline_function;
-        argc = vm_trampoline_arguments.size();
-        args = &vm_trampoline_arguments[0];
+        argc = safestack.size();
+        args = &safestack[0];
         frames_lost++;
         goto tail;
       } else return result;
@@ -4656,7 +4718,7 @@ inline std::ostream& operator<<(std::ostream& os, Value* x) {
     case UPVALUE: return os << "#<upvalue "
                             << (x->upvalue_closed() ? "(closed) " : "")
                             << " " << x->upvalue() << ')';
-    case SYNCLO: return os << "#<synclo>";
+    case SYNCLO: return os << "#<synclo " << static_cast<Synclo*>(x)->expr << '>';
     case TABLE: {
       Table* t = static_cast<Table*>(x);
       return os << "#<table entries: " << t->entries
@@ -4697,6 +4759,35 @@ ODD_FUNCTION(cdr) {
   return args[0]->cdr();
 }
 
+ODD_FUNCTION(list) {
+  //static const char* fn_name = "list";
+  if(argc == 0) return ODD_NULL;
+  // GC Protect arguments
+  state.safestack.clear();
+  for(size_t i = 0; i != argc; i++) 
+    state.safestack.push_back(args[i]);
+  Value* head = 0;
+  ODD_FRAME(head);
+  head = state.cons(state.safestack[argc-1], ODD_NULL);
+  for(int i = argc-2; i >= 0; i--) {
+    head = state.cons(state.safestack[i], head);
+  }
+  return head;
+}
+
+ODD_FUNCTION(list_ref) {
+  static const char* fn_name = "list-ref";
+  if(args[0] == ODD_NULL) return ODD_NULL;
+  ODD_CHECK_TYPE(PAIR, 0);
+  ODD_CHECK_TYPE(FIXNUM, 1);
+  ptrdiff_t i = args[1]->fixnum_value();
+  Value* head = args[0];
+  while(i-- && head->get_type() == PAIR) {
+    head = head->cdr();
+  }
+  return head ? head->car() : ODD_FALSE;
+}
+
 ODD_FUNCTION(apply_macro) { 
   // static const char* fn_name = "apply-macro";
   ODD_ASSERT(closure);
@@ -4705,19 +4796,20 @@ ODD_FUNCTION(apply_macro) {
 
   ODD_FRAME(cc_env, transformer, result, exp);
 
-  std::cout << "CC_ENV: " << cc_env << std::endl;
-  std::cout << "TRANSFORMER: " << transformer << std::endl;
   // Build rename procedure
-  //rename = state.make_native_function(&rename, 1, false, closure);
   
   // Build comparison closure
 
   // Apply transformer
-  state.vm_trampoline_arguments.clear();
-  state.vm_trampoline_arguments.push_back(exp);
-  state.vm_trampoline_arguments.push_back(cc_env);
+  state.safestack.clear();
+  state.safestack.push_back(exp);
+  state.safestack.push_back(cc_env);
 
-  result = state.apply(transformer, 2, &state.vm_trampoline_arguments[0]);
+  std::cout << "CC_ENV: " << cc_env << std::endl;
+  std::cout << "TRANSFORMER: " << transformer << std::endl;
+  std::cout << "state.safestack: " << state.safestack[0] << ' ' << state.safestack[1] << std::endl;
+
+  result = state.apply(transformer, 2, &state.safestack[0]);
   std::cout << "APPLY-MACRO: " << result << std::endl;
   return result;
 }
@@ -4739,6 +4831,7 @@ ODD_FUNCTION(synclo) {
       state.vector_append(v, vars->car());
       vars = vars->cdr();
     }
+    c->escaped_variables = v;
   }
   return c;
 }
@@ -4746,7 +4839,12 @@ ODD_FUNCTION(synclo) {
 inline void State::initialize_builtin_functions() {
   defun("car", &car, 1, false);
   defun("cdr", &cdr, 1, false);
+  defun("list", &list, 0, true);
+  defun("list-ref", &list_ref, 2, false);
+
   defun("synclo", &synclo, 2, true);
+
+  // exception handling
 }
 
 } // odd

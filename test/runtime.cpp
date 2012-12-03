@@ -220,7 +220,7 @@ void test_compiler(State& state) {
   test_eval(state, "#t", ODD_TRUE);
   test_eval(state, "#f", ODD_FALSE);
   // Global variable access
-  test_eval(state, "define(x #t) x", ODD_TRUE);
+  test_eval(state, "def(x #t) x", ODD_TRUE);
   // Function compilation
   test_eval(state, "lambda { #t }", PROTOTYPE);
   // Simple application
@@ -228,7 +228,7 @@ void test_compiler(State& state) {
   // Argument function and application
   test_eval(state, "lambda(x) { x }(#t)", ODD_TRUE);
   // Set!
-  test_eval(state, "define(z #f) set(z #t) z", ODD_TRUE);
+  test_eval(state, "def(z #f) set(z #t) z", ODD_TRUE);
   test_eval(state, "lambda(x) { set(x #t) x }(#f)", ODD_TRUE);
   // Closures
   test_eval(state, "lambda(x) { lambda() { x }() }(#t)", ODD_TRUE);
@@ -257,7 +257,7 @@ void test_compiler(State& state) {
 
   // Test that defining lambdas properly detects their names
   named_lambda named_lambda_functor;
-  test_eval<named_lambda>(state, "define(something lambda { #t }) something", named_lambda_functor);
+  test_eval<named_lambda>(state, "def(something lambda { #t }) something", named_lambda_functor);
 
   // Stack management
   test_eval(state, "lambda { #t #t #t }()", ODD_TRUE);
@@ -265,9 +265,9 @@ void test_compiler(State& state) {
   // Modules
   test_eval(state, "[module [a]] #t", ODD_TRUE);
 
-  test_eval(state, "[module [b]] define(x #t) x", ODD_TRUE);
+  test_eval(state, "[module [b]] def(x #t) x", ODD_TRUE);
   // Qualified imports
-  test_eval(state, "[module [c]] [public] define(x #t) define(y #t) define(z lambda { #t }) [module [d]] import { c } c.x", ODD_TRUE);
+  test_eval(state, "[module [c]] [public] def(x #t) def(y #t) def(z lambda { #t }) [module [d]] import { c } c.x", ODD_TRUE);
   // Unqualified imports
   test_eval(state, "[module [e]] import { c.* } y", ODD_TRUE);
   // Import function
@@ -275,15 +275,24 @@ void test_compiler(State& state) {
 
   // Macros
   // simple macro
-  test_eval(state, "[module [macro-test]] defsyntax(hello x e) { '[define x #t] } hello() x", ODD_TRUE);
-  test_eval(state, "[module [macro-test2]] defsyntax(hello2 x e) { synclo(e '[define hello2-var #t]) } hello2() hello2-var", ODD_TRUE);
+  test_eval(state, "[module [macro-test]] defsyntax(hello x e) { '[def x #t] } hello() x", ODD_TRUE);
+  // synclo macro
   state.trace = true;
-  test_eval(state, "[module [macro-test]] defsyntax(hello3 x e) { synclo(e '[define hello3-var #t]) }"\
+  test_eval(state, "[module [macro-test2]] defsyntax(hello2 x e) { synclo(e '[def hello2-var #t]) } hello2() hello2-var", ODD_TRUE);
+#if 0
+  // cross-module macro
+  test_eval(state, "[module [macro-test]] defsyntax(hello3 x e) { synclo(e '[def hello3-var #t]) }"\
                    "import { macro-test } macro-test.hello3() hello3-var", ODD_TRUE);
-  //test_eval(state, "[module [macro-test]] defsyntax(hello3 x e) { synclo(e '[define hello3-var #t]) }", ODD_TRUE);
-  // [module [hello3-test]] "
-  //                 "import { macro-test } macro-test.hello3() hello3-var", ODD_TRUE);
 
+  // aif
+  // wow this is painful to write without real facilities
+  state.trace = true;
+  //test_eval(state, "[module [aif-test]] defsyntax(aif x e) { list(list('lambda 'it list('brace list('if 'it list-ref(x 2) list-ref(x 3)))) list-ref(x 1)) } "
+  //                 "[module [aif-use-test]] import { aif-test } aif-test.aif(#t it #f)", ODD_TRUE);
+  test_eval(state, "[module [aif-def]] defsyntax(aif x e) { list(list('lambda 'it list('brace list('if 'it synclo(e list-ref(x 2)) synclo(e list-ref(x 3))))) synclo(e list-ref(x 1))) }"\
+                   "[module [aif-use]] import { aif-def } aif-def.aif(#t it #f)", ODD_TRUE);
+
+#endif
   state.trace = false;
 
   // test runtime provided eval function
