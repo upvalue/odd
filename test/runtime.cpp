@@ -93,6 +93,24 @@ static void test_symbols(State& state) {
   assert(state.markedp(*sym4));
 }
 
+static void test_handle_swap(State& state) {
+  Handle<Value> num1(state, Value::make_fixnum(2));
+  Value* num2 = Value::make_fixnum(3);
+
+  assert(*num1 == Value::make_fixnum(2));
+  assert(num2 == Value::make_fixnum(3));
+
+  num1.swap(num2);
+
+  assert(*num1 == Value::make_fixnum(3));
+  assert(num2 == Value::make_fixnum(2));
+
+  num1.swap(num2);
+
+  assert(*num1 == Value::make_fixnum(2));
+  assert(num2 == Value::make_fixnum(3));
+}
+
 static void test_vectors(State& state) {
   std::cout << "!! test_vectors" << std::endl;
   Vector* v = 0;
@@ -277,9 +295,10 @@ void test_compiler(State& state) {
   // simple macro
   test_eval(state, "[module [macro-test]] defsyntax(hello x e) { '[define x #t] } hello() x", ODD_TRUE);
   test_eval(state, "[module [macro-test2]] defsyntax(hello2 x e) { synclo(e '[define hello2-var #t]) } hello2() hello2-var", ODD_TRUE);
-  state.trace = true;
   test_eval(state, "[module [macro-test]] defsyntax(hello3 x e) { synclo(e '[define hello3-var #t]) }"\
                    "import { macro-test } macro-test.hello3() hello3-var", ODD_TRUE);
+  //state.trace = true;
+  test_eval(state, "[module [aif-def]] defsyntax(aif x e) { list(list('lambda 'it list('brace list('if 'it synclo(e list-ref(x 2) '[it]) synclo(e list-ref(x 3))))) synclo(e list-ref(x 1))) } [module [aif-use]] import { aif-def } aif-def.aif(#t it #f)", ODD_TRUE);
   //test_eval(state, "[module [macro-test]] defsyntax(hello3 x e) { synclo(e '[define hello3-var #t]) }", ODD_TRUE);
   // [module [hello3-test]] "
   //                 "import { macro-test } macro-test.hello3() hello3-var", ODD_TRUE);
@@ -301,6 +320,7 @@ void run_test_suite(State& state) {
   test_invariants(state);
   test_gc_1(state);
   test_symbols(state);
+  test_handle_swap(state);
   test_vectors(state);
   test_tables(state);
   test_reader(state);

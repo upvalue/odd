@@ -51,11 +51,7 @@
 #endif
 
 // Try to give a graceful error message when internal errors occur
-#define ODD_FAIL(desc) \
-  { \
-  std::cerr << desc << std::endl; \
-  ODD_ASSERT(!"failure"); \
-  }
+#define ODD_FAIL(desc) { std::cerr << desc << std::endl; ODD_ASSERT(!"failure"); }
 
 // Checking for exceptions
 #define ODD_CHECK(x) if((x)->active_exception()) return (x);
@@ -326,6 +322,7 @@ struct Value {
   void vector_set(size_t, Value*);
   size_t vector_length() const;
   VectorStorage* vector_storage() const;
+  bool vector_memq(Value* x);
 
   // Vector storage
   Value** vector_storage_data() const;
@@ -396,6 +393,10 @@ struct Value {
   bool native_function_variable_arity() const { 
     return get_header_bit(NATIVE_FUNCTION, NATIVE_FUNCTION_VARIABLE_ARITY_BIT);
   }
+
+  // Syntactic closures
+  Value* synclo_expr() const;
+  Value* synclo_escaped_variables() const;
 };
 
 struct Pair : Value {
@@ -497,6 +498,13 @@ Value** Value::vector_data() { return vector_storage()->data; }
 Value* Value::vector_ref(size_t i) { return vector_storage()->data[i]; }
 void Value::vector_set(size_t i, Value* v) { vector_storage()->data[i] = v; }
 size_t Value::vector_length() const { return vector_storage()->length; }
+bool Value::vector_memq(Value* x) {
+  if(get_type() != VECTOR) return false;
+  for(size_t i = 0; i != vector_length(); i++) {
+    if(vector_ref(i) == x) return true;
+  }
+  return false;
+}
 
 struct Blob : Value {
   unsigned length;
@@ -693,6 +701,16 @@ struct Synclo : Value {
   static const Type CLASS_TYPE = SYNCLO;
 };
 
+Value* Value::synclo_expr() const {
+  ODD_ASSERT(get_type() == SYNCLO);
+  return static_cast<const Synclo*>(this)->expr;
+}
+
+Value* Value::synclo_escaped_variables() const {
+  ODD_ASSERT(get_type() == SYNCLO);
+  return static_cast<const Synclo*>(this)->escaped_variables;
+}
+
 ///// GARBAGE COLLECTOR TRACKING
 
 // Handles are auto-tracked heap-allocated pointers
@@ -709,13 +727,19 @@ struct Handle {
   void initialize();
   ~Handle();
  
-   State& state;
+  State& state;
   T* ref;
   Handle<Value> *previous, *next;
 
   T* operator*() const { return ref; }
   T* operator->() const { return ref; }
   void operator=(T* ref_) { ref = ref_; }  
+
+  void swap(Value*& other) {
+    Value* s = ref;
+    ref = (T*) other;
+    other = s;
+  }
 };
 
 // This structure is used in the GC tracking macros to take a normal
@@ -1045,6 +1069,9 @@ void mark_heap() {
 
   for(Handle<Value>* i = handle_list; i != NULL; i = i->previous)
     recursive_mark(i->ref);
+
+  for(size_t i = 0; i != safestack.size(); i++)
+    recursive_mark(safestack[i]);
   
   for(size_t i = 0; i != vm_frames.size(); i++) {
     VMFrame* f = vm_frames[i];
@@ -1842,6 +1869,24 @@ VectorStorage* vector_storage_realloc(size_t capacity, VectorStorage* old) {
     memcpy(data->data, old->data, old->length * sizeof(Value*));
   }
   return data;
+}
+
+// Combine two vectors (also accepts #f as argument and ignores it)
+Vector* vector_combine(Vector* v1, Vector* v2) {
+  if(!v1 && !v2) return (Vector*) ODD_FALSE;
+  Vector* n = 0;
+  ODD_S_FRAME(n, v1, v2);
+  // Pre-calculate size of new vector
+  size_t capacity = (v1->get_type() == VECTOR ? v1->vector_length() : 0) + \
+                    (v2->get_type() == VECTOR ? v2->vector_length() : 0);
+  n = make_vector(capacity);
+  if(v1->get_type() == VECTOR)
+    for(size_t i = 0; i != v1->vector_length(); i++)
+      vector_append(n, v1->vector_ref(i));
+  if(v2->get_type() == VECTOR)
+    for(size_t i = 0; i != v2->vector_length(); i++)
+      vector_append(n, v2->vector_ref(i));
+  return n;
 }
 
 unsigned vector_append(Vector* vec, Value* value) {
@@ -2987,11 +3032,12 @@ struct Compiler {
     state(state_), parent(parent_),
     local_free_variable_count(0), upvalue_count(0),
     stack_max(0), stack_size(0), locals(0), constants(state), closure(false),
-    name(state_), env(state_), depth(depth_), last_insn(0) {
+    name(state_), env(state_), escaped_variables(state_), depth(depth_), last_insn(0) {
 
     if(!env_) env = (*state.core_module);
     else env = env_;
 
+    if(parent) escaped_variables = (*parent->escaped_variables);
   }
 
   ~Compiler() {}
@@ -3015,6 +3061,8 @@ struct Compiler {
   Handle<String> name;
   // The environment of the function
   Handle<Table> env;
+  // Escaped variables (for macros)
+  Handle<Vector> escaped_variables;
   // The depth of the function (for debug message purposes)
   size_t depth;
   // Location of last instruction emitted (for debug message purposes)
@@ -3154,6 +3202,11 @@ struct Compiler {
     state.env_lookup(*env, check, lookup);
     return lookup.success && lookup.scope == REF_GLOBAL &&
       lookup.global.value == state.global_symbol(S_SPECIAL);
+  }
+
+  bool identifierp(Value* x) {
+    return x->get_type() == SYMBOL || (x->get_type() == BOX && unbox(x)->get_type() == SYMBOL) ||
+      (x->get_type() == SYNCLO && (static_cast<Synclo*>(x)->expr->get_type() == SYMBOL));
   }
 
   // free variable handling
@@ -3490,7 +3543,7 @@ restart:
       else return arity_error_most(S_IF, exp, 3, argc);
     }
     Value* chk = 0, *condition = 0, *then_branch = 0, *else_branch = 0;
-    ODD_FRAME(chk, condition, then_branch, else_branch);
+    ODD_FRAME(exp, chk, condition, then_branch, else_branch);
 
     condition = exp->cadr();
     then_branch = exp->cddr()->car();
@@ -3565,6 +3618,7 @@ restart:
     size_t old_stack_size = stack_size;
 
     Value* args = exp->cdr();
+    ODD_FRAME(exp, chk, args);
     while(args != ODD_NULL) {
       chk = compile(args->car());
       ODD_CHECK(chk);
@@ -3613,7 +3667,7 @@ restart:
     // Compile transformer function
     bool closure;
     transformer = generate_lambda(3, swap, tail, name, closure);
-    ODD_ASSERT(!closure);
+    //ODD_ASSERT(!closure);
     ODD_CHECK(transformer);
     ODD_ASSERT(transformer->applicablep());
 
@@ -3634,19 +3688,37 @@ restart:
 
   Value* compile_macro_application(size_t argc, Value* exp, bool tail, Lookup& lookup) {
     // Syntax
-    state.vm_trampoline_arguments.clear();
-    state.vm_trampoline_arguments.push_back(exp);
+    state.safestack.clear();
+    // First argument is the expression
+    state.safestack.push_back(exp);
+    // Second argument is the usage environment of the macro, for creating syntactic closures with.
+    state.safestack.push_back(*env);
 
+    // Get the actual transformer
     Value* function = lookup.scope == REF_GLOBAL ? lookup.global.value : lookup.nonglobal.value;
+    Value* result = 0;
+    Value* other_env = 0;
 
     ODD_CC_MSG("macro application " << exp);
-    // No need to protect anything as it will all be discarded
-    Value* result = state.apply(function, state.vm_trampoline_arguments.size(), &state.vm_trampoline_arguments[0]);
-    
-    ODD_CHECK(result);
-    ODD_CC_MSG("macro expansion result " << result);
+    // Run the transformer
+    result = state.apply(function, state.safestack.size(), &state.safestack[0]);
 
-    return compile(result, tail);
+    ODD_CHECK(result);
+    
+    // Here's the fun part, we extract the definition environment of the macro (which is part of the transformer's closure) 
+    other_env = static_cast<NativeFunction*>(function)->closure->data[0];
+
+    // Swap it with the current environment
+    env.swap(other_env);
+
+    ODD_CC_MSG("macro expansion result " << result);
+    // Compile the macro's return value in the definition environment of the macro
+    result = compile(result, tail);
+
+    // Then swap back
+    env.swap(other_env);
+
+    return result;
   }
 
   // Switch to module
@@ -3703,17 +3775,18 @@ restart:
   Value* resolve_access(Value* exp, Value* args, Table*& modref, Value *& nameref) {
     Value* qualified_imports = state.table_get(*env, state.global_symbol(S_QUALIFIED_IMPORTS));
     Value* module_name = 0;
-    Value* variable_name = 0;
+    Value* variable_name = 0, *gross_hack = 0;
     Value* tmp = 0;
     Table* module = 0;
 
-    ODD_FRAME(exp, args, qualified_imports, module_name, variable_name, tmp, module);
+    ODD_FRAME(exp, args, qualified_imports, module_name, variable_name, tmp, module, gross_hack);
 
     module_name = tmp = args;
 
     while(args->get_type() == PAIR) {
       if(args->cdr() == ODD_NULL) {
         variable_name = unbox(args->car());
+        gross_hack = args;
         tmp->set_cdr(ODD_NULL);
         break;
       }
@@ -3722,6 +3795,7 @@ restart:
     }
 
     module_name = state.convert_module_name(module_name);
+    tmp->set_cdr(gross_hack);
 
     for(size_t i = 0; i != qualified_imports->vector_length(); i++) {
       if(equals(module_name, state.table_get(ODD_CAST(Table, qualified_imports->vector_ref(i)), state.global_symbol(S_MODULE_NAME)))) {
@@ -3826,6 +3900,7 @@ restart:
 
   // Compile a single expression, returns #f or an error if one occurred
   Value* compile(Value* exp, bool tail = false) {
+    ODD_CC_MSG("compile expression " << exp);
     // Dispatch based on an object's type
     switch(exp->get_type()) {
       // Constants: note that these are only immediate constants, such as #t
@@ -3860,21 +3935,15 @@ restart:
           syntax = state.lookup_syntaxp(lookup);
         }
         // Special case: access macro application
-        if(function->get_type() == PAIR) {
-          if(function->car()->get_type() == SYMBOL) {
-            Value* maybe_access = unbox(function->car());
-            state.env_lookup(*env, maybe_access, lookup);
-            if(state.lookup_syntaxp(lookup) && maybe_access == state.global_symbol(S_ACCESS)) {
-              Value* name = 0;
-              Value* chk = lookup_access_ref(length(function->cdr()), function, name, lookup);
-              // If this is a macro application, do that instead
-              if(state.lookup_syntaxp(lookup) && lookup.global.value != state.global_symbol(S_SPECIAL)) {
-                return compile_macro_application(length(exp->cdr()), exp, tail, lookup);
-              }
-              ODD_CHECK(chk);
-              return ODD_FALSE;
+        if(check_special_form(function, S_ACCESS)) {
+            Value* name = 0;
+            Value* chk = lookup_access_ref(length(function->cdr()), function, name, lookup);
+            // If this is a macro application, do that instead
+            if(state.lookup_syntaxp(lookup) && lookup.global.value != state.global_symbol(S_SPECIAL)) {
+              return compile_macro_application(length(exp->cdr()), exp, tail, lookup);
             }
-          }
+            ODD_CHECK(chk);
+            return ODD_FALSE;
         }
         if(syntax) {
           size_t argc = length(exp->cdr());
@@ -3941,25 +4010,36 @@ restart:
       }
       case SYNCLO: {
         Synclo *s = static_cast<Synclo*>(exp);
-        Table* senv = s->env;
-        Vector* vars = s->escaped_variables;
+        Value* senv = s->env;
+        Value* vars = 0;
         Value* expr = s->expr;
         Table* swap = 0;
         Value* chk = 0;
 
+        bool swapped = false;
         ODD_FRAME(s, senv, vars, expr, swap, chk);
 
-        swap = *env;
-        env = senv;
-        senv = swap;
-       
+        vars = state.vector_combine(s->escaped_variables, *escaped_variables);
+
+        escaped_variables.swap(vars);
+
+        // Unfortunately std::swap cannot be used here because these are different types.
+
+        // If this is not a reference to an escaped variable, we'll use the synclo's specified environment
+        if(!(identifierp(expr) && escaped_variables->vector_memq(expr))) {
+          env.swap(senv);
+          swapped = true;
+        }
+
         chk = compile(expr, tail);
 
-        swap = *env;
-        env = senv;
-        senv = swap;
+        if(swapped) {
+          env.swap(senv);
+        }
 
-        return ODD_FALSE;
+        escaped_variables.swap(vars);
+
+        return chk;
       }
       default:
         std::cerr << exp << std::endl;
@@ -4048,6 +4128,8 @@ size_t vm_depth;
 // for garbage collector because no allocations will be triggered while
 // trampolining.
 std::vector<Value*> vm_trampoline_arguments;
+// A garbage-collector protected vector. May be cleared when calling other functions!
+std::vector<Value*> safestack;
 Value* vm_trampoline_function;
 
 // A frame containing information that needs to be tracked by the garbage
@@ -4269,7 +4351,6 @@ Value* vm_apply(Prototype* prototype, Closure* closure, size_t argc,
         vm_trampoline_function = fn;
         trampoline = true;
         VM_RETURN(ODD_UNSPECIFIED);
-        continue;
       }
       case OP_APPLY: {
         // Retrieve argument count
@@ -4634,7 +4715,7 @@ inline std::ostream& operator<<(std::ostream& os, Value* x) {
     case BOX: {
       // If it has source info then it's some value wrapped by the reader
       if(x->box_has_source())
-        return os << x->box_value();
+        return os << '$' << x->box_value();
       else
         return os << "#<box " << (ptrdiff_t)x << ">";
     }
@@ -4656,7 +4737,12 @@ inline std::ostream& operator<<(std::ostream& os, Value* x) {
     case UPVALUE: return os << "#<upvalue "
                             << (x->upvalue_closed() ? "(closed) " : "")
                             << " " << x->upvalue() << ')';
-    case SYNCLO: return os << "#<synclo>";
+    case SYNCLO: {
+      os << "#<synclo " << x->synclo_expr();
+      if(x->synclo_escaped_variables())
+        os << ' ' << x->synclo_escaped_variables();
+      return os << '>';
+    }
     case TABLE: {
       Table* t = static_cast<Table*>(x);
       return os << "#<table entries: " << t->entries
@@ -4697,55 +4783,86 @@ ODD_FUNCTION(cdr) {
   return args[0]->cdr();
 }
 
+ODD_FUNCTION(list) {
+  //static const char* fn_name = "list";
+  if(argc == 0) return ODD_NULL;
+  // GC Protect arguments
+  state.safestack.clear();
+  for(size_t i = 0; i != argc; i++)
+    state.safestack.push_back(args[i]);
+  Value* head = ODD_NULL;
+  ODD_FRAME(head);
+  ptrdiff_t i = argc;
+  while(i--) {
+    head = state.cons(state.safestack[i], head);
+  }
+  return head;
+}
+
+ODD_FUNCTION(list_ref) {
+  static const char* fn_name = "list-ref";
+  if(args[0] == ODD_NULL) return ODD_NULL;
+  ODD_CHECK_TYPE(PAIR, 0);
+  ODD_CHECK_TYPE(FIXNUM, 1);
+  ptrdiff_t i = args[1]->fixnum_value();
+  Value* head = args[0];
+  while(i-- && head->get_type() == PAIR) {
+    head = head->cdr();
+  }
+  return head ? head->car() : ODD_FALSE;
+}
+
 ODD_FUNCTION(apply_macro) { 
   // static const char* fn_name = "apply-macro";
+  ODD_ASSERT(argc == 2);
   ODD_ASSERT(closure);
   ODD_ASSERT(closure->length == 2);
   Value *cc_env = closure->data[0], *transformer = closure->data[1], *exp = args[0], *result = 0;
+  Value* other_env = args[1];
 
-  ODD_FRAME(cc_env, transformer, result, exp);
-
-  std::cout << "CC_ENV: " << cc_env << std::endl;
-  std::cout << "TRANSFORMER: " << transformer << std::endl;
-  // Build rename procedure
-  //rename = state.make_native_function(&rename, 1, false, closure);
-  
-  // Build comparison closure
+  ODD_FRAME(cc_env, transformer, result, exp, other_env);
 
   // Apply transformer
-  state.vm_trampoline_arguments.clear();
-  state.vm_trampoline_arguments.push_back(exp);
-  state.vm_trampoline_arguments.push_back(cc_env);
+  state.safestack.clear();
+  state.safestack.push_back(exp);
+  state.safestack.push_back(other_env);
 
-  result = state.apply(transformer, 2, &state.vm_trampoline_arguments[0]);
-  std::cout << "APPLY-MACRO: " << result << std::endl;
+  result = state.apply(transformer, 2, &state.safestack[0]);
   return result;
 }
 
 ODD_FUNCTION(synclo) {
   const char* fn_name = "synclo";
   ODD_CHECK_TYPE(TABLE, 0);
-  Synclo* c = state.allocate<Synclo>();
+  Synclo* c = 0;
+  Value* env = ODD_CAST(Table, args[0]);
+  Value* expr = args[1];
+  Vector* v = 0;
+  Value* vars = (argc > 2) ? args[2] : ODD_FALSE;
+  ODD_FRAME(c, env, expr, v, vars);
+  c = state.allocate<Synclo>();
   c->env = ODD_CAST(Table, args[0]);
-  c->expr = args[1];
+  c->expr = state.unbox(args[1]);
   if(argc > 2) {
     if(argc > 3) ODD_FAIL("too many arguments");
-    Value* vars = args[3];
     ODD_CHECK_TYPE(PAIR, 2);
-    Vector* v = 0;
-    ODD_FRAME(c, v, vars);
     v = state.make_vector();
     while(vars->get_type() == PAIR) {
-      state.vector_append(v, vars->car());
+      state.vector_append(v, state.unbox(vars->car()));
       vars = vars->cdr();
     }
+    c->escaped_variables = v;
   }
+
   return c;
 }
 
 inline void State::initialize_builtin_functions() {
   defun("car", &car, 1, false);
   defun("cdr", &cdr, 1, false);
+  defun("list", &list, 0, true);
+  defun("list-ref", &list_ref, 2, false);
+
   defun("synclo", &synclo, 2, true);
 }
 
