@@ -1582,6 +1582,9 @@ State():
 
   register_module("#odd#core", *core_module);
   register_module("#user", *user_module);
+
+  toplevel_cc = new Compiler(*this, 0);
+  toplevel_cc->enter_module(table_get(*user_module, global_symbol(S_MODULE_NAME)));
 }
 
 ~State() {
@@ -4096,6 +4099,19 @@ restart:
       p->set_header_bit(PROTOTYPE, Value::PROTOTYPE_VARIABLE_ARITY_BIT);
     return p;
   }
+
+  // Clear a Compiler instance for re-use
+  // Gets rid of code, upvals, etc, while preserving module environment
+  void clear() {
+    code.clear();
+    debuginfo.clear();
+    free_variables.clear();
+    local_free_variable_count = upvalue_count = stack_max = stack_size = locals = last_insn = 0;
+    constants = (Vector*) ODD_FALSE;
+    closure = false;
+    name = (String*) ODD_FALSE;
+    escaped_variables = (Vector*) ODD_FALSE;
+  }
 };
 
 ///// (VM) VIRTUAL MACHINE
@@ -4437,6 +4453,8 @@ tail:
 // module management
 Handle<Table> modules;
 std::vector<std::string> module_search_paths;
+// compiler used for one-off evals, etc
+Compiler* toplevel_cc;
 
 // Convert a Scheme module name into a string
 // (scheme base) => "#scheme.base"
@@ -4566,19 +4584,18 @@ Value* load_file(const char* path, Value* module_name = 0) {
   Value* chk = 0;
   Prototype* p = 0;
   ODD_S_FRAME(x, p, chk, module_name);
-  State::Compiler cc(*this, 0);
   if(module_name)
-    cc.enter_module(module_name);
+    toplevel_cc->enter_module(module_name);
   else
-    cc.enter_module(table_get(*user_module, global_symbol(S_MODULE_NAME)));
+    toplevel_cc->enter_module(table_get(*user_module, global_symbol(S_MODULE_NAME)));
   while(true) {
     x = reader.read();
     if(x == ODD_EOF) break;
     if(x->active_exception()) return x;
-    chk = cc.compile(x);
+    chk = toplevel_cc->compile(x);
     if(chk != ODD_FALSE) return chk;
   }
-  p = cc.end();
+  p = toplevel_cc->end();
   x = apply(p, 0, 0);
   return x;
 }
@@ -4588,12 +4605,14 @@ Value* eval(Value* exp, Value* env) {
   Value *chk = 0, *proto = 0, *result = 0;
   ODD_S_FRAME(exp, env, new_env, chk, proto, result);
   new_env = make_env(env);
+
   Compiler cc(*this, NULL, new_env);
   chk = cc.compile(exp, true);
   ODD_CHECK(chk);
   proto = cc.end();
   return apply(proto, 0, 0);
 }
+
 }; // State
 
 ///// GARBAGE COLLECTOR TRACKING IMPLEMENTATION

@@ -32,17 +32,77 @@ static void print_help(char** argv) {
         << help << std::endl;
 }
 
+void print_module_name(std::ostream& ss, Value* x) {
+  String* n = static_cast<String*>(x);
+  const char* d = n->string_data();
+  for(size_t i = 1; i < n->string_length(); i++) {
+    ss << (d[i] == '#' ? '.' : d[i]);
+  }
+}
+
 void repl() {
   char *line = 0;
+  size_t linenumber = 0;
+  
+  // Well this is horrifying
+  State& state = *::state;
 
-  std::ostringstream ss; 
-  State::Compiler cc(*state, NULL);
+  State::Compiler cc(state, NULL);
+  cc.enter_module(state.table_get(*(state.user_module), state.global_symbol(State::S_MODULE_NAME)));
 
-  ss << "> ";
+  Handle<Symbol> module_name(state, (Symbol*) state.table_get(*(cc.env), state.global_symbol(State::S_MODULE_NAME)));
 
-  while((line = linenoise(ss.str().c_str())) != NULL) {
-    printf("yecho\n");
+  while(1) {
+    cc.clear();
+
+    // I tried writing directly to std::cout but it appears to cause some odd behavior in conjunction with linenoise
+    std::ostringstream prompt;
+    print_module_name(prompt, *module_name);
+    prompt << ' ' << ++linenumber << "> ";
+
+    line = linenoise(prompt.str().c_str());
+    if(!line) break;
+
+    std::ostringstream sd;
+    sd << "repl:";
+    print_module_name(sd, *module_name);
+    unsigned file = state.register_string(sd.str(), line);
+
+    std::stringstream ln;
+    ln << std::noskipws;
+    ln << line;
+
     free(line);
+
+    State::Reader reader(state, ln, file);
+    reader.line = linenumber;
+    
+    Value* x = 0, *check = 0;
+    Prototype* proto = 0;
+    ODD_FRAME(x, check, proto);
+    bool success = true;
+    while(1) {
+      x = reader.read();
+      if(x == ODD_EOF) break;
+      if(x->active_exception()) {
+        std::cerr << "Reader error: " << x->exception_message() << std::endl;
+        success = false;
+        break;
+      }
+      check = cc.compile(x);
+      if(check->active_exception()) {
+        std::cerr << check << std::endl;
+        success = false;
+        break;
+      }
+    }
+    if(success) { 
+      proto = cc.end();
+      x = state.apply(proto, 0, 0);
+      if(x != ODD_UNSPECIFIED) 
+        std::cout << x << std::endl;
+    }
+    module_name = (Symbol*) state.table_get(*cc.env, state.global_symbol(State::S_MODULE_NAME));
   }
 }
 
