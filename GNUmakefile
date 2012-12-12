@@ -1,4 +1,5 @@
 CXXFLAGS := -O2 -Wall -g3 -fno-rtti -fno-exceptions 
+CPPFLAGS := -DODD_VERSION='"$(shell git rev-parse --short HEAD)"'
 LDFLAGS := 
 
 -include site.mk

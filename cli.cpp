@@ -21,7 +21,9 @@ static const char help[] = \
   "  -T                  run built-in runtime test suite\n" \
   "  -h                  print this help message\n" \
   "  -R                  open a REPL\n" \
-  "  -V                  give version information\n" \
+  "  -Z                  toggle tail call optimization\n" \
+  "  -V                  toggle runtime trace (noisy)\n" \
+  "  -v                  give version information\n" \
   "behavior:\n" \
   "  if no arguments are given, odd will open a REPL\n"\
   "  if filenames are given, odd will evalute the files and exit\n"\
@@ -32,6 +34,8 @@ static void print_help(char** argv) {
         << help << std::endl;
 }
 
+// Convert internal module names to normal names
+// #scheme#base => scheme.base
 void print_module_name(std::ostream& ss, Value* x) {
   String* n = static_cast<String*>(x);
   const char* d = n->string_data();
@@ -85,13 +89,13 @@ void repl() {
       x = reader.read();
       if(x == ODD_EOF) break;
       if(x->active_exception()) {
-        std::cerr << "Reader error: " << x->exception_message() << std::endl;
+        std::cerr << "Reader error: " << x->exception_message()->string_data() << std::endl;
         success = false;
         break;
       }
       check = cc.compile(x);
       if(check->active_exception()) {
-        std::cerr << check << std::endl;
+        std::cerr << "Compiler error: " << check->exception_message()->string_data() << std::endl;
         success = false;
         break;
       }
@@ -116,6 +120,9 @@ int main(int argc, char** argv) {
         switch(arg[1]) {
           case 'h': print_help(argv); continue;
           case 'T': test(); continue;
+          case 'V': state->trace = !state->trace; continue;
+          case 'Z': state->optimize_tail_calls = !state->optimize_tail_calls; continue;
+          case 'v': std::cout << "odd 0.1 " << ODD_VERSION << std::endl; continue;
           default:
             std::cerr << "!!! unknown option " << argv[i] << std::endl;
             print_help(argv);
@@ -126,6 +133,7 @@ int main(int argc, char** argv) {
       // File name
       Value* chk = state->load_file(arg.c_str());
       if(chk->active_exception()) {
+        state->print_stack_trace(std::cout);
         std::cout << "ERROR: " << chk->exception_message()->string_data() << std::endl;
         return EXIT_FAILURE;
       }

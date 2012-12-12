@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
 #include <limits>
 #include <fstream>
 #include <sstream>
@@ -132,10 +133,13 @@ inline std::ostream& operator<<(std::ostream& os, FriendlySize f) {
   return os << f.s << ending;
 }
 
+// Warning: do not change structure without changing how compiler encodes debuginfo
 struct SourceInfo {
   SourceInfo(): file(0), line(0) {}
   unsigned file, line;
 };
+
+typedef std::pair<unsigned, SourceInfo> debug_t;
 
 ///// (OBJ) Object representation 
 
@@ -860,12 +864,19 @@ struct Block {
   }
 };
 
+// Actual heap
 std::vector<Block*> blocks;
+// Garbage collector root set
 Handle<Value>* handle_list;
 std::vector<VMFrame*> vm_frames;
 Frame* frame_list;
+// Print a bunch of messages about compiler, virtual machine, etc, only works with ODD_DEBUG
 bool trace;
+// Does exactly what it says. Helpful for flushing out garbage collector bugs. Expensive.
 bool collect_before_every_allocation;
+// If false, will not optimize tail calls. Handy for debugging purposes.
+bool optimize_tail_calls;
+// Garbage collector data
 int mark_bit;
 size_t heap_size, block_cursor, live_at_last_collection, collections;
 char* sweep_cursor;
@@ -1483,7 +1494,7 @@ void compact() {
 State(): 
   // Garbage collector
   handle_list(0), frame_list(0), 
-  trace(false), collect_before_every_allocation(false), mark_bit(1),
+  trace(false), collect_before_every_allocation(false), optimize_tail_calls(true), mark_bit(1),
   heap_size(ODD_HEAP_ALIGNMENT),
   block_cursor(0),  live_at_last_collection(0), collections(0),
   sweep_cursor(0),
@@ -3041,6 +3052,9 @@ struct Compiler {
     else env = env_;
 
     if(parent) escaped_variables = (*parent->escaped_variables);
+    else {
+      name = state.make_string("<toplevel>");
+    }
   }
 
   ~Compiler() {}
@@ -3052,7 +3066,7 @@ struct Compiler {
   std::vector<size_t> code;
   // A vector containing combinations of instruction offsets and source
   // location info for debugging and tracebacks
-  std::vector<std::pair<unsigned, SourceInfo> > debuginfo;
+  std::vector<debug_t> debuginfo;
   // A vector containing free variable locations
   std::vector<FreeVariableInfo> free_variables;
   unsigned local_free_variable_count, upvalue_count;
@@ -3138,9 +3152,10 @@ struct Compiler {
     SourceInfo src;
     unwrap_source_info(exp, src);
     if(src.file) {
-      unsigned insn = code.size() - 1;
-      std::pair<unsigned, SourceInfo> dbg(insn, src);
+      unsigned insn = code.size() ? (code.size() - 1) : 0;
+      debug_t dbg(insn, src);
       debuginfo.push_back(dbg);
+      ODD_CC_MSG("annotate " << insn << ' ' << dbg.second.file << ':' << dbg.second.line);
     }
   }
 
@@ -3467,7 +3482,7 @@ restart:
     Table *new_env = 0;
     Value *args = 0, *body = 0, *arg = 0;
     Prototype* proto = 0;
-    ODD_FRAME(exp, new_env, args, arg, body, proto);
+    ODD_FRAME(exp, name, new_env, args, arg, body, proto);
 
     // Create a new environment for the function with the current environment
     // as its parent
@@ -4059,14 +4074,19 @@ restart:
     ODD_CC_EMIT("return");
     Prototype* p = 0;
 
-    Blob* codeblob = 0, *localfreevars = 0, *upvals = 0;
-    ODD_FRAME(p, codeblob, localfreevars, upvals);
+    Blob* codeblob = 0, *localfreevars = 0, *upvals = 0, *dbginfo = 0;
+    ODD_FRAME(p, codeblob, localfreevars, upvals, dbginfo);
     p = state.allocate<Prototype>();
     // Copy some data from the compiler to Scheme blobs
     codeblob = state.make_blob<size_t>(code.size());
     memcpy(codeblob->data, &code[0], code.size() * sizeof(size_t));
     p->code = codeblob;
 
+    dbginfo = state.make_blob<debug_t>(debuginfo.size());
+    memcpy(dbginfo->data, &debuginfo[0], debuginfo.size() * sizeof(debug_t));
+    p->debuginfo = dbginfo;
+    // print debug info
+    
     // Free variable handling
     localfreevars = state.make_blob<unsigned>(local_free_variable_count);
     upvals = state.make_blob<UpvalLoc>(upvalue_count);
@@ -4136,6 +4156,7 @@ return res; }
 // Check for exceptions and unwind the stack if necessary
 #define VM_CHECK(x) \
 if(x->active_exception()) { \
+  push_stack_trace((prototype), (ip)); \
   VM_RETURN(x); \
 }
 
@@ -4167,12 +4188,47 @@ struct VMFrame {
 };
 
 // Evaluation errors
-Value* arity_error() {
-  return make_exception(State::S_ODD_EVAL, "function got bad amount of arguments");
+void print_stack_trace(std::ostream& os) {
+  for(size_t i = stack_trace.size(); i--;) {
+    os << stack_trace[i] << std::endl;
+  }
 }
 
-Value* bad_application() {
-  return make_exception(State::S_ODD_EVAL, "attempt to apply non-function");
+void push_stack_trace(Prototype* p, unsigned ip) {
+  // Debuginfo is a blob containing structs with 3 unsigned integers.
+
+  // The compiler spits these out as it compiles expressions. The first integer describes the instruction pointer,
+  // and the second describe file and line information.
+
+  // So we go back and find the integer that is closest to (but not over) the CURRENT instruction pointer, and that
+  // source code information is used to print a descriptive stack trace.
+
+  SourceInfo info;
+  bool found = false;
+  for(size_t i = 0; i < p->debuginfo->blob_length<debug_t>(); i++) {
+    debug_t debug = p->debuginfo->blob_ref<debug_t>(i);
+    if(ip < debug.first) break;
+    info = debug.second;
+    found = true;
+//    std::cout << "debug triplet: " << debug[i][0] << ' ' << debug[i][1] << ' ' << debug[i][2] << std::endl;
+  }
+  if(found) {
+    std::ostringstream out;
+    out << source_names[info.file] << ':' << info.line << ' ' << (p->name ? p->name->string_data() : "anonymous") << ' ';
+    std::string ln(source_contents[info.file]->at(info.line-1));
+    // Erase beginning spaces
+    ln.erase(ln.begin(), std::find_if(ln.begin(), ln.end(), std::not1(std::ptr_fun<int, int>(std::isspace))));
+    out << '"' << ln << '"';
+    stack_trace.push_back(out.str());
+  }
+}
+
+void push_stack_trace(const std::string& str) {
+  stack_trace.push_back(str);
+}
+
+Value* arity_error() {
+  return make_exception(State::S_ODD_EVAL, "function got bad amount of arguments");
 }
 
 Value* expected_applicable(const std::string& name, size_t arg_number,
@@ -4354,19 +4410,22 @@ Value* vm_apply(Prototype* prototype, Closure* closure, size_t argc,
         VM_RETURN(ret);
       }
       case OP_TAIL_APPLY: {
-        // Retrieve argument count
-        size_t argc = wc[ip++];
-        ODD_VM_VMSG("tail-apply " << argc);
-        // Pop the function, which should be at the top of the stack
-        Value* fn = f.stack[f.si-1];
-        f.si--;
-        vm_trampoline_arguments.clear();
-        for(size_t i = 0; i != argc; i++) {
-          vm_trampoline_arguments.push_back(f.stack[f.si-argc+i]);
+        // TODO: Debug-only?
+        if(optimize_tail_calls) {
+          // Retrieve argument count
+          size_t argc = wc[ip++];
+          ODD_VM_VMSG("tail-apply " << argc);
+          // Pop the function, which should be at the top of the stack
+          Value* fn = f.stack[f.si-1];
+          f.si--;
+          vm_trampoline_arguments.clear();
+          for(size_t i = 0; i != argc; i++) {
+            vm_trampoline_arguments.push_back(f.stack[f.si-argc+i]);
+          }
+          vm_trampoline_function = fn;
+          trampoline = true;
+          VM_RETURN(ODD_UNSPECIFIED);
         }
-        vm_trampoline_function = fn;
-        trampoline = true;
-        VM_RETURN(ODD_UNSPECIFIED);
       }
       case OP_APPLY: {
         // Retrieve argument count
@@ -4434,7 +4493,9 @@ tail:
         args = &vm_trampoline_arguments[0];
         frames_lost++;
         goto tail;
-      } else return result;
+      } else {
+        return result;
+      }
     case NATIVE_FUNCTION: {
       NativeFunction::ptr_t ptr =
         static_cast<NativeFunction*>(function)->pointer;
@@ -4442,11 +4503,19 @@ tail:
                  static_cast<NativeFunction*>(function)->closure);
     }
     default:
-      ODD_FAIL("attempt to apply bad type" << function->get_type());
+      if(frames_lost) {
+        std::ostringstream lost;
+        lost << "Lost " << frames_lost << " stack frames to tail call optimization.";
+        push_stack_trace(lost.str());
+      }
+      std::ostringstream desc;
+      desc << "attempt to apply non-function " << prototype;
+      return make_exception(State::S_ODD_EVAL, desc.str());
   }
   return ODD_UNSPECIFIED;
 } 
 
+#undef VM_POP_FRAME
 #undef VM_RETURN
 #undef VM_CHECK
 
@@ -4455,9 +4524,10 @@ Handle<Table> modules;
 std::vector<std::string> module_search_paths;
 // compiler used for one-off evals, etc
 Compiler* toplevel_cc;
+std::vector<std::string> stack_trace;
 
 // Convert a Scheme module name into a string
-// (scheme base) => "#scheme.base"
+// [scheme base] => "#scheme.base"
 // scheme => "#scheme"
 Value* convert_module_name(Value* spec) {
   std::ostringstream out;
