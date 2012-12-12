@@ -2783,8 +2783,14 @@ Value* read() {
       case TK_RBRACE: return parse_error("unexpected '}'");
       case TK_LPAREN: return parse_error("unexpected '('");
       case TK_RBRACKET: return parse_error("unexpected ']'");
-      default:std::cerr << "unexpected character " << (int)token << ' '  << (char)token << std::endl;
+      case TK_DOT: return parse_error("unexpected '.'");
       case TK_LOOKAHEAD: ODD_ASSERT(false);
+      default: {
+        std::ostringstream os;
+        os << "unexpected character '" << (char) token << '\'';
+        return parse_error(os.str());
+      }
+                        std::cerr << "unexpected character " << (int)token << ' '  << (char)token << std::endl;
     }
     ODD_ASSERT(false);
   }
