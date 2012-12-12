@@ -112,6 +112,7 @@ void repl() {
 
 int main(int argc, char** argv) {
   state = new State;
+  state->module_search_paths.push_back("./");
   // Parse options
   for(int i = 1; i < argc; i++) {
     std::string arg(argv[i]);

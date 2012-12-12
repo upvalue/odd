@@ -3019,7 +3019,7 @@ void env_lookup(Table* env, Value* key, Lookup& lookup, bool search_exports = fa
   // Check for unqualified imports
   if(table_has_key(env, global_symbol(S_UNQUALIFIED_IMPORTS))) {
     Vector* modules = ODD_CAST(Vector, table_get(env, global_symbol(S_UNQUALIFIED_IMPORTS), found));
-    for(size_t i = modules->vector_length() - 1; i != ((size_t)0)-1; i--) {
+    for(size_t i = modules->vector_length(); i--;) {
       Lookup sublookup;
       Table* exports = ODD_CAST(Table, table_get(ODD_CAST(Table, modules->vector_ref(i)), global_symbol(S_EXPORTS)));
 
@@ -4633,7 +4633,7 @@ Value* load_module(String* name) {
   }
   path += ".odd";
 
-  if(!module_search_paths.size())
+  if(!module_search_paths.size()) 
     ODD_FAIL("no module search paths added (try state.module_search_paths.push_back(\"./\"); before attempting to load modules");
 
   for(size_t i = module_search_paths.size(); i != 0; i--) {
@@ -4656,7 +4656,7 @@ Value* load_module(String* name) {
   }
 
   std::ostringstream ss;
-  ss << "failed to find module " << path;
+  ss << "failed to find file " << path;
   ss << " searched paths [";
   for(size_t i = 0; i != module_search_paths.size(); i++) {
     ss << module_search_paths[i] << (i != (module_search_paths.size() - 1) ? " " : "");

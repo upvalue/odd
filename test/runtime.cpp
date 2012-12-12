@@ -299,9 +299,6 @@ void test_compiler(State& state) {
                    "import { macro-test } macro-test.hello3() hello3-var", ODD_TRUE);
   //state.trace = true;
   test_eval(state, "[module [aif-def]] defsyntax(aif x e) { list(list('lambda 'it list('brace list('if 'it synclo(e list-ref(x 2) '[it]) synclo(e list-ref(x 3))))) synclo(e list-ref(x 1))) } [module [aif-use]] import { aif-def } aif-def.aif(#t it #f)", ODD_TRUE);
-  //test_eval(state, "[module [macro-test]] defsyntax(hello3 x e) { synclo(e '[def hello3-var #t]) }", ODD_TRUE);
-  // [module [hello3-test]] "
-  //                 "import { macro-test } macro-test.hello3() hello3-var", ODD_TRUE);
 
   state.trace = false;
 
