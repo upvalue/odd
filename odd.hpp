@@ -1542,7 +1542,7 @@ State():
     "#odd#eval",
     "#odd#table",
     // Special forms
-    "define",
+    "def",
     "access",
     "set",
     "brace",
@@ -1579,7 +1579,7 @@ State():
   // Initialize core environment for compiler
   core_module = make_env(ODD_FALSE, "#odd#core");
 
-  for(size_t i = S_DEFINE; i != S_PRIVATE+1; i++) {
+  for(size_t i = S_DEF; i != S_PRIVATE+1; i++) {
     env_define(*core_module, global_symbol(static_cast<Global>(i)),
                global_symbol(S_SPECIAL), true);
   }
@@ -1637,7 +1637,7 @@ enum Global {
   S_ODD_EVAL,
   S_ODD_TABLE,
   // Special forms
-  S_DEFINE,
+  S_DEF,
   S_ACCESS,
   S_SET,
   S_BRACE,
@@ -3370,7 +3370,7 @@ struct Compiler {
     // process if this define is a function definition
 restart:
     Value* chk = 0;
-    if(argc != 2) return arity_error(S_DEFINE, exp, 2, argc);
+    if(argc != 2) return arity_error(S_DEF, exp, 2, argc);
     Value* name = unbox(exp->cadr());
     Value* args = 0;
 
@@ -3997,7 +3997,7 @@ recur:
             // Dispatch on the special form
             Symbol* op = ODD_CAST(Symbol, function);
             // define
-            if(op == state.global_symbol(S_DEFINE)) {
+            if(op == state.global_symbol(S_DEF)) {
               return compile_define(argc, exp, tail);
             // set
             } else if(op == state.global_symbol(S_SET)) {
