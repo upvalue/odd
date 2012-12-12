@@ -3614,6 +3614,27 @@ restart:
 
     return ODD_FALSE;
   }
+  
+  // For quote: strip syntactic closures and boxes, neither of which should appear in end-user code.
+  Value* strip_syntax(Value* exp) {
+    Value *car=0, *cdr=0;
+    ODD_FRAME(exp, car, cdr);
+recur:
+    switch(exp->get_type()) {
+      case SYNCLO:
+        exp = exp->synclo_expr();
+        goto recur;
+      case BOX:
+        exp = exp->box_value();
+        goto recur;
+      case PAIR:
+        car = strip_syntax(exp->car());
+        cdr = strip_syntax(exp->cdr());
+        exp = state.cons(car, cdr);
+        return exp;
+      default: return exp;
+    }
+  }
 
   Value* compile_quote(size_t argc, Value* exp) {
     if(argc != 1) return arity_error(S_QUOTE, exp, 1, argc);
@@ -3622,7 +3643,8 @@ restart:
       return compile(exp->cadr());
     } else {
       // Everything else is a constant
-      push_constant(unbox(exp->cadr()));
+      Value* x = strip_syntax(exp->cadr());
+      push_constant(x);
       return ODD_FALSE;
     }
   }
