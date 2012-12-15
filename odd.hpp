@@ -268,6 +268,11 @@ struct Value {
     header += bit;
   }
 
+  void unset_header_bit(Type type, int bit) {
+    ODD_ASSERT(get_type() == type);
+    header -= bit;
+  }
+
   // Set the header's type and mark (for the garbage collector)
   void set_header_unsafe(unsigned char type, bool mark, size_t mark_bit) {
     header = (mark ? (mark_bit << 8) : (!mark_bit << 8)) + type;
@@ -291,6 +296,7 @@ struct Value {
 
   // Type specific methods: simple getters and setters, object flags
 
+  static Value* to_boolean(bool i) { return i ? ODD_TRUE : ODD_FALSE; }
   // Fixnums
 
   static Value* make_fixnum(ptrdiff_t n) { return (Value*) ((n << 1) + 1); }
@@ -1537,10 +1543,11 @@ State():
     "#exporting",
     "#export-parent",
     // Exception tags
-    "#odd#read",
-    "#odd#compile",
-    "#odd#eval",
-    "#odd#table",
+    "odd-read",
+    "odd-compile",
+    "odd-eval",
+    "odd-table",
+    "odd-syntax",
     // Special forms
     "def",
     "access",
@@ -1636,6 +1643,7 @@ enum Global {
   S_ODD_COMPILE,
   S_ODD_EVAL,
   S_ODD_TABLE,
+  S_ODD_SYNTAX,
   // Special forms
   S_DEF,
   S_ACCESS,
@@ -2283,9 +2291,10 @@ struct Reader {
   std::string token_buffer;
 
   // Error handling
-  Token lex_error(const std::string& msg) {
+  Token lex_error(const std::string& msg, size_t sline = 0) {
     std::ostringstream ss;
-    ss << state.source_names[file] << ':' << line << ": " << msg;
+    if(!sline) sline = line;
+    ss << state.source_names[file] << ':' << sline << ": " << msg;
     token_value = state.make_exception(State::S_ODD_READ, ss.str());
     return TK_EXCEPTION;
   }
@@ -2415,9 +2424,10 @@ struct Reader {
         // Strings
         case '"': {
           token_buffer.clear();
+          size_t sline = line;
           while((c = getc())) {
             if(c == EOF) {
-              return lex_error("unexpected end of file in string");
+              return lex_error("unexpected end of file in string", sline);
             } else if(c == '"') {
               token_value = state.make_string(token_buffer);
               return TK_STRING;
@@ -2435,9 +2445,10 @@ struct Reader {
             case EOF: return lex_error("unexpected EOF after #");
             case '\n': return lex_error("unexpected newline after #");
             default: {
-              std::string msg = "unknown read syntax \'";
+              std::string msg = "did not expect \'";
               msg += c;
               msg += '\'';
+              msg += " after #";
               return lex_error(msg);
             }
           }
@@ -3959,6 +3970,11 @@ recur:
         push();
         ODD_CC_EMIT("push-immediate " << exp);
         break;
+      // Non-immediate but literal constants
+      case STRING:
+        push_constant(exp);
+        ODD_CC_EMIT("push-constant " << exp);
+        break;
       // Variable references
       case SYMBOL:
       case BOX: {
@@ -4543,6 +4559,15 @@ tail:
   return ODD_UNSPECIFIED;
 } 
 
+// Apply with no arguments
+Value* apply(Value* fn) { return apply(fn, 0, NULL); }
+
+Value* apply(Value* fn, Value* arg1) {
+  safestack.clear();
+  safestack.push_back(arg1);
+  return apply(fn, 1, &safestack[0]);
+}
+
 #undef VM_POP_FRAME
 #undef VM_RETURN
 #undef VM_CHECK
@@ -4819,7 +4844,7 @@ inline std::ostream& operator<<(std::ostream& os, Value* x) {
         }
         return os << ')';
     case PAIR: {
-      os << '(' << x->car();
+      os << '[' << x->car();
       for(x = x->cdr(); x->get_type() == PAIR; x = x->cdr()) {
         os << ' ' << x->car();
       }
@@ -4827,7 +4852,7 @@ inline std::ostream& operator<<(std::ostream& os, Value* x) {
       if(x != ODD_NULL) {
         os << " . " << x;
       }
-      return os << ')';
+      return os << ']';
     }  
     case BOX: {
       // If it has source info then it's some value wrapped by the reader
@@ -4887,6 +4912,20 @@ inline std::ostream& operator<<(std::ostream& os, Value* x) {
     return state.expected_applicable(fn_name, (number), \
                                      args[(number)]->get_type()); \
   }
+
+// Check for maximum arguments; not necessary for fixed-arity functions but useful for functions which accept optional,
+// but not unlimited arguments
+#define ODD_MAX_ARITY(expect) \
+  if((argc) > (expect)) { \
+    std::ostringstream ss; \
+    ss << fn_name << " expceted no more than " << (expect) << " arguments, but got " << (argc); \
+    return state.make_exception(State::S_ODD_EVAL, ss.str()); \
+  }
+    
+
+ODD_FUNCTION(eq) {
+  return Value::to_boolean(args[0] == args[1]);
+}
 
 ODD_FUNCTION(car) {
   static const char* fn_name = "car";
@@ -4950,6 +4989,7 @@ ODD_FUNCTION(apply_macro) {
 
 ODD_FUNCTION(synclo) {
   const char* fn_name = "synclo";
+  ODD_MAX_ARITY(3);
   ODD_CHECK_TYPE(TABLE, 0);
   Synclo* c = 0;
   Value* env = ODD_CAST(Table, args[0]);
@@ -4961,7 +5001,6 @@ ODD_FUNCTION(synclo) {
   c->env = ODD_CAST(Table, args[0]);
   c->expr = state.unbox(args[1]);
   if(argc > 2) {
-    if(argc > 3) ODD_FAIL("too many arguments");
     ODD_CHECK_TYPE(PAIR, 2);
     v = state.make_vector();
     while(vars->get_type() == PAIR) {
@@ -4974,13 +5013,70 @@ ODD_FUNCTION(synclo) {
   return c;
 }
 
+ODD_FUNCTION(string_to_symbol) {
+  const char* fn_name = "string->symbol";
+  ODD_CHECK_TYPE(STRING, 0);
+  return state.make_symbol(ODD_CAST(String, args[0]));
+}
+
+ODD_FUNCTION(throw_) {
+  const char* fn_name = "throw";
+  ODD_CHECK_TYPE(SYMBOL, 0);
+  ODD_CHECK_TYPE(STRING, 1);
+  ODD_MAX_ARITY(3);
+
+  Value* tag = args[0], *message = args[1], *irritants = args[2];
+  Value* exc = 0;
+
+  ODD_FRAME(tag, message, irritants, exc);
+  exc = state.make_exception(ODD_CAST(Symbol, tag), ODD_CAST(String, message), irritants);
+  return exc;
+}
+
+ODD_FUNCTION(catch_) {
+  const char* fn_name = "catch";
+  if(args[0] != 0) {
+    ODD_CHECK_TYPE(SYMBOL, 0);
+  }
+  ODD_CHECK_APPLICABLE(1);
+  ODD_CHECK_APPLICABLE(2);
+  Symbol* tag = static_cast<Symbol*>(args[0]);
+  Value* try_thunk = args[1], *except_thunk = args[2];
+  Value* result = 0, *result2 = 0;
+  ODD_FRAME(tag, try_thunk, except_thunk, result, result2);
+
+  result = state.apply(try_thunk);
+  if(!result->active_exception()) return result;
+  // Check whether this particular exception should be handled or not
+  if(!(tag == ODD_FALSE || tag == result->exception_tag())) return result;
+  // Now deactivate the exception for handling
+  result->unset_header_bit(EXCEPTION, Value::EXCEPTION_ACTIVE_BIT);
+  
+  std::cout << ((Prototype*) except_thunk)->arguments << std::endl;
+  result2 = state.apply(except_thunk, result);
+  
+  return result2;  
+}
+
 inline void State::initialize_builtin_functions() {
+  // comparison & predicates
+  defun("=", &eq, 2, false);
+
+  // pairs & lists
   defun("car", &car, 1, false);
   defun("cdr", &cdr, 1, false);
   defun("list", &list, 0, true);
   defun("list-ref", &list_ref, 2, false);
 
+  // macros
   defun("synclo", &synclo, 2, true);
+
+  // symbols
+  defun("string->symbol", &string_to_symbol, 1, false);
+  
+  // exceptions
+  defun("throw", &throw_, 2, true);
+  defun("catch", &catch_, 3, false);
 }
 
 } // odd

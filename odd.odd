@@ -1,9 +1,0 @@
-// odd.odd - Basic odd language functionality
-// Includes macros, pattern matching, records, syntactic sugar
-
-[public]
-
-define(unspecified if(#f #f))
-
-defun(not x) { eq?(x #f) }
-

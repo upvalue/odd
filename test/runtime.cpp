@@ -302,6 +302,9 @@ void test_compiler(State& state) {
 
   state.trace = false;
 
+  // Exceptions
+  test_eval(state, "catch('broken lambda { throw('broken \"It's broken!\" #f) } lambda(e) { #t })", ODD_TRUE);
+
   // test runtime provided eval function
   assert(state.eval(ODD_TRUE, (*state.core_module)) == ODD_TRUE);
 }

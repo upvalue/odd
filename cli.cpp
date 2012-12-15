@@ -120,10 +120,11 @@ int main(int argc, char** argv) {
       if(arg.length() > 1) {
         switch(arg[1]) {
           case 'h': print_help(argv); continue;
+          case 'R': repl(); continue;
           case 'T': test(); continue;
+          case 'v': std::cout << "odd 0.1 " << ODD_VERSION << std::endl; continue;
           case 'V': state->trace = !state->trace; continue;
           case 'Z': state->optimize_tail_calls = !state->optimize_tail_calls; continue;
-          case 'v': std::cout << "odd 0.1 " << ODD_VERSION << std::endl; continue;
           default:
             std::cerr << "!!! unknown option " << argv[i] << std::endl;
             print_help(argv);
