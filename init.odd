@@ -1,0 +1,8 @@
+// init.odd - Basic language functionality
+[module [odd core]]
+
+[private]
+
+[public]
+
+

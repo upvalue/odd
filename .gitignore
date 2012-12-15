@@ -1,3 +1,5 @@
-/pip
-/bench/gc-pip
+/odd
+/bench/gc-odd
 /bench/gc-boehm
+/.gitignore
+/site.mk

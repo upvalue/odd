@@ -1,3 +1,0 @@
-defsyntax(hello x i c) {
-  '[hello]
-}
