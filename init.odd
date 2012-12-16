@@ -1,7 +1,26 @@
 // init.odd - Basic language functionality
 [module [odd core]]
 
-[private]
+def(not lambda(x) {
+  =(x #f)
+})
+
+defsyntax(let x e) {
+  // let(x 1) { x } => [[lambda [x] x] 1]
+  if(not(=(length(x 4)))) {
+    syntax-error(x "Expected exactly 3 arguments to let")
+  }
+
+}
+
+def(qq-list lambda(lst) {
+  if(pair?(lst)) {
+    
+  } {
+
+  }
+})
 
 [public]
 
+def(not not)

@@ -44,7 +44,12 @@ void print_module_name(std::ostream& ss, Value* x) {
   }
 }
 
+void print_version_number() {
+  std::cout << "odd 0.1 " << ODD_VERSION << std::endl;
+}
+
 void repl() {
+  print_version_number();
   char *line = 0;
   size_t linenumber = 0;
   
@@ -122,7 +127,7 @@ int main(int argc, char** argv) {
           case 'h': print_help(argv); continue;
           case 'R': repl(); continue;
           case 'T': test(); continue;
-          case 'v': std::cout << "odd 0.1 " << ODD_VERSION << std::endl; continue;
+          case 'v': print_version_number(); continue;
           case 'V': state->trace = !state->trace; continue;
           case 'Z': state->optimize_tail_calls = !state->optimize_tail_calls; continue;
           default:

@@ -1548,6 +1548,7 @@ State():
     "odd-eval",
     "odd-table",
     "odd-syntax",
+    "odd-type",
     // Special forms
     "def",
     "access",
@@ -1562,6 +1563,7 @@ State():
     "import",
     "public",
     "private",
+    "export",
     // Other
     "quasiquote",
     "unquote",
@@ -1644,6 +1646,7 @@ enum Global {
   S_ODD_EVAL,
   S_ODD_TABLE,
   S_ODD_SYNTAX,
+  S_ODD_TYPE,
   // Special forms
   S_DEF,
   S_ACCESS,
@@ -1658,6 +1661,7 @@ enum Global {
   S_IMPORT,
   S_PUBLIC,
   S_PRIVATE,
+  S_EXPORT,
   // End special forms
   S_QUASIQUOTE,
   S_UNQUOTE,
@@ -2926,9 +2930,7 @@ void env_define(Table* table, Value* key, Value* value, bool exported = false) {
     if(exported) table_set(exports, key, value);
   } else {
     chk = table_insert(table, key, value);
-    if(exported) {
-      table_insert(exports, key, value);
-    }
+    if(exported) table_insert(exports, key, value);
   }
   ODD_ASSERT(!chk->active_exception());
 }
@@ -3647,7 +3649,7 @@ recur:
       case PAIR:
         car = strip_syntax(exp->car());
         cdr = strip_syntax(exp->cdr());
-        exp = state.cons(car, cdr);
+        exp = state.cons_source(car, cdr, exp);
         return exp;
       default: return exp;
     }
@@ -3747,7 +3749,7 @@ recur:
     // Syntax
     state.safestack.clear();
     // First argument is the expression
-    state.safestack.push_back(exp);
+    state.safestack.push_back(strip_syntax(exp));
     // Second argument is the usage environment of the macro, for creating syntactic closures with.
     state.safestack.push_back(*env);
 
@@ -3955,6 +3957,8 @@ recur:
     return ODD_FALSE;
   }
 
+  // Handle an export statement
+
   // Compile a single expression, returns #f or an error if one occurred
   Value* compile(Value* exp, bool tail = false) {
     ODD_CC_MSG("compile expression " << exp);
@@ -4032,6 +4036,9 @@ recur:
             } else if(op == state.global_symbol(S_PRIVATE)) {
               state.table_set(*env, state.global_symbol(S_EXPORTING), ODD_FALSE);
               return ODD_FALSE;
+            } else if(op == state.global_symbol(S_EXPORT)) {
+              return compile_export(argc, exp);
+            }
             // access
             } else if(op == state.global_symbol(S_ACCESS)) {
               return compile_access_ref(argc, exp);
@@ -4254,15 +4261,17 @@ void push_stack_trace(Prototype* p, unsigned ip) {
     if(ip < debug.first) break;
     info = debug.second;
     found = true;
-//    std::cout << "debug triplet: " << debug[i][0] << ' ' << debug[i][1] << ' ' << debug[i][2] << std::endl;
   }
   if(found) {
     std::ostringstream out;
     out << source_names[info.file] << ':' << info.line << ' ' << (p->name ? p->name->string_data() : "anonymous") << ' ';
-    std::string ln(source_contents[info.file]->at(info.line-1));
-    // Erase beginning spaces
-    ln.erase(ln.begin(), std::find_if(ln.begin(), ln.end(), std::not1(std::ptr_fun<int, int>(std::isspace))));
-    out << '"' << ln << '"';
+    // Source code may not be available (eg REPL)
+    if(source_contents[info.file]->size() >= info.line) {
+      std::string ln(source_contents[info.file]->at(info.line-1));
+      // Erase beginning spaces
+      ln.erase(ln.begin(), std::find_if(ln.begin(), ln.end(), std::not1(std::ptr_fun<int, int>(std::isspace))));
+      out << '"' << ln << '"';
+    }
     stack_trace.push_back(out.str());
   }
 }
@@ -4280,7 +4289,13 @@ Value* expected_applicable(const std::string& name, size_t arg_number,
   std::stringstream out;
   out << name << " expected argument " << arg_number+1
       << " to be applicable, but got " << got;
-  return make_exception(State::S_ODD_EVAL, out.str());
+  return make_exception(State::S_ODD_TYPE, out.str());
+}
+
+Value* expected_list(const std::string& name, size_t arg_number, Value* lst) {
+  std::ostringstream out;
+  out << name << " expected argument " << arg_number+1 << " to be a list";
+  return make_exception(State::S_ODD_TYPE, out.str());
 }
 
 Value* type_error(const std::string& name, size_t arg_number,
@@ -4288,7 +4303,7 @@ Value* type_error(const std::string& name, size_t arg_number,
   std::ostringstream out;
   out << name << " expected argument " << arg_number+1 << " to be " << 
     expected << " but got " << got << " (" << argument << ')';
-  return make_exception(State::S_ODD_EVAL, out.str());
+  return make_exception(State::S_ODD_TYPE, out.str());
 }
 
 // Apply Scheme function
@@ -4470,6 +4485,7 @@ Value* vm_apply(Prototype* prototype, Closure* closure, size_t argc,
           trampoline = true;
           VM_RETURN(ODD_UNSPECIFIED);
         }
+        // Note: Falls through to OP_APPLY if tail calls are disabled
       }
       case OP_APPLY: {
         // Retrieve argument count
@@ -4927,6 +4943,28 @@ ODD_FUNCTION(eq) {
   return Value::to_boolean(args[0] == args[1]);
 }
 
+ODD_FUNCTION(fx_gt) {
+  static const char* fn_name = "fx>";
+  ODD_CHECK_TYPE(FIXNUM, 0);
+  ODD_CHECK_TYPE(FIXNUM, 1);
+  return Value::to_boolean(args[0] > args[1]);
+}
+
+ODD_FUNCTION(fx_lt) {
+  static const char* fn_name = "fx<";
+  ODD_CHECK_TYPE(FIXNUM, 0);
+  ODD_CHECK_TYPE(FIXNUM, 1);
+  return Value::to_boolean(args[0] < args[1]);
+}
+
+#define ODD_PREDICATE(name, tipe) ODD_FUNCTION(name) { return Value::to_boolean(args[0]->get_type() == (tipe)); }
+
+ODD_PREDICATE(pairp, PAIR);
+ODD_PREDICATE(symbolp, SYMBOL);
+ODD_PREDICATE(stringp, STRING);
+
+#undef ODD_PREDICATE
+
 ODD_FUNCTION(car) {
   static const char* fn_name = "car";
   ODD_CHECK_TYPE(PAIR, 0);
@@ -4966,6 +5004,21 @@ ODD_FUNCTION(list_ref) {
     head = head->cdr();
   }
   return head ? head->car() : ODD_FALSE;
+}
+
+ODD_FUNCTION(length_) {
+  const char* fn_name = "length";
+  if(args[0] == ODD_NULL) return Value::make_fixnum(0);
+  ODD_CHECK_TYPE(PAIR, 0);
+  Value* lst = args[0];
+  ptrdiff_t num = 0;
+  while(lst->get_type() == PAIR) {
+    num++;
+    if(lst->cdr() == ODD_NULL) break;
+    if(lst->cdr()->get_type() != PAIR) return state.expected_list("length", 0, lst);
+    lst = lst->cdr();
+  }
+  return Value::make_fixnum(num);
 }
 
 ODD_FUNCTION(apply_macro) { 
@@ -5058,15 +5111,41 @@ ODD_FUNCTION(catch_) {
   return result2;  
 }
 
+ODD_FUNCTION(syntax_error) {
+  const char* fn_name = "syntax-error";
+  ODD_CHECK_TYPE(STRING, 1);
+  Value* irritant = args[0];
+  String* message = ODD_CAST(String, args[1]);
+
+  // Attempt to determine source of expression.
+  std::string out;
+  state.format_source_error(irritant, message->string_data(), out);
+  return state.make_exception(State::S_ODD_SYNTAX, out);
+}
+
+ODD_FUNCTION(print) {
+  for(size_t i = 0; i != argc; i++) {
+    std::cout << args[i] << (i == argc-1 ? "" : " ");
+  }
+  std::cout << std::endl;
+}
+
 inline void State::initialize_builtin_functions() {
   // comparison & predicates
   defun("=", &eq, 2, false);
+  defun("fx<", &fx_lt, 2, false);
+  defun("fx>", &fx_gt, 2, false);
+
+  defun("pair?", &pairp, 1, false);
+  defun("string?", &stringp, 1, false);
+  defun("symbol?", &symbolp, 1, false);
 
   // pairs & lists
   defun("car", &car, 1, false);
   defun("cdr", &cdr, 1, false);
   defun("list", &list, 0, true);
   defun("list-ref", &list_ref, 2, false);
+  defun("length", &length_, 1, false);
 
   // macros
   defun("synclo", &synclo, 2, true);
@@ -5074,9 +5153,14 @@ inline void State::initialize_builtin_functions() {
   // symbols
   defun("string->symbol", &string_to_symbol, 1, false);
   
-  // exceptions
+  // exceptions & errors
   defun("throw", &throw_, 2, true);
   defun("catch", &catch_, 3, false);
+
+  defun("syntax-error", &syntax_error, 2, false);
+
+  // input/output
+  defun("print", &print, 1, true);
 }
 
 } // odd
