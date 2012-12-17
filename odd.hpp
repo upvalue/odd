@@ -1274,8 +1274,7 @@ Value* allocate(Type type, size_t size) {
 
 // The actual entry point of the garbage collector
 template <class T> T* allocate(ptrdiff_t additional = 0) {
-  return static_cast<T*>(allocate(static_cast<Type>(T::CLASS_TYPE),
-                         sizeof(T) + additional));
+  return static_cast<T*>(allocate(static_cast<Type>(T::CLASS_TYPE), sizeof(T) + additional));
 }
 
 ///// COMPACTION
@@ -1318,9 +1317,9 @@ static size_t minimum_size(Value* x) {
       // Should not occur
     case TRANSIENT: case FIXNUM: case CONSTANT:
       ODD_FAIL("minimum_size type should not occur: " << x->get_type());
-   }
-   return align(POINTER_ALIGNMENT, size);
- }
+  }
+  return align(POINTER_ALIGNMENT, size);
+}
 
 void update_forward(Value** ref) {
   Value* obj = *ref;
@@ -1588,7 +1587,7 @@ State():
   // Initialize core environment for compiler
   core_module = make_env(ODD_FALSE, "#odd#core");
 
-  for(size_t i = S_DEF; i != S_PRIVATE+1; i++) {
+  for(size_t i = S_DEF; i != S_EXPORT+1; i++) {
     env_define(*core_module, global_symbol(static_cast<Global>(i)),
                global_symbol(S_SPECIAL), true);
   }
@@ -2930,7 +2929,13 @@ void env_define(Table* table, Value* key, Value* value, bool exported = false) {
     if(exported) table_set(exports, key, value);
   } else {
     chk = table_insert(table, key, value);
-    if(exported) table_insert(exports, key, value);
+    if(exported) {
+      if(!table_has_key(exports, key)) {      
+        table_insert(exports, key, value);
+      } else {
+        table_set(exports, key, value);
+      }
+    }
   }
   ODD_ASSERT(!chk->active_exception());
 }
@@ -3957,6 +3962,23 @@ recur:
     return ODD_FALSE;
   }
 
+  Value* compile_export(size_t argc, Value* exp) {
+    Value* lst = exp->cdr();
+    Value* name = 0;
+    Table* exports = 0;
+    ODD_FRAME(lst, name, exp, exports);
+    exports = ODD_CAST(Table, state.table_get(*env, state.global_symbol(S_EXPORTS)));
+    while(lst->get_type() == PAIR) {
+      name = unbox(lst->car());
+      if(name->get_type() == SYMBOL) {
+        if(state.table_has_key(exports, name)) continue;
+        state.table_insert(exports, name, name);
+      }
+      lst = lst->cdr();
+    }
+    return ODD_FALSE;
+  }
+
   // Handle an export statement
 
   // Compile a single expression, returns #f or an error if one occurred
@@ -4038,7 +4060,6 @@ recur:
               return ODD_FALSE;
             } else if(op == state.global_symbol(S_EXPORT)) {
               return compile_export(argc, exp);
-            }
             // access
             } else if(op == state.global_symbol(S_ACCESS)) {
               return compile_access_ref(argc, exp);
@@ -5128,6 +5149,7 @@ ODD_FUNCTION(print) {
     std::cout << args[i] << (i == argc-1 ? "" : " ");
   }
   std::cout << std::endl;
+  return ODD_UNSPECIFIED;
 }
 
 inline void State::initialize_builtin_functions() {

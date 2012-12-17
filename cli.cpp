@@ -138,6 +138,7 @@ int main(int argc, char** argv) {
       }
     } else {
       // File name
+      //std::cout << "Loading file: " << arg.c_str() << std::endl;
       Value* chk = state->load_file(arg.c_str());
       if(chk->active_exception()) {
         state->print_stack_trace(std::cout);

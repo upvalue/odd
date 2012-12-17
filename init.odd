@@ -11,6 +11,15 @@ defsyntax(let x e) {
     syntax-error(x "Expected exactly 3 arguments to let")
   }
 
+  def(name list-ref(x 1))
+  def(value list-ref(x 2))
+  def(body list-ref(x 3))
+
+  if(not(symbol?(name))) {
+    syntax-error(x "Expected first argument to let to be a symbol" name)
+  }
+
+  list(list('lambda name synclo(body e list(name))) synclo(value e))
 }
 
 def(qq-list lambda(lst) {
@@ -23,4 +32,3 @@ def(qq-list lambda(lst) {
 
 [public]
 
-def(not not)

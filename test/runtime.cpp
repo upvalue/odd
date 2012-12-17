@@ -290,6 +290,8 @@ void test_compiler(State& state) {
   test_eval(state, "[module [e]] import { c.* } y", ODD_TRUE);
   // Import function
   test_eval(state, "[module [f]] import { c } c.z()", ODD_TRUE);
+  // Export names manually
+  test_eval(state, "[module [g]] def(horse #t) [export horse] [module [h]] import { g.* } horse", ODD_TRUE);
 
   // Macros
   // simple macro
