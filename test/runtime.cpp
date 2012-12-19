@@ -243,6 +243,9 @@ void test_compiler(State& state) {
   test_eval(state, "lambda { #t }", PROTOTYPE);
   // Simple application
   test_eval(state, "lambda { #t }()", ODD_TRUE);
+  // Internal function definition
+  test_eval(state, "lambda { def(x #t) x }()", ODD_TRUE);
+  test_eval(state, "lambda { def(x #t) lambda { x }() }()", ODD_TRUE);
   // Argument function and application
   test_eval(state, "lambda(x) { x }(#t)", ODD_TRUE);
   // Set!

@@ -406,6 +406,7 @@ struct Value {
 
   // Syntactic closures
   Value* synclo_expr() const;
+  Table* synclo_env() const;
   Value* synclo_escaped_variables() const;
 };
 
@@ -714,6 +715,11 @@ struct Synclo : Value {
 Value* Value::synclo_expr() const {
   ODD_ASSERT(get_type() == SYNCLO);
   return static_cast<const Synclo*>(this)->expr;
+}
+
+Table* Value::synclo_env() const {
+  ODD_ASSERT(get_type() == SYNCLO);
+  return static_cast<const Synclo*>(this)->env;
 }
 
 Value* Value::synclo_escaped_variables() const {
@@ -1730,6 +1736,16 @@ Pair* cons_source(Value* car, Value* cdr, Value* src_exp) {
   }
 }
 
+Pair* list_copy(Value* lst) {
+  Value *lst2head = 0, *lst2tail = 0;
+  ODD_S_FRAME(lst, lst2head, lst2tail);
+  while(lst->get_type() == PAIR) {
+    append_m(&lst2head, &lst2tail, lst->car());
+    lst = lst->cdr();
+  }
+  return static_cast<Pair*>(lst2head);
+}
+
 Blob* make_blob(ptrdiff_t length) {
   Blob* b = allocate<Blob>(array_size<unsigned char>(length));
   b->length = length;
@@ -1846,8 +1862,7 @@ NativeFunction* make_native_function(NativeFunction::ptr_t ptr,
   fn->arguments = arguments;
   fn->closure = closure;
   if(variable_arity)
-    fn->set_header_bit(NATIVE_FUNCTION,
-                       Value::NATIVE_FUNCTION_VARIABLE_ARITY_BIT);
+    fn->set_header_bit(NATIVE_FUNCTION, Value::NATIVE_FUNCTION_VARIABLE_ARITY_BIT);
   return fn;
 }
 
@@ -3070,7 +3085,7 @@ struct Compiler {
     state(state_), parent(parent_),
     local_free_variable_count(0), upvalue_count(0),
     stack_max(0), stack_size(0), locals(0), constants(state), closure(false),
-    name(state_), env(state_), escaped_variables(state_), depth(depth_), last_insn(0) {
+    name(state_), env(state_), synclo_env(state_), synclo_fv(state_), escaped_variables(state_), depth(depth_), last_insn(0) {
 
     if(!env_) env = (*state.core_module);
     else env = env_;
@@ -3102,6 +3117,13 @@ struct Compiler {
   Handle<String> name;
   // The environment of the function
   Handle<Table> env;
+  // These variables exist only when compiling a syntactic closure. 
+
+  // synclo_env is the definition environment of the syntactic closure; it is searched for free variables when they are
+  // encountered
+  Handle<Table> synclo_env;
+  // synclo_fv is a list of symbols introduced by syntactic closures
+  Handle<Pair> synclo_fv;
   // Escaped variables (for macros)
   Handle<Vector> escaped_variables;
   // The depth of the function (for debug message purposes)
@@ -3227,13 +3249,20 @@ struct Compiler {
     return state.make_exception(State::S_ODD_COMPILE, out);
   }
 
-  bool exporting() { return state.table_get(*env, state.global_symbol(S_EXPORTING)); }
+  bool exporting() { return state.env_globalp(*env) && state.table_get(*env, state.global_symbol(S_EXPORTING)); }
 
   // Checks a function to see whether it is a call to a particular special
   // form
   bool check_special_form(Value* form, Global g) {
+    Table* check_env = *env;
     // Quick check to make sure it has the right format and name
-    if(form->get_type() != PAIR) return false;
+    if(form->get_type() != PAIR && form->get_type() != SYNCLO) return false;
+    if(form->get_type() == SYNCLO) {
+      Value* sync = form;
+      form = form->synclo_expr();
+      if(form->get_type() != PAIR) return false;
+      check_env = sync->synclo_env();
+    }
     Value* check = unbox(form->car());
     if(check->get_type() != SYMBOL || check != state.global_symbol(g))
       return false;
@@ -3241,7 +3270,7 @@ struct Compiler {
     // But we still need to do a real lookup because form names could be
     // shadowed by other definitions
     Lookup lookup;
-    state.env_lookup(*env, check, lookup);
+    state.env_lookup(check_env, check, lookup);
     return lookup.success && lookup.scope == REF_GLOBAL &&
       lookup.global.value == state.global_symbol(S_SPECIAL);
   }
@@ -3518,12 +3547,22 @@ restart:
     args = exp->cdr();
     if(args != ODD_NULL) {
       if(args->get_type() != PAIR) 
-        return syntax_error(S_LAMBDA, exp, "first argument to lambda must be"
-                            " either () or a list of arguments");
+        return syntax_error(S_LAMBDA, exp, "first argument to lambda must be either () or a list of arguments");
       while(args->get_type() == PAIR) {
         arg = unbox(args->car());
+        // This is bad. I don't like this special case for synclos.
+        if(arg->get_type() == SYNCLO) {
+          if(check_special_form(arg, S_BRACE)) {
+            if(args->cdr() != ODD_NULL)
+              return syntax_error(S_LAMBDA, exp, "additional arguments to lambda after body");
+            break;
+          } else {
+            variable_arity = true;
+          }
+          break;
+        }
         if(arg->get_type() == PAIR) {
-          if(arg->car() == state.global_symbol(State::S_BRACE)) {
+          if(check_special_form(arg, S_BRACE)) {
             // Encountered lambda body, stop parsing
             if(args->cdr() != ODD_NULL)
               return syntax_error(S_LAMBDA, exp, "additional arguments to lambda after body");
@@ -3735,8 +3774,6 @@ recur:
     ODD_CHECK(transformer);
     ODD_ASSERT(transformer->applicablep());
 
-    ODD_CC_MSG("defsyntax " << name << ' ' << transformer);
-    
     // Create a closure with apply-macro, the transformer function and the current compilation environment
     apply_macro_closure = state.vector_storage_realloc(2, 0);
     apply_macro_closure->data[0] = *env;
@@ -4101,10 +4138,10 @@ recur:
       case SYNCLO: {
         Synclo *s = static_cast<Synclo*>(exp);
         Value* senv = s->env;
-        Value* vars = 0;
         Value* expr = s->expr;
         Table* swap = 0;
         Value* chk = 0;
+        Value* vars = 0;
 
         bool swapped = false;
         ODD_FRAME(s, senv, vars, expr, swap, chk);
@@ -4113,7 +4150,11 @@ recur:
 
         escaped_variables.swap(vars);
 
-        // Unfortunately std::swap cannot be used here because these are different types.
+#if 0
+        env.swap(senv);
+        chk = compile(expr, tail);
+        env.swap(senv);
+#endif
 
         // If this is not a reference to an escaped variable, we'll use the synclo's specified environment
         if(!(identifierp(expr) && escaped_variables->vector_memq(expr))) {
@@ -4301,6 +4342,18 @@ void push_stack_trace(const std::string& str) {
   stack_trace.push_back(str);
 }
 
+Value* arity_error_least(unsigned expected, unsigned got) {
+  std::ostringstream out;
+  out << "function expected at least " << expected << " arguments but got " << got;
+  return make_exception(State::S_ODD_EVAL, out.str());
+}
+
+Value* arity_error_most(unsigned expected, unsigned got) {
+  std::ostringstream out;
+  out << "function expected at most " << expected << " arguments but got " << got;
+  return make_exception(State::S_ODD_EVAL, out.str());
+}
+
 Value* arity_error() {
   return make_exception(State::S_ODD_EVAL, "function got bad amount of arguments");
 }
@@ -4328,8 +4381,7 @@ Value* type_error(const std::string& name, size_t arg_number,
 }
 
 // Apply Scheme function
-Value* vm_apply(Prototype* prototype, Closure* closure, size_t argc,
-                Value* args[], bool& trampoline) {
+Value* vm_apply(Prototype* prototype, Closure* closure, size_t argc, Value* args[], bool& trampoline) {
   // Track virtual machine depth
   vm_depth++;
 
@@ -4367,7 +4419,10 @@ Value* vm_apply(Prototype* prototype, Closure* closure, size_t argc,
   // Load arguments
 
   // Check argument count
-  if(argc < prototype->arguments) { VM_RETURN(arity_error()); }
+  if(argc < prototype->arguments) { VM_RETURN(arity_error_least(prototype->arguments, argc)); }
+  else if(argc > prototype->arguments && !prototype->prototype_variable_arity()) {
+    VM_RETURN(arity_error_most(prototype->arguments, argc));
+  }
 
   // Load normal arguments
   size_t i;
@@ -4578,10 +4633,15 @@ tail:
         return result;
       }
     case NATIVE_FUNCTION: {
-      NativeFunction::ptr_t ptr =
-        static_cast<NativeFunction*>(function)->pointer;
-      return ptr(*this, argc, args,
-                 static_cast<NativeFunction*>(function)->closure);
+      NativeFunction* fn = static_cast<NativeFunction*>(function);
+      NativeFunction::ptr_t ptr = fn->pointer;
+
+      if(argc < fn->arguments) return arity_error_least(argc, fn->arguments);
+      else if(argc > fn->arguments && !fn->native_function_variable_arity()) {
+        return arity_error_most(argc, fn->arguments);
+      }
+
+      return ptr(*this, argc, args, fn->closure);
     }
     default:
       if(frames_lost) {
@@ -4754,9 +4814,12 @@ Value* load_file(const char* path, Value* module_name = 0) {
     if(x->active_exception()) return x;
     chk = toplevel_cc->compile(x);
     if(chk != ODD_FALSE) return chk;
+    p = toplevel_cc->end();
+    ODD_CHECK(p);
+    x = apply(p, 0, 0);
+    ODD_CHECK(x);
+    toplevel_cc->clear();
   }
-  p = toplevel_cc->end();
-  x = apply(p, 0, 0);
   return x;
 }
 
@@ -4955,7 +5018,7 @@ inline std::ostream& operator<<(std::ostream& os, Value* x) {
 #define ODD_MAX_ARITY(expect) \
   if((argc) > (expect)) { \
     std::ostringstream ss; \
-    ss << fn_name << " expceted no more than " << (expect) << " arguments, but got " << (argc); \
+    ss << fn_name << " expected no more than " << (expect) << " arguments, but got " << (argc); \
     return state.make_exception(State::S_ODD_EVAL, ss.str()); \
   }
     
@@ -5076,6 +5139,9 @@ ODD_FUNCTION(synclo) {
   c->expr = state.unbox(args[1]);
   if(argc > 2) {
     ODD_CHECK_TYPE(PAIR, 2);
+    if(!state.listp(args[2])) {
+      return state.expected_list("synclo", 2, args[2]);
+    }
     v = state.make_vector();
     while(vars->get_type() == PAIR) {
       state.vector_append(v, state.unbox(vars->car()));
@@ -5126,7 +5192,6 @@ ODD_FUNCTION(catch_) {
   // Now deactivate the exception for handling
   result->unset_header_bit(EXCEPTION, Value::EXCEPTION_ACTIVE_BIT);
   
-  std::cout << ((Prototype*) except_thunk)->arguments << std::endl;
   result2 = state.apply(except_thunk, result);
   
   return result2;  
@@ -5144,8 +5209,27 @@ ODD_FUNCTION(syntax_error) {
   return state.make_exception(State::S_ODD_SYNTAX, out);
 }
 
+ODD_FUNCTION(syntax_assert) {
+  const char* fn_name = "syntax-assert";
+  ODD_CHECK_TYPE(STRING, 1);
+  Value* irritant = args[0];
+  String* message = ODD_CAST(String, args[1]);
+  Value* test = args[2];
+
+  if(test != ODD_FALSE)
+    return ODD_UNSPECIFIED;
+
+  std::string out;
+  state.format_source_error(irritant, message->string_data(), out);
+  return state.make_exception(State::S_ODD_SYNTAX, out);
+}
+
 ODD_FUNCTION(print) {
   for(size_t i = 0; i != argc; i++) {
+    if(args[i]->get_type() == STRING) {
+      std::cout << args[i]->string_data() << (i == argc-1 ? "" : " ");
+      continue;
+    }
     std::cout << args[i] << (i == argc-1 ? "" : " ");
   }
   std::cout << std::endl;
@@ -5171,6 +5255,8 @@ inline void State::initialize_builtin_functions() {
 
   // macros
   defun("synclo", &synclo, 2, true);
+  defun("syntax-assert", &syntax_assert, 3, false);
+  defun("syntax-error", &syntax_error, 2, false);
 
   // symbols
   defun("string->symbol", &string_to_symbol, 1, false);
@@ -5179,7 +5265,6 @@ inline void State::initialize_builtin_functions() {
   defun("throw", &throw_, 2, true);
   defun("catch", &catch_, 3, false);
 
-  defun("syntax-error", &syntax_error, 2, false);
 
   // input/output
   defun("print", &print, 1, true);
