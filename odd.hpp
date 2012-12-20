@@ -322,6 +322,7 @@ struct Value {
   Value* caddr() const;
 
   Value* list_ref(size_t i) const;
+  bool memq(Value* x);
 
   void set_car(Value*);
   void set_cdr(Value*);
@@ -407,7 +408,7 @@ struct Value {
   // Syntactic closures
   Value* synclo_expr() const;
   Table* synclo_env() const;
-  Value* synclo_escaped_variables() const;
+  Value* synclo_vars() const;
 };
 
 struct Pair : Value {
@@ -470,6 +471,15 @@ Value* Value::list_ref(size_t i) const {
     lst = lst->cdr();
   }
   return lst ? lst->car() : ODD_FALSE;
+}
+
+bool Value::memq(Value* x)  {
+  Value* lst = this;
+  while(lst->get_type() == PAIR) {
+    if(lst->car() == x) return true;
+    lst = lst->cdr();
+  }
+  return false;
 }
 
 void Value::set_car(Value* car_) { 
@@ -706,7 +716,7 @@ struct Table : Value {
 // Syntactic closures
 struct Synclo : Value {
   Table* env;
-  Vector* escaped_variables;
+  Value* vars;
   Value* expr;
 
   static const Type CLASS_TYPE = SYNCLO;
@@ -722,9 +732,9 @@ Table* Value::synclo_env() const {
   return static_cast<const Synclo*>(this)->env;
 }
 
-Value* Value::synclo_escaped_variables() const {
+Value* Value::synclo_vars() const {
   ODD_ASSERT(get_type() == SYNCLO);
-  return static_cast<const Synclo*>(this)->escaped_variables;
+  return static_cast<const Synclo*>(this)->vars;
 }
 
 ///// GARBAGE COLLECTOR TRACKING
@@ -3005,71 +3015,7 @@ Value* env_qualify_name(Table* env, Value* name) {
   return make_symbol(ss.str());
 }
 
-void env_lookup(Table* env, Value* key, Lookup& lookup, bool search_exports = false) {
-  bool found = false;
-  Table* start_env = env;
-  // Search through environments
-  while(env->get_type() == TABLE) {
-    // Search through an environment
-    Value* cell = table_get_cell(env, key);
-    if(cell != ODD_FALSE) {
-      // Found a match -- determine scope
-      ODD_ASSERT(cell->get_type() == PAIR);
-      if(env_globalp(env)) {
-        lookup.scope = REF_GLOBAL;
-        lookup.global.value = cell->cdr();
-        lookup.global.module = env;
-        if(search_exports) lookup.global.module = (Table*)table_get(env, global_symbol(S_EXPORT_PARENT));
-        return;
-      } else {
-        // If we're still searching through the original environment, it's a
-        // local variable, and if not, it's a free variable
-        lookup.scope = env == start_env ? REF_LOCAL : REF_UP;
-        lookup.nonglobal.value = cell->cdr();
-        // If this is a variable and not a macro, calculate its local index
-        if(cell->cdr()->get_type() == FIXNUM) {
-          lookup.nonglobal.index = cell->cdr()->fixnum_value();
-        }
-        return;
-      }
-    }
-    // No dice (note that even though this is in a union with global, it's
-    // fine to increment because it'll be discarded if we go all the way to a
-    // global variable)
-    lookup.nonglobal.level++;
-    // Nothing in this environment, keep searching
-
-    // Check whether this environment is a child environment (such as a function within a module)
-    if(table_has_key(env, global_symbol(S_PARENT))) {
-      env = ODD_CAST(Table, table_get(env, global_symbol(S_PARENT), found));
-      ODD_ASSERT(found);
-      continue;
-    }
-    // No delegates or delegate search failed, we're done
-    break;
-  }
-
-  // Check for unqualified imports
-  if(table_has_key(env, global_symbol(S_UNQUALIFIED_IMPORTS))) {
-    Vector* modules = ODD_CAST(Vector, table_get(env, global_symbol(S_UNQUALIFIED_IMPORTS), found));
-    for(size_t i = modules->vector_length(); i--;) {
-      Lookup sublookup;
-      Table* exports = ODD_CAST(Table, table_get(ODD_CAST(Table, modules->vector_ref(i)), global_symbol(S_EXPORTS)));
-
-      env_lookup(exports, key, sublookup, true);
-
-      if(sublookup.success) {
-        lookup = sublookup;
-        return;
-      }
-    }
-  }
-
-  lookup.success = false;
-}
-
-// A structure describing the location of a free variable relative to the
-// function it's being used in
+// A structure describing the location of a free variable relative to the function it's being used in
 struct FreeVariableInfo {
   // The lexical location of the variable
   unsigned lexical_level, lexical_index;
@@ -3085,13 +3031,15 @@ struct Compiler {
     state(state_), parent(parent_),
     local_free_variable_count(0), upvalue_count(0),
     stack_max(0), stack_size(0), locals(0), constants(state), closure(false),
-    name(state_), env(state_), synclo_env(state_), synclo_fv(state_), escaped_variables(state_), depth(depth_), last_insn(0) {
+    name(state_), env(state_), synclo_env(state_), synclo_fv(state_), depth(depth_), last_insn(0) {
 
     if(!env_) env = (*state.core_module);
     else env = env_;
 
-    if(parent) escaped_variables = (*parent->escaped_variables);
-    else {
+    if(parent) {
+      synclo_env = (*parent->synclo_env);
+      synclo_fv = (*parent->synclo_fv);
+    } else {
       name = state.make_string("<toplevel>");
     }
   }
@@ -3124,8 +3072,6 @@ struct Compiler {
   Handle<Table> synclo_env;
   // synclo_fv is a list of symbols introduced by syntactic closures
   Handle<Pair> synclo_fv;
-  // Escaped variables (for macros)
-  Handle<Vector> escaped_variables;
   // The depth of the function (for debug message purposes)
   size_t depth;
   // Location of last instruction emitted (for debug message purposes)
@@ -3251,30 +3197,6 @@ struct Compiler {
 
   bool exporting() { return state.env_globalp(*env) && state.table_get(*env, state.global_symbol(S_EXPORTING)); }
 
-  // Checks a function to see whether it is a call to a particular special
-  // form
-  bool check_special_form(Value* form, Global g) {
-    Table* check_env = *env;
-    // Quick check to make sure it has the right format and name
-    if(form->get_type() != PAIR && form->get_type() != SYNCLO) return false;
-    if(form->get_type() == SYNCLO) {
-      Value* sync = form;
-      form = form->synclo_expr();
-      if(form->get_type() != PAIR) return false;
-      check_env = sync->synclo_env();
-    }
-    Value* check = unbox(form->car());
-    if(check->get_type() != SYMBOL || check != state.global_symbol(g))
-      return false;
-
-    // But we still need to do a real lookup because form names could be
-    // shadowed by other definitions
-    Lookup lookup;
-    state.env_lookup(check_env, check, lookup);
-    return lookup.success && lookup.scope == REF_GLOBAL &&
-      lookup.global.value == state.global_symbol(S_SPECIAL);
-  }
-
   bool identifierp(Value* x) {
     return x->get_type() == SYMBOL || (x->get_type() == BOX && unbox(x)->get_type() == SYMBOL) ||
       (x->get_type() == SYNCLO && (static_cast<Synclo*>(x)->expr->get_type() == SYMBOL));
@@ -3312,6 +3234,131 @@ struct Compiler {
     }
     free_variables.push_back(l);
     return free_variables.size() - 1;
+  }
+
+  // Environments
+  void env_define(Table* table, Value* key, Value* value, bool exported = false) {
+    // If present in free variables, copy & remove.
+    if((*synclo_fv) && synclo_fv->memq(key)) {
+      Value* cpy = 0, *last = 0, *head = 0;
+      ODD_FRAME(table, key, value, cpy, last, head);
+      head = last = cpy = state.list_copy(*synclo_fv);
+      while(cpy->get_type() == PAIR) {
+        if(cpy->car() == key) {
+          // If this is the head of the list
+          if(cpy == last) {
+            head = cpy->cdr();
+            break;
+          } else {
+            // If not
+            last->set_cdr(cpy->cdr());
+            break;
+          }
+        }
+        last = cpy;
+        cpy = cpy->cdr();
+        synclo_fv = static_cast<Pair*>(head);
+        std::cout << "ADJUSTED FREE VARIABLES " << (*synclo_fv) << std::endl;
+
+      }
+    }
+    state.env_define(table, key, value, exported);
+  }
+
+  void env_lookup(Table* env, Value* key, Lookup& lookup, bool search_exports = false) {
+    bool found = false;
+    if(env == (*Compiler::env)) {
+      if(*synclo_env) { 
+        if(!((*synclo_fv) && synclo_fv->memq(key))) {
+          ODD_ASSERT(*synclo_env);
+          env = *synclo_env;
+        }
+      }
+    }
+    Table* start_env = env;
+    // Search through environments
+    while(env->get_type() == TABLE) {
+      // Search through an environment
+      Value* cell = state.table_get_cell(env, key);
+      if(cell != ODD_FALSE) {
+        // Found a match -- determine scope
+        ODD_ASSERT(cell->get_type() == PAIR);
+        if(state.env_globalp(env)) {
+          lookup.scope = REF_GLOBAL;
+          lookup.global.value = cell->cdr();
+          lookup.global.module = env;
+          if(search_exports) lookup.global.module = (Table*) state.table_get(env, state.global_symbol(S_EXPORT_PARENT));
+          return;
+        } else {
+          // If we're still searching through the original environment, it's a
+          // local variable, and if not, it's a free variable
+          lookup.scope = env == start_env ? REF_LOCAL : REF_UP;
+          lookup.nonglobal.value = cell->cdr();
+          // If this is a variable and not a macro, calculate its local index
+          if(cell->cdr()->get_type() == FIXNUM) {
+            lookup.nonglobal.index = cell->cdr()->fixnum_value();
+          }
+          return;
+        }
+      }
+      // No dice (note that even though this is in a union with global, it's
+      // fine to increment because it'll be discarded if we go all the way to a
+      // global variable)
+      lookup.nonglobal.level++;
+      // Nothing in this environment, keep searching
+
+      // Check whether this environment is a child environment (such as a function within a module)
+      if(state.table_has_key(env, state.global_symbol(S_PARENT))) {
+        env = ODD_CAST(Table, state.table_get(env, state.global_symbol(S_PARENT), found));
+        ODD_ASSERT(found);
+        continue;
+      }
+      // No delegates or delegate search failed, we're done
+      break;
+    }
+
+    // Check for unqualified imports
+    if(state.table_has_key(env, state.global_symbol(S_UNQUALIFIED_IMPORTS))) {
+      Vector* modules = ODD_CAST(Vector, state.table_get(env, state.global_symbol(S_UNQUALIFIED_IMPORTS), found));
+      for(size_t i = modules->vector_length(); i--;) {
+        Lookup sublookup;
+        Table* exports = ODD_CAST(Table, state.table_get(ODD_CAST(Table, modules->vector_ref(i)),
+                                                         state.global_symbol(S_EXPORTS)));
+
+        env_lookup(exports, key, sublookup, true);
+
+        if(sublookup.success) {
+          lookup = sublookup;
+          return;
+        }
+      }
+    }
+
+    lookup.success = false;
+  }
+
+  // Checks a function to see whether it is a call to a particular special
+  // form
+  bool check_special_form(Value* form, Global g) {
+    Table* check_env = *env;
+    // Quick check to make sure it has the right format and name
+    if(form->get_type() != PAIR && form->get_type() != SYNCLO) return false;
+    if(form->get_type() == SYNCLO) {
+      Value* sync = form;
+      form = form->synclo_expr();
+      if(form->get_type() != PAIR) return false;
+      check_env = sync->synclo_env();
+    }
+    Value* check = unbox(form->car());
+    if(check->get_type() != SYMBOL || check != state.global_symbol(g))
+      return false;
+
+    // But we still need to do a real lookup because form names could be
+    // shadowed by other definitions
+    Lookup lookup;
+    env_lookup(check_env, check, lookup);
+    return lookup.success && lookup.scope == REF_GLOBAL &&
+      lookup.global.value == state.global_symbol(S_SPECIAL);
   }
 
   Value* generate_ref(Lookup& lookup, Value* exp,  Value* name) {
@@ -3369,7 +3416,7 @@ struct Compiler {
     annotate(exp);
     Value* name = unbox(exp);
     Lookup lookup;
-    state.env_lookup(*env, name, lookup);
+    env_lookup(*env, name, lookup);
     if(!lookup.success) return undefined_variable(exp);
     return generate_ref(lookup, exp, name);
   }
@@ -3439,7 +3486,6 @@ restart:
         goto restart;
       }
     }
-    // TODO: Handle (define name (lambda () #t))
 
     // We'll create a fake lookup structure for generate_set here
     Lookup lookup;
@@ -3458,7 +3504,7 @@ restart:
     }
 
     // TODO: Allow re-definitions, but warn about them
-    state.env_define(*env, name, value, exporting());
+    env_define(*env, name, value, exporting());
 
     // Compile body for set
     ODD_FRAME(name);
@@ -3485,7 +3531,7 @@ restart:
 
     // Look up variable
     Lookup lookup;
-    state.env_lookup(*env, name, lookup);
+    env_lookup(*env, name, lookup);
     // Don't allow special forms or syntax
     if(!lookup.success)
       return undefined_variable(exp->cadr());
@@ -3579,7 +3625,7 @@ restart:
         }
         // Finally, we can add them to the environment!
         // Add it as a local variable
-        state.env_define(new_env, arg, Value::make_fixnum(argc));
+        env_define(new_env, arg, Value::make_fixnum(argc));
         argc++;
         args = args->cdr();
         if(args->get_type() != PAIR) {
@@ -3782,7 +3828,7 @@ recur:
     apply_macro_fn = state.make_native_function(&apply_macro, 0, true, apply_macro_closure);
     
     // Define macro
-    state.env_define(*env, name, apply_macro_fn, exporting());
+    env_define(*env, name, apply_macro_fn, exporting());
     ODD_CC_MSG("defsyntax " << name << ' ' << transformer << ' ' << state.table_get(*env, state.global_symbol(S_MODULE_NAME)));
     return ODD_FALSE;
   }
@@ -3923,7 +3969,7 @@ recur:
     ODD_CHECK(chk);
 
     Lookup lookup;
-    state.env_lookup(module, variable_name, lookup);
+    env_lookup(module, variable_name, lookup);
     // TODO: Improve error message
     if(!lookup.success) {
       String* modname = ODD_CAST(String, state.table_get(module, state.global_symbol(S_MODULE_NAME)));
@@ -4056,7 +4102,7 @@ recur:
         Value* function = unbox(exp->car());
         bool syntax = false;
         if(function->get_type() == SYMBOL) {
-          state.env_lookup(*env, function, lookup);
+          env_lookup(*env, function, lookup);
           syntax = state.lookup_syntaxp(lookup);
         }
         // Special case: access macro application
@@ -4143,18 +4189,23 @@ recur:
         Value* chk = 0;
         Value* vars = 0;
 
-        bool swapped = false;
         ODD_FRAME(s, senv, vars, expr, swap, chk);
 
+        vars = state.list_copy(s->vars);
+
+        synclo_env.swap(senv);
+        synclo_fv.swap(vars);
+        
+        chk = compile(expr, tail);
+        
+        synclo_env.swap(senv);
+        synclo_fv.swap(vars);
+
+        return chk;
+#if 0
         vars = state.vector_combine(s->escaped_variables, *escaped_variables);
 
         escaped_variables.swap(vars);
-
-#if 0
-        env.swap(senv);
-        chk = compile(expr, tail);
-        env.swap(senv);
-#endif
 
         // If this is not a reference to an escaped variable, we'll use the synclo's specified environment
         if(!(identifierp(expr) && escaped_variables->vector_memq(expr))) {
@@ -4169,6 +4220,7 @@ recur:
         }
 
         escaped_variables.swap(vars);
+#endif
 
         return chk;
       }
@@ -4240,10 +4292,11 @@ recur:
     debuginfo.clear();
     free_variables.clear();
     local_free_variable_count = upvalue_count = stack_max = stack_size = locals = last_insn = 0;
-    constants = (Vector*) ODD_FALSE;
+    constants = static_cast<Vector*>(ODD_FALSE);
     closure = false;
-    name = (String*) ODD_FALSE;
-    escaped_variables = (Vector*) ODD_FALSE;
+    name = static_cast<String*>(ODD_FALSE);
+    synclo_env = static_cast<Table*>(ODD_FALSE);
+    synclo_fv = static_cast<Pair*>(ODD_FALSE);
   }
 };
 
@@ -4981,8 +5034,8 @@ inline std::ostream& operator<<(std::ostream& os, Value* x) {
                             << " " << x->upvalue() << ')';
     case SYNCLO: {
       os << "#<synclo " << x->synclo_expr();
-      if(x->synclo_escaped_variables())
-        os << ' ' << x->synclo_escaped_variables();
+      if(x->synclo_vars())
+        os << ' ' << x->synclo_vars();
       return os << '>';
     }
     case TABLE: {
@@ -5131,23 +5184,18 @@ ODD_FUNCTION(synclo) {
   Synclo* c = 0;
   Value* env = ODD_CAST(Table, args[0]);
   Value* expr = args[1];
-  Vector* v = 0;
   Value* vars = (argc > 2) ? args[2] : ODD_FALSE;
-  ODD_FRAME(c, env, expr, v, vars);
+  Value* vars_copy = 0;
+  ODD_FRAME(c, env, expr, vars, vars_copy);
   c = state.allocate<Synclo>();
   c->env = ODD_CAST(Table, args[0]);
   c->expr = state.unbox(args[1]);
   if(argc > 2) {
     ODD_CHECK_TYPE(PAIR, 2);
-    if(!state.listp(args[2])) {
+    if(!state.listp(args[2]))
       return state.expected_list("synclo", 2, args[2]);
-    }
-    v = state.make_vector();
-    while(vars->get_type() == PAIR) {
-      state.vector_append(v, state.unbox(vars->car()));
-      vars = vars->cdr();
-    }
-    c->escaped_variables = v;
+    vars_copy = state.list_copy(vars);
+    c->vars = vars_copy;
   }
 
   return c;
