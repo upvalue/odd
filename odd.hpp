@@ -33,8 +33,9 @@
 #include <algorithm>
 #include <limits>
 #include <fstream>
-#include <sstream>
 #include <iostream>
+#include <set>
+#include <sstream>
 #include <vector>
 
 #if defined(_LP64)
@@ -739,6 +740,15 @@ Value* Value::synclo_vars() const {
 
 ///// GARBAGE COLLECTOR TRACKING
 
+// Garbage-collector tracked vector
+typedef std::vector<Value*> value_vector_t;
+struct SafeVector : std::vector<value_vector_t> {
+  SafeVector(State& state);
+  ~SafeVector();
+
+  State& state;
+};
+
 // Handles are auto-tracked heap-allocated pointers
 template <class T>
 struct Handle {
@@ -890,6 +900,7 @@ struct Block {
 std::vector<Block*> blocks;
 // Garbage collector root set
 Handle<Value>* handle_list;
+std::set<SafeVector*> safe_vectors;
 std::vector<VMFrame*> vm_frames;
 Frame* frame_list;
 // Print a bunch of messages about compiler, virtual machine, etc, only works with ODD_DEBUG
@@ -3258,8 +3269,6 @@ struct Compiler {
         last = cpy;
         cpy = cpy->cdr();
         synclo_fv = static_cast<Pair*>(head);
-        std::cout << "ADJUSTED FREE VARIABLES " << (*synclo_fv) << std::endl;
-
       }
     }
     state.env_define(table, key, value, exported);
@@ -4202,27 +4211,6 @@ recur:
         synclo_fv.swap(vars);
 
         return chk;
-#if 0
-        vars = state.vector_combine(s->escaped_variables, *escaped_variables);
-
-        escaped_variables.swap(vars);
-
-        // If this is not a reference to an escaped variable, we'll use the synclo's specified environment
-        if(!(identifierp(expr) && escaped_variables->vector_memq(expr))) {
-          env.swap(senv);
-          swapped = true;
-        }
-
-        chk = compile(expr, tail);
-
-        if(swapped) {
-          env.swap(senv);
-        }
-
-        escaped_variables.swap(vars);
-#endif
-
-        return chk;
       }
       default:
         std::cerr << exp << std::endl;
@@ -4411,17 +4399,16 @@ Value* arity_error() {
   return make_exception(State::S_ODD_EVAL, "function got bad amount of arguments");
 }
 
-Value* expected_applicable(const std::string& name, size_t arg_number,
-                           Type got) {
+Value* expected_list(const std::string& name, size_t arg_number, Value* value) {
   std::stringstream out;
-  out << name << " expected argument " << arg_number+1
-      << " to be applicable, but got " << got;
+  out << name << "expected argument " << arg_number+1 << " to be a list, but got " << value;
   return make_exception(State::S_ODD_TYPE, out.str());
 }
 
-Value* expected_list(const std::string& name, size_t arg_number, Value* lst) {
-  std::ostringstream out;
-  out << name << " expected argument " << arg_number+1 << " to be a list";
+Value* expected_applicable(const std::string& name, size_t arg_number, Type got) {
+  std::stringstream out;
+  out << name << " expected argument " << arg_number+1
+      << " to be applicable, but got " << got;
   return make_exception(State::S_ODD_TYPE, out.str());
 }
 
@@ -5060,6 +5047,12 @@ inline std::ostream& operator<<(std::ostream& os, Value* x) {
                             (expect), args[(number)]->get_type()); \
   }
 
+#define ODD_CHECK_LIST(number) \
+  if(!state.listp(args[(number)])) { \
+    return state.expected_list(fn_name, (number), args[(number)]); \
+  }
+
+
 #define ODD_CHECK_APPLICABLE(number) \
   if(!((args[(number)])->applicablep())) { \
     return state.expected_applicable(fn_name, (number), \
@@ -5102,6 +5095,18 @@ ODD_PREDICATE(stringp, STRING);
 
 #undef ODD_PREDICATE
 
+ODD_FUNCTION(map_) {
+  static const char* fn_name = "map";
+  ODD_CHECK_APPLICABLE(0);
+  ODD_CHECK_LIST(1);
+  return ODD_UNSPECIFIED;
+}
+
+ODD_FUNCTION(cons_) {
+  //static const char* fn_name = "cons";
+  return state.cons(args[0], args[1]);
+}
+
 ODD_FUNCTION(car) {
   static const char* fn_name = "car";
   ODD_CHECK_TYPE(PAIR, 0);
@@ -5141,6 +5146,18 @@ ODD_FUNCTION(list_ref) {
     head = head->cdr();
   }
   return head ? head->car() : ODD_FALSE;
+}
+
+ODD_FUNCTION(list_ref_rest) {
+  static const char* fn_name = "list-ref-rest";
+  if(args[0] == ODD_NULL) return ODD_NULL;
+  ODD_CHECK_TYPE(PAIR, 0);
+  ODD_CHECK_TYPE(FIXNUM, 1);
+  ptrdiff_t i = args[1]->fixnum_value();
+  Value* head = args[0];
+  while(i-- && head->get_type() == PAIR)
+    head = head->cdr();
+  return head ? head->cdr() : ODD_FALSE;
 }
 
 ODD_FUNCTION(length_) {
@@ -5294,11 +5311,16 @@ inline void State::initialize_builtin_functions() {
   defun("string?", &stringp, 1, false);
   defun("symbol?", &symbolp, 1, false);
 
+  // functions
+  defun("map", &map_, 2, false);
+
   // pairs & lists
+  defun("cons", &cons_, 2, false);
   defun("car", &car, 1, false);
   defun("cdr", &cdr, 1, false);
   defun("list", &list, 0, true);
   defun("list-ref", &list_ref, 2, false);
+  defun("list-ref-rest", &list_ref_rest, 2, false);
   defun("length", &length_, 1, false);
 
   // macros
@@ -5312,7 +5334,6 @@ inline void State::initialize_builtin_functions() {
   // exceptions & errors
   defun("throw", &throw_, 2, true);
   defun("catch", &catch_, 3, false);
-
 
   // input/output
   defun("print", &print, 1, true);

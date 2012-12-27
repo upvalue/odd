@@ -5,6 +5,8 @@ def(not lambda(x) {
   =(x #f)
 })
 
+def(unspecified if(#f #f))
+
 defsyntax(let x e) {
   // let(x 1) { x } => [[lambda [x] x] 1]
   syntax-assert(x "Expected exactly 3 arguments to let" =(length(x) 4))
@@ -16,20 +18,48 @@ defsyntax(let x e) {
   syntax-assert(x "Expected first argument to let to be a symbol" symbol?(name))
 
   def(ret list(list('lambda name synclo(e body list(name))) synclo(e value)))
-  print(ret)
   ret
 }
 
-def(qq-list lambda(lst) {
-  if(pair?(lst)) {
-    
+defsyntax(and x e) {
+  def(len length(x))
+  if(=(len 1)) {
+    unspecified
   } {
+    if(=(len 2)) {
+      synclo(e list-ref(x 1))
+    } {
+      def(ret list('let 'tmp synclo(e list-ref(x 1)) list('if 'tmp cons('and synclo(e list-ref-rest(x 1))) #f)))
+      print(ret)
+      ret
+    }
+  }
+}
 
+// Quasiquote mechanics
+
+def(concat-list lambda(x y) {
+  if(pair?(x) cons(car(x) concat-list(cdr(x) y)) y)
+})
+
+
+def(qq-object #f)
+
+// Dive into a list, check for unquote-splicing
+def(qq-list lambda(l) {
+  if(pair?(l)) {
+    let(obj car(l)) {
+      print(obj)
+      if(and(pair?(obj) =(car(obj) 'unquote-splicing))) {
+      }
+    }
+  } {
+    list('quote l)
   }
 })
 
-def(quasiquote let(x 777) { x })
+def(qq-element lambda(l) {
+  if(=(list-ref(l 0) 'unquote) list-ref(l 1) qq-list(l))
+})
 
-print(quasiquote)
-
-[export not let quasiquote]
+[export not and let quasiquote]
