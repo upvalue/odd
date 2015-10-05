@@ -1,5 +1,0 @@
-/odd
-/bench/gc-odd
-/bench/gc-boehm
-/.gitignore
-/site.mk

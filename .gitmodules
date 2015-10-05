@@ -1,3 +1,0 @@
-[submodule "vendor/linenoise"]
-	path = vendor/linenoise
-	url = git@github.com:ioddly/linenoise.git
