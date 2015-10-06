@@ -57,7 +57,7 @@ class Parser(object):
         self.state = state
         self.src = src
         if isinstance(srcio, str):
-            self.io = io.StringIO(srcio)
+            self.io = io.BytesIO(srcio.encode('utf-8'))
         else:
             self.io = srcio
         self.line = 0
@@ -66,22 +66,43 @@ class Parser(object):
     def error(self, text, length):
         return ParserError(text, SourceLocation(self.src, self.line, self.col, length))
 
+    def next_char(self):
+        return self.io.read(1).decode('utf-8')
+
+    def peek_char(self):
+        ch = self.next_char()
+        self.io.seek(-1, 1)
+        return ch
+
     def next_symbol(self, ch):
         string = ch
         while True:
-            ch = self.io.read(1)
+            ch = self.io.read(1).decode('utf-8')
             self.col += 1
             if (ch in Parser.SYMBOL_CHARS) and (ch not in Parser.RESERVED_PUNCTUATION) and ch != '':
                 string += ch
             else:
                 return self.state.make_symbol(string)
 
+    def newline(self):
+        self.line += 1
+        self.col = 0
+
+    def eat_comment(self):
+        while True:
+            ch = self.next_char()
+            if ch == '\n':
+                self.newline()
+                return
+            elif ch == '':
+                return
+
     def next_token(self):
         while True:
-            ch = self.io.read(1)
+            ch = self.next_char()
             self.col += 1
             if ch == '#':
-                nch = self.io.read(1)
+                nch = self.next_char()
                 if nch == 't':
                     return TRUE
                 elif nch =='f':
@@ -89,10 +110,15 @@ class Parser(object):
                 else:
                     raise self.error("Unknown constant #%s" % nch, 2)
             elif ch == '\n':
-                self.line += 1
-                self.col = 0
+                self.newline()
             elif ch == ' ':
                 continue
+            elif ch == '/':
+                tst = self.peek_char()
+                if tst == '/':
+                    self.eat_comment()
+                else:
+                    return self.next_symbol(ch)
             elif ch != '' and (ch in Parser.SYMBOL_CHARS) and (ch not in Parser.RESERVED_PUNCTUATION):
                 return self.next_symbol(ch)
             elif ch == '':
