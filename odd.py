@@ -20,7 +20,10 @@ class Constant(Value):
         self.value = value
 
     def __repr__(self):
-        return str(self.value)
+        if self.value == True:
+            return "#t"
+        elif self.value == False:
+            return "#f"
 
 TRUE = Constant(True)
 FALSE = Constant(False)
@@ -83,7 +86,7 @@ class Parser(object):
             return token
         pass
 
-    def tree(self):
+    def exprs(self):
         exprs = []
         expr = self.next_expr()
         while expr:
@@ -93,7 +96,7 @@ class Parser(object):
 
     @staticmethod
     def parse(state, src, code):
-        return Parser(src, code).tree()
+        return Parser(src, code).exprs()
 
 class State(object):
     def __init__(self):
@@ -125,6 +128,13 @@ class State(object):
         if isinstance(value, Value):
             return value.evaluate(self)
         elif isinstance(value, str):
-            return self.parse(value)
+            return [expr.evaluate(self) for expr in self.parse(value)]
         else:
             raise ValueError("argument %r must be string or Odd value" % value)
+
+if __name__ == "__main__":
+    state = State()
+
+    print(state.evaluate("#t"))
+    #print(state.make_parser("#t #f #t").exprs())
+
