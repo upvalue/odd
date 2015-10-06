@@ -131,7 +131,7 @@ class State(object):
         return len(self.source_files) - 1
 
     def make_symbol(self, string):
-        if 'string' in self.symbols:
+        if string in self.symbols:
             return self.symbols[string]
         self.symbols[string] = Symbol(string)
         return self.symbols[string]
@@ -171,6 +171,7 @@ def identity(state, arg):
 if __name__ == "__main__":
     state = State()
 
+    print(state.parse("hello #t #f"))
     print(state.evaluate("hello #t #f"))
     #print(state.make_parser("#t #f #t").exprs())
 
