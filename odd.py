@@ -1,5 +1,5 @@
 # odd.py - odd language interpreter in python
-import io
+import io, string
 
 class SourceLocation(object):
     "Describes the location of a bit of Odd code, mainly used for helpful error reporting"
@@ -44,8 +44,17 @@ class ParserError(Exception):
         self.location = location
         self.msg = msg
 
+class Expression(Value):
+    def __init__(self, tipe, exprs):
+        self.tipe = tipe 
+        self.exprs = exprs
+
 class Parser(object):
-    def __init__(self, src, srcio):
+    RESERVED_PUNCTUATION = ".#"
+    SYMBOL_CHARS = string.ascii_letters + string.punctuation
+
+    def __init__(self, state, src, srcio):
+        self.state = state
         self.src = src
         if isinstance(srcio, str):
             self.io = io.StringIO(srcio)
@@ -56,6 +65,16 @@ class Parser(object):
 
     def error(self, text, length):
         return ParserError(text, SourceLocation(self.src, self.line, self.col, length))
+
+    def next_symbol(self, ch):
+        string = ch
+        while True:
+            ch = self.io.read(1)
+            self.col += 1
+            if (ch in Parser.SYMBOL_CHARS) and (ch not in Parser.RESERVED_PUNCTUATION) and ch != '':
+                string += ch
+            else:
+                return self.state.make_symbol(string)
 
     def next_token(self):
         while True:
@@ -74,6 +93,8 @@ class Parser(object):
                 self.col = 0
             elif ch == ' ':
                 continue
+            elif ch != '' and (ch in Parser.SYMBOL_CHARS) and (ch not in Parser.RESERVED_PUNCTUATION):
+                return self.next_symbol(ch)
             elif ch == '':
                 return None
             else:
@@ -81,8 +102,8 @@ class Parser(object):
 
     def next_expr(self):
         token = self.next_token()
+        # Literal
         if isinstance(token, Value):
-            # Literal
             return token
         pass
 
@@ -96,9 +117,11 @@ class Parser(object):
 
     @staticmethod
     def parse(state, src, code):
-        return Parser(src, code).exprs()
+        return Parser(state, src, code).exprs()
 
 class State(object):
+    primitives = {}
+
     def __init__(self):
         self.symbols = {}
         self.source_files = []
@@ -115,7 +138,7 @@ class State(object):
 
     def make_parser(self, code):
         src = self.register_source("python string", code)
-        return Parser(src, code)
+        return Parser(self, src, code)
 
     def parse(self, value):
         if isinstance(value, str):
@@ -132,9 +155,22 @@ class State(object):
         else:
             raise ValueError("argument %r must be string or Odd value" % value)
 
+def primitive(name=None):
+    def decorator(function):
+        nonlocal name
+        if name == None:
+            name = function.__name__
+        State.primitives[name] = function
+        return function
+    return decorator
+
+@primitive
+def identity(state, arg):
+    return arg
+
 if __name__ == "__main__":
     state = State()
 
-    print(state.evaluate("#t"))
+    print(state.evaluate("hello #t #f"))
     #print(state.make_parser("#t #f #t").exprs())
 
