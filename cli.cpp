@@ -4,7 +4,6 @@
 #include "odd.hpp"
 
 #include "vendor/linenoise/linenoise.h"
-#include "vendor/linenoise/linenoise.c"
 
 using namespace odd;
 

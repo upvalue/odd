@@ -1,4 +1,5 @@
 CXXFLAGS := -O2 -Wall -g3 -fno-rtti -fno-exceptions 
+CFLAGS := -O2 -g3
 CPPFLAGS := -DODD_VERSION='"$(shell git rev-parse --short HEAD)"'
 LDFLAGS := 
 
@@ -6,9 +7,13 @@ LDFLAGS :=
 
 all: odd
 
-odd: cli.cpp odd.hpp test/runtime.cpp
+%.o: %.c
+	@echo -n ' CC  ';
+	$(strip $(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ $<)
+
+odd: cli.cpp vendor/linenoise/linenoise.o odd.hpp test/runtime.cpp 
 	@echo -n ' LD  ';
-	$(strip $(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $< $(LDFLAGS))
+	$(strip $(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ cli.cpp vendor/linenoise/linenoise.o $(LDFLAGS))
 
 .PHONY: clean cloc
 
