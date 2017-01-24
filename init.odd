@@ -36,30 +36,4 @@ defsyntax(and x e) {
   }
 }
 
-// Quasiquote mechanics
-
-def(concat-list lambda(x y) {
-  if(pair?(x) cons(car(x) concat-list(cdr(x) y)) y)
-})
-
-
-def(qq-object #f)
-
-// Dive into a list, check for unquote-splicing
-def(qq-list lambda(l) {
-  if(pair?(l)) {
-    let(obj car(l)) {
-      print(obj)
-      if(and(pair?(obj) =(car(obj) 'unquote-splicing))) {
-      }
-    }
-  } {
-    list('quote l)
-  }
-})
-
-def(qq-element lambda(l) {
-  if(=(list-ref(l 0) 'unquote) list-ref(l 1) qq-list(l))
-})
-
 [export not and let quasiquote]
