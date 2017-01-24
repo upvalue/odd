@@ -244,9 +244,9 @@ struct Value {
   // Check for ...1
   bool fixnump() const { return bits() & 1; }
   // Check for 0 or ..10 
-  bool constantp() const { return !this || (bits() & 3) == 2; }
+  bool constantp() const { return ((ptrdiff_t) this) == 0 || (bits() & 3) == 2; }
   // Check for ..00 (and not null)
-  bool pointerp() const { return this && (bits() & 3) == 0; }
+  bool pointerp() const { return ((ptrdiff_t) this != 0) && (bits() & 3) == 0; }
   // Anything that isn't a pointer is immediate
   bool immediatep() const { return !pointerp(); }
   bool applicablep() const {

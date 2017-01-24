@@ -1,8 +1,6 @@
-Odd is a Scheme-derived programming language. 
+Odd is a Scheme-inspired programming language with C-style syntax
 
-Make sure to run 'git submodule update --init' after cloning.
-
-Short version:
+## Features
 
 - Scheme semantics
 - Helpful error messages
@@ -12,4 +10,10 @@ Short version:
 - Fast, direct dispatching virtual machine
 - Extremely easy to redistribute (can be distilled to a single C++ header)
 
-For more information, see the [Odd manual](http://ioddly.com/projects/odd/).
+## Build instructions
+
+1) Run git submodule update --init in order to checkout dependencies.
+
+2) Run GNU make
+
+3) ./odd to start REPL
