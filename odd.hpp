@@ -225,7 +225,7 @@ struct Value {
   // The 'header' field contains an object's type, the garbage collector mark,
   // and other information that can be represented with a bit or two (such as
   // whether a Pair has source code information attached)
-  unsigned header;
+  unsigned int header;
 
   // Headers have the following format
   // SSSS SSSM TTTT TTTT

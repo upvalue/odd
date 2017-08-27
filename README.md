@@ -17,3 +17,7 @@ Odd is a Scheme-inspired programming language with C-style syntax
 2) Run GNU make
 
 3) ./odd to start REPL
+
+## Note
+
+g++ optimized builds are currently not working. Compile with clang or disable optimization.
